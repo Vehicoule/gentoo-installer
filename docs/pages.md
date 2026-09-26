@@ -33,16 +33,23 @@ RAM < 512 MB → warning (emerge will be painful).
 Purpose: choose target disk(s) and partition plan. The most consequential
 page — everything downstream depends on it.
 
+User-facing layout options are presented Calamares-style:
+**Normal** (erase disk, everything below auto-defaulted), **Install
+alongside Windows** (only shown when Windows/another OS is detected),
+**Advanced** (full control).
+
 | Field | Type | Default | Validation |
 |---|---|---|---|
 | device | enum (detected disks) | — | nonempty; excluded: the disk hosting the live env |
-| scheme | enum `efi-swap-root\|bios-boot-swap-root\|alongside\|manual` | `efi-swap-root` (UEFI) | `bios-*` shown only when booted via BIOS; `alongside` requires detected free space or shrinkable partition |
+| scheme | enum `normal (efi-swap-root)\|bios-boot-swap-root\|alongside\|advanced (manual)` | `normal` (UEFI) | `bios-*` shown only when booted via BIOS; `alongside` shown only when an existing OS is detected and requires free space or shrinkable partition |
 | wipe | bool | `true` | must be `false` when `scheme=alongside` (VALIDATE) |
-| root_fs | enum `xfs\|ext4\|btrfs\|f2fs` | `xfs` | — |
-| swap_mib | int | 4096 | 0 = none; option `zram` (no swap partition) |
+| root_fs | enum `xfs\|ext4\|btrfs\|f2fs` (+expert `bcachefs`) | `btrfs` | modern default; bcachefs needs a recent kernel — expert flag |
+| swap | enum `zram\|partition\|none` | `zram` | `partition` reveals swap_mib; zram default fits memory-efficiency ethos (no disk swap) |
+| swap_mib | int | 4096 | only when `swap=partition` |
 | esp_mib | int (expert) | 512 | ≥128; ≥512 recommended for UKI/systemd-boot |
+| boot_part | bool (expert) | false | separate /boot partition (needed for advanced crypto layouts; ESP stays separate) |
 | luks | bool | false | reveals passphrase + `cryptsetup` options (pbkdf argon2id) |
-| luks_passphrase | secret | — | required iff `luks`; min length 8; confirm field |
+| luks_passphrase | secret | — | required iff `luks`; min length 8; confirm field; supplied to `cryptsetup luksFormat` via stdin (no argv/env leak) |
 | lvm | bool | false | LVM2 vg on root part (or inside LUKS if set) |
 | home_part | bool (expert) | false | separate /home partition |
 | btrfs_subvols | list (expert) | `@,@home,@snapshots` | only when `root_fs=btrfs` |
@@ -50,9 +57,10 @@ page — everything downstream depends on it.
 | shrink_mib | int | — | alongside only; ≥ min install size (8 GiB) and ≤ fs free space |
 | manual_plan | partition table editor (expert) | — | free-form: part/fs/mount table; validated like any scheme |
 
-Live preview: engine emits the post-install partition table (the same
-`Cmd` plan the pipeline will run); TUI renders a table, GUI renders a
-disk-bar graphic.
+Normal/alongside modes auto-default every field above — the user only
+picks disk, fs, LUKS toggle. Live preview: engine emits the post-install
+partition table (the same `Cmd` plan the pipeline will run); TUI renders
+a table, GUI renders a disk-bar graphic.
 
 Edge cases: zero eligible disks → hard error page; active swap/LVM/md on
 target → refuse until deactivated; `alongside` reuses the existing ESP —
@@ -64,15 +72,24 @@ Purpose: the Gentoo-specific choice — init system, stage3 flavor, profile.
 
 | Field | Type | Default | Validation |
 |---|---|---|---|
-| init | enum `openrc\|systemd` (+ expert `runit\|s6\|dinit`) | `systemd` | alt inits show warning: post-stage3 swap, expert path |
-| variant | enum stage3 flavors | `desktop-systemd` | constrained by init (see matrix) and `security.selinux` |
+| init | enum `openrc\|systemd\|runit\|s6\|dinit` | `systemd` | all first-class options (alt inits get an "early support" badge, not a gate) — see init-backend note in DESIGN.md |
+| libc | enum `glibc\|musl` | `glibc` | `musl` disables systemd (needs glibc); runit/s6/dinit fine on musl |
+| toolchain | enum `gcc\|llvm` | `gcc` | `llvm` ⇒ `llvm-*`/`musl-llvm-*` stage3 |
+| hardening | enum `standard\|hardened\|hardened+selinux` | `hardened+selinux` | per user direction: hardening on by default; see caveat below |
 | profile | enum/string (expert override) | derived | must exist in `eselect profile list` for the variant |
 | binhost | bool | `true` | official binpkg host; signature-verified |
 
-Variant↔init constraints (encoded in the engine, surfaced as disabled
-options): `musl-*` flavors are openrc-only (systemd requires glibc);
-`llvm-*` flavors are openrc-based; `*-systemd` flavors require
-`init=systemd`; `security.selinux=true` forces `hardened-selinux-*`.
+Variant selection is **axes-based** — libc × toolchain × hardening map to
+a stage3 stem (e.g. glibc+llvm+hardened ⇒ `hardened-llvm-*`; musl+llvm ⇒
+`musl-llvm-*`). Caveat the UI must convey: *hardening is baked into the
+stage3's toolchain* (hardened gcc/clang defaults), so it can't be applied
+on top of a standard stage3 — selecting it selects a different tarball.
+SELinux policy, by contrast, is additive (sec-policy/*, refpolicy,
+`security.selinux=true`).
+
+Init constraints (encoded, surfaced as disabled options): `musl` ⇒
+systemd unavailable; `*-systemd` stage3 flavors ⇒ `init=systemd`;
+runit/s6/dinit on any libc (post-stage3 init swap for non-openrc).
 
 Profile preview: show the fully resolved profile name (e.g.
 `default/linux/amd64/23.0/desktop/systemd`) so users see exactly what
@@ -82,11 +99,10 @@ they're getting.
 
 | Field | Type | Default |
 |---|---|---|
-| timezone | searchable enum (zoneinfo) | `UTC` (or geoip hint if net) |
+| timezone | searchable enum (zoneinfo) | **autodetected** via geoip when net is up; user confirms/overrides; `UTC` fallback |
 | locales | multi-select (locale.gen) | `en_US.UTF-8` |
 | default_locale | enum (⊂ locales) | first selected |
-| keymap | enum (console keymaps) | `us` |
-| xkb_layout | string | derived from keymap |
+| keymap | enum (console keymaps) | `us` — drives xkb_layout default |
 | ntp | bool | `true` (chrony / systemd-timesyncd) |
 
 ## P4 — Accounts
@@ -99,7 +115,7 @@ they're getting.
 | user.name / .groups / .shell | str / list / enum | — / `wheel,audio,video` / `/bin/bash` | shell from /etc/shells of stage3 |
 | user.password | secret | — | optional if ssh key present |
 | user.ssh_authorized_keys | textarea | — | ssh pubkey syntax check |
-| privilege | enum `sudo\|doas\|none` | `sudo` | `none` only if root unlocked |
+| privilege | enum `doas\|sudo\|none` | `doas` | minimal-footprint default per distro ethos; `none` only if root unlocked |
 
 VALIDATE (hard): after all options applied, ≥1 usable login path —
 password on a surviving account, or `sshd=true` + authorized key.
@@ -109,10 +125,16 @@ password on a surviving account, or `sshd=true` + authorized key.
 | Field | Type | Default | Validation |
 |---|---|---|---|
 | hostname | string | `gentoo` | RFC 1123 |
-| kernel | enum `dist-bin\|dist\|manual` | `dist-bin` | `manual` = we mount+chroot, user configures — expert |
+| kernel | enum with user-facing explanations: `dist-bin` = "prebuilt official kernel — fastest, recommended"; `dist` = "compiled from source with Gentoo defaults — tunable"; `manual` = "gentoo-sources, you configure it" (expert) | `dist-bin` | — |
 | initramfs | enum `dracut\|ugrd\|none` | `dracut` | `none` unsafe with LUKS/LVM/separate-/usr — VALIDATE warns/blocks |
 | uki | bool | false | implies dracut/ugrd + installkernel[uki] |
-| bootloader | enum `auto\|grub\|systemd-boot\|efistub` | `auto` | auto resolves **boot mode first**: BIOS ⇒ grub always; UEFI ⇒ systemd-boot on systemd, grub on openrc. Explicit `systemd-boot`/`efistub`/`uki` on BIOS are hard-rejected by VALIDATE |
+| bootloader | enum `auto\|grub\|systemd-boot\|efistub\|limine\|refind` | `auto` | auto resolves **boot mode first**: BIOS ⇒ grub always; UEFI ⇒ systemd-boot on systemd, grub on openrc. Explicit `systemd-boot`/`efistub`/`uki`/`limine-efi`/`refind` on BIOS are hard-rejected by VALIDATE (limine BIOS mode exists — offered separately under `limine` with `bios` sub-option) |
+
+Seamless kernel upgrades (hard requirement): dist kernels +
+installkernel regenerate boot entries on every kernel emerge —
+systemd-boot/grub via existing installkernel plugins; **limine** gets a
+shipped kernel-install plugin writing `limine.conf` entries; **rEFInd**
+auto-discovers kernels/UKIs on the ESP (no config regen needed).
 | secure_boot | enum `off\|sbctl\|shim` | `off` | UEFI-only — hidden and forced `off` on BIOS boots (VALIDATE rejects non-`off` there too); `sbctl` requires uki or signed grub; `shim` for grub only |
 | net_manager | enum `networkmanager\|dhcpcd\|netifrc\|systemd-networkd` | `networkmanager` | `systemd-networkd` needs init=systemd |
 | wifi_fw | bool | detected | `linux-firmware` + `sof-firmware` |
@@ -123,7 +145,7 @@ password on a surviving account, or `sshd=true` + authorized key.
 
 | Field | Type | Default |
 |---|---|---|
-| package_sets | multi-select from preset (`minimal`, `desktop-base`, `cosmic-desktop`, `dev-tools`, `server`) | `minimal` |
+| package_sets | multi-select from preset — stock preset ships `minimal` only; downstream distros define their own sets | `minimal` |
 | extra_atoms | list editor | `[]` |
 | use_global | searchable flag editor (tri-state: on/off/unset) with `use.desc` descriptions | profile defaults |
 | use_pkg | per-package `package.use` records (v2; v1 edits a raw table) | `[]` |
