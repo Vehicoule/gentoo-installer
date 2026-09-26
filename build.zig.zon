@@ -1,0 +1,16 @@
+.{
+    .name = .gentoo_installer,
+    .version = "0.0.0",
+    .fingerprint = 0xff38eed1a0751a99,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "presets",
+        "docs",
+        "LICENSE",
+        "README.md",
+    },
+}
