@@ -27,6 +27,7 @@ interaction mode.
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | locale | enum (preset list) | `en_US.UTF-8` | display language for the wizard itself |
+| keymap | enum (console keymaps) | `us` | applies to the *live env* immediately (`loadkeys`/`localectl`); prefills P3's installed-system keymap — needed before P1's LUKS passphrase, not after |
 | mode | enum `express\|advanced` | `express` | sets the flow: express skips all non-essential pages; advanced exposes every field |
 | answer_file | path (optional) | — | loads a saved config and jumps to P7 Review |
 
@@ -145,7 +146,8 @@ password on a surviving account, or `sshd=true` + authorized key.
 | keep_kernels | int | 3 | kernel boot entries retained; 0 = never prune |
 | net_manager | enum `networkmanager\|dhcpcd\|netifrc\|systemd-networkd` | `networkmanager` | `systemd-networkd` needs init=systemd |
 | wifi_fw | bool | detected | `linux-firmware` + `sof-firmware` |
-| microcode | bool | detected (vendor) | intel-microcode / amd via linux-firmware |
+| gpu_driver | enum `auto\|nouveau\|nvidia-open\|nvidia-drivers` | `auto` | `auto` = in-kernel/mesa; NVIDIA ⇒ generation-aware: **`nvidia-open`** on Turing+ (GTX 16xx/RTX 20xx+ — Express's opinionated pick), `nvidia-drivers` or `nouveau` on older silicon. `nvidia-*` options appear only when `env.gpus[]` reports NVIDIA; VALIDATE rejects `nvidia-open` on pre-Turing. They imply `ACCEPT_LICENSE=+NVIDIA` and kernel-module signing when secure_boot is on |
+| microcode | bool | detected (vendor) | intel-microcode / amd via linux-firmware; loaded early via the initramfs (dracut `early_microcode`) |
 | services.sshd / .logger / .cron | bool | false/true/true | — |
 
 Seamless kernel upgrades (hard requirement): dist kernels +
@@ -177,7 +179,7 @@ firmware menu, which already lists them.
 
 | Field | Type | Default |
 |---|---|---|
-| package_sets | multi-select from preset — stock preset ships `minimal` only; downstream distros define their own sets | `minimal` |
+| package_sets | multi-select from preset — stock gentoo preset ships `minimal` / `cosmic` (minimal COSMIC DE) / `cosmic-full` (full COSMIC DE incl. apps); downstream distros define their own | `minimal` |
 | extra_atoms | list editor | `[]` |
 | use_global | searchable flag editor (tri-state: on/off/unset) with `use.desc` descriptions | profile defaults |
 | use_pkg | per-package `package.use` records (v2; v1 edits a raw table) | `[]` |
@@ -226,5 +228,6 @@ shell into the installed system — archinstall-style escape hatch),
 unmount + reboot, install-media removal note.
 
 Failure/abort path: resume instructions (`gentoo-installer --resume`
-same-boot; `detect --repair` after reboot) + copyable log bundle for a
-bug report.
+same-boot; `detect --repair` after reboot) + **export logs** — writes
+the journal + event log as a tarball to a picked disk/ESP partition or
+USB for bug reports and mass-install debugging.

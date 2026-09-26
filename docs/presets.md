@@ -68,6 +68,11 @@ fields = ["stage3.libc", "system.init"]   # the wizard, rejected if a
 enabled = true                   # a distro may ship Express-only
 fields_shown = ["disk.device", "confirm"] # plus credentials, always
 
+[[repos]]                        # overlays a set's atoms come from
+name        = "cosmic"           # `eselect repository enable cosmic`
+                                 # before packages merge; or `sync_uri`
+                                 # = "https://…git" to vendor your own
+
 [[package_sets]]                 # multi-select on P6
 id          = "minimal"
 label       = "Minimal"
@@ -77,11 +82,26 @@ default     = true               # pre-checked (when defaults.packages
                                  # .sets is absent)
 
 [[package_sets]]
-id          = "mydistro-desktop"
-label       = "MyDistro Desktop"
-description = "COSMIC session + audio + distro tools"
-atoms       = ["cosmic-de/cosmic-meta", "media-libs/pipewire"]
+id          = "cosmic"
+label       = "COSMIC (minimal)"
+description = "COSMIC session: compositor, greeter, seat stack"
+repos       = ["cosmic"]         # set requires this overlay
+atoms       = ["cosmic-de/cosmic-meta", "media-libs/pipewire",
+               "gui-apps/turnstile", "sys-auth/seatd",
+               "sys-apps/dbus"]  # Chimera-proven session/seat stack —
+                                 # replaces elogind on non-systemd inits
 use         = { "media-libs/pipewire" = "sound-server dbus" }
+default     = false
+
+[[package_sets]]
+id          = "cosmic-full"
+label       = "COSMIC (full)"
+description = "minimal COSMIC + apps: files, terminal, editor, store"
+repos       = ["cosmic"]
+atoms       = ["cosmic-de/cosmic-meta", "cosmic-de/cosmic-apps",
+               "media-libs/pipewire", "gui-apps/turnstile",
+               "sys-auth/seatd", "sys-apps/dbus"]
+extends     = "cosmic"           # optional: set that must accompany this one
 default     = false
 
 [[extra_steps]]                  # journaled pipeline extensions
@@ -110,7 +130,10 @@ post_install = "scripts/post-install.sh"  # last thing inside chroot,
   step), honor retry/skip/`skippable`. Sandboxing is the chroot; they
   see `/mnt/gentoo` as `/`.
 - **package_sets** are the only way a preset shapes P6 — the stock
-  preset ships `minimal` alone; COSMIC or any DE is a downstream set.
+  preset ships `minimal` / `cosmic` / `cosmic-full`; a set's `repos`
+  list names `[[repos]]` overlays the engine enables (`eselect
+  repository`) or adds (`sync_uri`) before merge; `extends` forces
+  another set on when this one is picked.
 - **hooks.post_install** is where the distro's own magic lives (install
   the WM, write first-boot units, seed `/etc/mydistro`).
 - **Assets** are relative to the preset dir; the GUI resolves `logo`
@@ -121,7 +144,8 @@ post_install = "scripts/post-install.sh"  # last thing inside chroot,
 
 ## The stock preset
 
-`presets/gentoo/` in-tree: `id="gentoo"`, zero locks, `minimal`
-package set only, no extra steps, branding = Gentoo. It exists to keep
-the generic installer fully functional and to serve as the reference
-preset.
+`presets/gentoo/` in-tree: `id="gentoo"`, zero locks, three package sets
+(`minimal` / `cosmic` / `cosmic-full` via the upstream `cosmic` overlay —
+a distro preset may vendor its own `sync_uri` later), no extra steps,
+branding = Gentoo. It exists to keep the generic installer fully
+functional and to serve as the reference preset.
