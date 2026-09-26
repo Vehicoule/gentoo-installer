@@ -55,7 +55,8 @@ needed". IDs are **prescribed where the tool allows** — `sgdisk -u
 <part>:<GUID>` sets the planned PARTUUID; `mkfs.* -U` (btrfs/ext4/f2fs),
 `-m uuid=` (xfs), `-i` (vfat — a 32-bit serial surfaced as `XXXX-XXXX`,
 FAT has no real UUID) set fs ids; `cryptsetup luksFormat --uuid` sets
-the LUKS UUID; `pvcreate --uuid` sets the PV uuid. What remains
+the LUKS UUID; `pvcreate --uuid <u> --norestorefile` sets the PV uuid
+(the restorefile flag is required alongside `--uuid`). What remains
 unprescribed — VG/LV uuids — is probed with the LVM tools
 (`vgs`/`lvs -o *_uuid`, not `blkid`) and journaled.
 
@@ -63,7 +64,11 @@ Repair after a reboot (live journal gone) anchors on prescribed IDs,
 never generated ones: a partition slot is identified by its planned
 PARTUUID; `cryptsetup isLuks` or an LVM PV signature on that slot
 proves `luks_format`/`pvcreate` ran; `vg0`/`tank`/`root` names plus
-the parent PV's signature are the VG/LV identity check.
+the parent PV's signature are the VG/LV identity check. With `luks=on`
+the PV sits *inside* `cryptroot` — repair first asks for the
+passphrase (or `--key-file` in unattended runs) and opens the
+container before probing inner layers; until unlocked, those ops
+report `unknown` (locked), never `done`.
 
 ## Layer stacking (fixed order)
 
@@ -121,6 +126,10 @@ detect OSes ──► space_src?
 ```
 
 - Never reformats the existing ESP; Windows Boot Manager preserved.
+  Bootloader files land under a preset-scoped dir (`EFI/<preset.id>`)
+  so a new install never overwrites another loader — the ESP write
+  list is part of the plan preview, and the alongside ack notes the
+  ESP gains files (nothing removed).
 - `resize_fs` runs **before** the partition shrink so fs metadata is
   consistent; ntfsresize then sgdisk resize; `ntfsfix`-clean required
   first (dirty NTFS ⇒ refuse with instructions to `chkdsk` / full
