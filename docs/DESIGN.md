@@ -234,8 +234,8 @@ locale      = "en_US.UTF-8"      # default LANG (⊂ locales)
 keymap      = "us"
 kernel      = "dist-bin"         # dist-bin | dist | manual
 bootloader  = "auto"             # auto | grub | systemd-boot | efistub | limine | refind
-                               # Express pins limine (uniform BIOS+UEFI); auto
-                               # is the Advanced-flow default resolution
+                               # auto always resolves to limine (uniform
+                               # BIOS+UEFI); the rest are explicit Advanced picks
 initramfs   = "dracut"           # dracut | ugrd | none
 uki         = false              # unified kernel image
 binhost     = true               # official gentoo binhost
@@ -393,8 +393,8 @@ converted to `password_hash` at export (no plaintext, file mode 0600).
   drive/9p, runs `--config test.conf` over serial, asserts the guest boots
   to a login prompt. The same script scales to arm64 (qemu-system-aarch64 +
   UEFI firmware) and riscv64 later.
-- CI matrix (later): {openrc,systemd} × {ext4,xfs,btrfs} × {grub,systemd-boot}
-  × {amd64,arm64,riscv64}.
+- CI matrix (later): {openrc,systemd} × {ext4,xfs,btrfs} × {limine,grub,systemd-boot}
+  × {amd64,arm64,riscv64} — limine must be in it, it's the `auto` default.
 
 ## Repo layout
 
@@ -417,7 +417,8 @@ GUI is a separate build artifact; the TUI/engine binary stays dependency-free.
 - **M1** — engine: config model, runner, partition/mount/stage3/chroot,
   portage gen; `--dry-run` end-to-end. Unit + golden tests.
 - **M2** — TUI wizard over the shared state machine; happy path
-  (UEFI/GPT, openrc|systemd, ext4/xfs, dist-bin kernel, grub|systemd-boot).
+  (UEFI/GPT, openrc|systemd, ext4/xfs, dist-bin kernel, limine +
+  grub|systemd-boot explicit picks).
 - **M3** — QEMU green: real install boots on amd64 for the happy path.
 - **M4** — libcosmic GUI shell on the headless protocol.
 - **M5** — option matrix: LUKS, LVM, btrfs subvols, nomultilib, manual
@@ -428,17 +429,33 @@ GUI is a separate build artifact; the TUI/engine binary stays dependency-free.
 - **M7** — distro preset layer hardening (branding, extra steps,
   post-install hooks), docs, 1.0.
 
-## Open questions
+## Efficiency budget
 
-1. License — defaulting to **GPL-3.0-or-later** (installer convention, e.g.
-   Calamares; Slint not in play anymore so no constraint). Confirm or pick
-   MIT/Apache-2.0.
-2. Binary naming: `gentoo-installer` (cli+tui+headless) and
-   `gentoo-installer-gui`? 
-3. Bootloader default on UEFI: `systemd-boot` (lighter, fits the efficiency
-   ethos) vs `grub` (most familiar)? Proposal: `auto` resolves boot mode
-   first — BIOS ⇒ always grub; UEFI ⇒ systemd-boot on systemd variants,
-   grub on openrc. VALIDATE hard-rejects systemd-boot/efistub/uki on BIOS.
-4. Do we ship a `.zigmod`/`zig` version manager pin or rely on distro zig?
-5. First distro preset beyond stock gentoo — defer until M6, but the schema
-   should be drafted against a real wish-list (your wayland WM + tools).
+Memory efficiency is a distro value, so the installer measures itself:
+
+| surface | target | rationale |
+|---|---|---|
+| engine+TUI binary | ≤ 4 MiB, one artifact | runs on the *minimal* ISO; no deps past libc |
+| engine RSS | ≤ 32 MiB during any step | installs must work on ≤ 1 GiB VMs |
+| TUI repaint | ≤ 16 ms full draw at 80×24 | libvaxis does terminal-query detection — no terminfo dep on a stripped ISO |
+| GUI binary | ≤ 15 MiB, ≤ 150 MiB RSS | LiveGUI only — never shipped on the minimal ISO |
+| ISO additive weight | ≤ 6 MiB on the *minimal* ISO (engine+TUI+assets); ≤ 25 MiB on *LiveGUI* (adds the GUI) | keeps both live images lean |
+| startup | `hello` → first page ≤ 300 ms cold | perceived polish |
+| event stream | ≤ 1 MB/day steady-state | NDJSON lines are tiny; `log` events dominate, streamed not buffered |
+
+Enforcement (planned — no build/CI exists yet): once the repo has CI,
+build `-Drelease=small` and fail on binary-size or peak-RSS regression
+(QEMU smoke run); the table is the ratchet.
+
+## Decisions
+
+- **License**: GPL-3.0-or-later (installer convention, e.g. Calamares).
+- **Binaries**: `gentoo-installer` (engine+TUI+headless) and
+  `gentoo-installer-gui` (libcosmic shell).
+- **Bootloader `auto`**: resolves to **limine** on both BIOS and UEFI,
+  both flows; grub/systemd-boot/efistub/rEFInd are explicit Advanced
+  picks. VALIDATE hard-rejects systemd-boot/efistub/uki on BIOS.
+- **Zig pin**: exact version, pinned in `build.zig.zon` + CI + the
+  environment blueprint — distro zig is not assumed.
+- **First custom preset**: deferred to M6; the preset schema is drafted
+  against the distro wish-list (wayland WM + tools).
