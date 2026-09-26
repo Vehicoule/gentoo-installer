@@ -1142,7 +1142,7 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
                 \\# onto the ESP at the fixed paths the loader entry uses.
                 \\[ "$1" = add ] || exit 0
                 \\cp -f "$4" /efi/vmlinuz || exit 1
-                \\initrd=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img 2>/dev/null | head -n1)
+                \\initrd=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img /boot/*/*/initrd* 2>/dev/null | head -n1)
                 \\[ -n "$initrd" ] && cp -f "$initrd" /efi/initramfs.img
                 \\exit 0
                 ,

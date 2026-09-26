@@ -5,11 +5,16 @@ Phase A (this script): boot the Gentoo minimal ISO kernel+initrd under
 OVMF with a serial console, pull the installer binary + ops over
 hostfwd-friendly user-net http, run the install, power off.
 """
-import os, sys, time
+import os, subprocess, sys, time
 import pexpect
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG = os.path.join(HERE, "phase-a.log")
+ISO = os.path.join(HERE, "install-amd64-minimal.iso")
+
+def iso_label():
+    return subprocess.check_output(
+        ["blkid", "-o", "value", "-s", "LABEL", ISO]).decode().strip()
 
 QEMU = [
     "qemu-system-x86_64",
@@ -18,8 +23,8 @@ QEMU = [
     "-bios", "/usr/share/OVMF/OVMF_CODE.fd",
     "-kernel", os.path.join(HERE, "boot/vmlinuz-live"),
     "-initrd", os.path.join(HERE, "boot/initrd-live"),
-    "-append", "console=ttyS0,115200 root=live:CDLABEL=Gentoo-amd64-20260913 rd.live.dir=/ rd.live.squashimg=image.squashfs cdroot dokeymap",
-    "-cdrom", os.path.join(HERE, "install-amd64-minimal.iso"),
+    "-append", "console=ttyS0,115200 root=live:CDLABEL=%s rd.live.dir=/ rd.live.squashimg=image.squashfs cdroot dokeymap" % iso_label(),
+    "-cdrom", ISO,
     "-drive", "file=%s,if=virtio,format=qcow2" % os.path.join(HERE, "target.qcow2"),
     "-nic", "user,model=virtio-net-pci",
     "-nographic", "-no-reboot",

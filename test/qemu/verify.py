@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """Phase B: add serial console to limine.conf (if needed) via live ISO,
 then boot the installed qcow2 under OVMF alone and expect a login prompt."""
-import os, sys, pexpect
+import os, subprocess, sys, pexpect
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG = os.path.join(HERE, "phase-b.log")
+ISO = os.path.join(HERE, "install-amd64-minimal.iso")
+
+def iso_label():
+    return subprocess.check_output(
+        ["blkid", "-o", "value", "-s", "LABEL", ISO]).decode().strip()
 
 def live_extra_args():
     return [
         "-kernel", os.path.join(HERE, "boot/vmlinuz-live"),
         "-initrd", os.path.join(HERE, "boot/initrd-live"),
-        "-append", "console=ttyS0,115200 root=live:CDLABEL=Gentoo-amd64-20260913 rd.live.dir=/ rd.live.squashimg=image.squashfs cdroot dokeymap",
-        "-cdrom", os.path.join(HERE, "install-amd64-minimal.iso"),
+        "-append", "console=ttyS0,115200 root=live:CDLABEL=%s rd.live.dir=/ rd.live.squashimg=image.squashfs cdroot dokeymap" % iso_label(),
+        "-cdrom", ISO,
     ]
 
 QEMU_BASE = [
@@ -52,9 +57,12 @@ def main():
     c.sendline(b"TestUser#2026")
     c.expect(r"gentoo.*[$#]|~".encode(), timeout=20)
     print("== LOGIN WORKS")
-    c.sendline(b"uname -a; cat /etc/os-release | head -2; sudo -n true 2>/dev/null; doas -n true 2>/dev/null; id")
-    c.expect(b"livecd|gentoo|uid=", timeout=20)
-    c.sendline(b"poweroff")
+    c.sendline(b"uname -a; cat /etc/os-release | head -2; id; echo V-MARK-$?")
+    c.expect(b"V-MARK-0", timeout=20)
+    c.sendline(b"su - root -c 'echo SU-OK; poweroff'")
+    c.expect(b"[Pp]assword", timeout=20)
+    c.sendline(b"TestRoot#2026")
+    c.expect(b"SU-OK", timeout=20)
     c.expect(pexpect.EOF, timeout=60)
     print("== PHASE B PASS")
     log.close()
