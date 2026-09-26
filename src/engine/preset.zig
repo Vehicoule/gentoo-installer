@@ -86,6 +86,102 @@ pub fn checkLocks(alloc: Allocator, preset: *const Preset, user_doc: *const toml
     return errs.items;
 }
 
+pub const ResolvedSets = struct {
+    atoms: [][]const u8,
+    repos: [][]const u8,
+};
+
+/// Resolve `packages.sets` names against the preset's [[package_sets]]
+/// (id → atoms + repos, honouring `extends`). Unknown names are a
+/// validation-style error list the caller surfaces.
+pub fn resolveSets(alloc: Allocator, preset: ?*const Preset, names: []const []const u8) !struct { resolved: ResolvedSets, errs: [][]const u8 } {
+    var atoms: std.ArrayList([]const u8) = .empty;
+    var repos: std.ArrayList([]const u8) = .empty;
+    // dedupe atoms/repos across extends chains (a child may restate
+    // parent entries)
+    var atoms_seen: std.StringHashMap(void) = .init(alloc);
+    var repos_seen: std.StringHashMap(void) = .init(alloc);
+    defer atoms_seen.deinit();
+    defer repos_seen.deinit();
+    var errs: std.ArrayList([]const u8) = .empty;
+    var seen: std.StringHashMap(void) = .init(alloc);
+    defer seen.deinit();
+
+    // No preset → sets are unresolvable by definition; treat as empty
+    // (set ids are preset-defined vocabulary, not engine vocabulary).
+    if (preset == null) return .{ .resolved = .{ .atoms = &.{}, .repos = &.{} }, .errs = errs.items };
+    const sets_table: ?[]toml.Value = blk: {
+        const p = preset.?;
+        const v = p.doc.root.get("package_sets") orelse break :blk null;
+        break :blk switch (v) {
+            .array => |a| a,
+            else => null,
+        };
+    };
+
+    // No sets named in config → pull in the preset's `default = true` sets.
+    var effective = names;
+    var defaults: std.ArrayList([]const u8) = .empty;
+    if (names.len == 0) {
+        if (sets_table) |arr| {
+            for (arr) |v| {
+                if (v != .table) continue;
+                const d = v.table.get("default") orelse continue;
+                if (d != .boolean or !d.boolean) continue;
+                const iv = v.table.get("id") orelse continue;
+                if (iv == .string) try defaults.append(alloc, iv.string);
+            }
+        }
+        effective = defaults.items;
+    }
+
+    for (effective) |name| {
+        var stack: std.ArrayList([]const u8) = .empty;
+        try stack.append(alloc, name);
+        while (stack.pop()) |cur| {
+            if (seen.contains(cur)) continue;
+            try seen.put(cur, {});
+            const set = findSet(sets_table, cur) orelse {
+                try errs.append(alloc, std.fmt.allocPrint(alloc, "packages.sets: unknown set '{s}'", .{cur}) catch @panic("oom"));
+                continue;
+            };
+            if (set.get("atoms")) |a| {
+                if (a == .array)
+                    for (a.array) |item| {
+                        if (item == .string and !atoms_seen.contains(item.string)) {
+                            try atoms_seen.put(item.string, {});
+                            try atoms.append(alloc, item.string);
+                        }
+                    };
+            }
+            if (set.get("repos")) |a| {
+                if (a == .array)
+                    for (a.array) |item| {
+                        if (item == .string and !repos_seen.contains(item.string)) {
+                            try repos_seen.put(item.string, {});
+                            try repos.append(alloc, item.string);
+                        }
+                    };
+            }
+            if (set.get("extends")) |e| {
+                if (e == .string) try stack.append(alloc, e.string);
+            }
+        }
+    }
+    return .{ .resolved = .{ .atoms = atoms.items, .repos = repos.items }, .errs = errs.items };
+}
+
+fn findSet(sets: ?[]toml.Value, id: []const u8) ?toml.Value.Table {
+    const arr = sets orelse return null;
+    for (arr) |v| {
+        if (v != .table) continue;
+        if (v.table.get("id")) |iv| {
+            if (iv == .string and std.mem.eql(u8, iv.string, id)) return v.table;
+        }
+    }
+    return null;
+}
+
 fn lookup(root: toml.Value.Table, dotted: []const u8) ?toml.Value {
     var cur = root;
     var it = std.mem.splitScalar(u8, dotted, '.');
@@ -106,7 +202,8 @@ fn valueEq(a: toml.Value, b: toml.Value) bool {
         .integer => |ai| b == .integer and ai == b.integer,
         .float => |af| b == .float and af == b.float,
         .boolean => |ab| b == .boolean and ab == b.boolean,
-        .array => |aa| b == .array and aa.len == b.array.len and blk: {
+        .array => |aa| blk: {
+            if (b != .array or aa.len != b.array.len) break :blk false;
             for (aa, b.array) |x, y| if (!valueEq(x, y)) break :blk false;
             break :blk true;
         },

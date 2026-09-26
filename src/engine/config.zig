@@ -170,7 +170,7 @@ fn boolOr(v: toml.Value, path: []const u8) DecodeError!bool {
 
 fn intOr(v: toml.Value, path: []const u8) DecodeError!u32 {
     return switch (v) {
-        .integer => |i| if (i >= 0) @intCast(i) else decodeFail(path, "expected non-negative int"),
+        .integer => |i| if (i >= 0 and i <= std.math.maxInt(u32)) @intCast(i) else decodeFail(path, "expected non-negative u32"),
         else => decodeFail(path, "expected int"),
     };
 }
@@ -416,8 +416,27 @@ pub fn validate(alloc: Allocator, cfg: *const Config, has_nvidia: ?bool) ![][]co
     }
     if (cfg.makeconf.cflags == .custom) {
         const v = cfg.makeconf.cflags.custom;
-        if (hasCtl(v)) try errs.append(alloc, "makeconf.cflags contains control characters");
+        if (hasCtl(v) or hasShellMeta(v))
+            try errs.append(alloc, "makeconf.cflags contains shell metacharacters — portage sources make.conf");
     }
+    // URLs interpolated into sh -c strings must be plain URL charset.
+    if (!urlSafe(cfg.stage3.mirror))
+        try errs.append(alloc, "stage3.mirror contains characters outside URL charset");
+    if (!urlSafe(cfg.makeconf.mirrors))
+        try errs.append(alloc, "makeconf.mirrors contains characters outside URL charset");
+    // Erase-disk schemes always format — wipe=false preserves nothing.
+    if (!cfg.disk.wipe and cfg.disk.scheme != .alongside and cfg.disk.scheme != .manual)
+        try errs.append(alloc, "disk.wipe=false has no effect on erase schemes — use alongside/manual to preserve data");
+    // usernames become filesystem paths (/home/<name>) and useradd args.
+    for (cfg.users) |u| {
+        if (!posixName(u.name))
+            try errs.append(alloc, fmt(alloc, "users[].name '{s}' is not a POSIX account name", .{u.name}));
+        for (u.groups) |g|
+            if (!posixName(g))
+                try errs.append(alloc, fmt(alloc, "group '{s}' is not a POSIX group name", .{g}));
+    }
+    if (!hostnameOk(cfg.system.hostname))
+        try errs.append(alloc, fmt(alloc, "hostname '{s}' is not a valid hostname", .{cfg.system.hostname}));
     for (cfg.system.locales) |l|
         if (hasCtl(l)) try errs.append(alloc, fmt(alloc, "locale contains control characters: '{s}'", .{l}));
     for (cfg.users) |u| {
@@ -497,6 +516,62 @@ pub fn validate(alloc: Allocator, cfg: *const Config, has_nvidia: ?bool) ![][]co
 fn hasCtl(v: []const u8) bool {
     for (v) |ch| if (ch < 0x20 or ch == 0x7f) return true;
     return false;
+}
+
+// Characters that would break out of quoting or inject commands into
+// make.conf (a shell-sourced file) or sh -c strings.
+fn hasShellMeta(v: []const u8) bool {
+    for (v) |ch| {
+        switch (ch) {
+            '\'', '"', '\\', '$', '`', ';', '|', '&', '<', '>', '(', ')', '{', '}', '[', ']' => return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+// URL allowlist: scheme://host/path chars only.
+fn urlSafe(v: []const u8) bool {
+    if (v.len == 0) return false;
+    for (v) |ch| {
+        switch (ch) {
+            'a'...'z', 'A'...'Z', '0'...'9', ':', '/', '?', '&', '=', '.', '_', '~', '%', '-' => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
+// POSIX account/group names: [a-z_][a-z0-9_-]*, ≤32 chars. This also
+// rules out '/', '\\', '..' — user names build filesystem paths.
+fn posixName(v: []const u8) bool {
+    if (v.len == 0 or v.len > 32) return false;
+    for (v, 0..) |ch, i| {
+        const ok = switch (ch) {
+            'a'...'z', '_', '-' => true,
+            '0'...'9' => i > 0,
+            else => false,
+        };
+        if (!ok) return false;
+    }
+    return true;
+}
+
+// RFC1123 hostname: labels of alnum + '-', not starting/ending with '-'.
+fn hostnameOk(v: []const u8) bool {
+    if (v.len == 0 or v.len > 253) return false;
+    var it = std.mem.splitScalar(u8, v, '.');
+    while (it.next()) |label| {
+        if (label.len == 0) return false;
+        if (label[0] == '-' or label[label.len - 1] == '-') return false;
+        for (label) |ch| {
+            switch (ch) {
+                'a'...'z', 'A'...'Z', '0'...'9', '-' => {},
+                else => return false,
+            }
+        }
+    }
+    return true;
 }
 
 fn fmt(alloc: Allocator, comptime f: []const u8, args: anytype) []const u8 {

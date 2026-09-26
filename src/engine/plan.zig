@@ -98,7 +98,12 @@ fn step(alloc: Allocator, id: []const u8, title: []const u8, cmds: std.ArrayList
 /// Build the full install plan. `env` comes from detect; when null
 /// (e.g. `--dry-run` off a bare config on a non-live host), detection-
 /// dependent commands are still emitted with placeholders.
-pub fn build(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !Plan {
+pub const Sets = struct {
+    atoms: []const []const u8 = &.{},
+    repos: []const []const u8 = &.{},
+};
+
+pub fn build(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, pkg_sets: Sets) !Plan {
     var steps: std.ArrayList(Step) = .empty;
 
     try steps.append(alloc, step(alloc, "detect", "Detect environment", blk: {
@@ -125,6 +130,7 @@ pub fn build(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !Pla
     try steps.append(alloc, try planFstab(alloc, cfg));
     try steps.append(alloc, try planSystemConfig(alloc, cfg));
     try steps.append(alloc, try planServices(alloc, cfg));
+    try steps.append(alloc, try planPackages(alloc, cfg, pkg_sets));
     try steps.append(alloc, try planBootloader(alloc, cfg));
     try steps.append(alloc, try planFinish(alloc, cfg));
 
@@ -284,6 +290,13 @@ fn planMount(alloc: Allocator, cfg: *const Config) !Step {
         const swap_n: u32 = if (cfg.boot_mode == .uefi) 2 else 2;
         try c.append(alloc, argv(alloc, &.{ "swapon", partPath(alloc, cfg.disk.device, swap_n) }, "enable swap"));
     }
+    // btrfs: mount the home + snapshots subvolumes created earlier.
+    if (cfg.disk.root_fs == .btrfs) {
+        const dev = root.dev;
+        try c.append(alloc, argv(alloc, &.{ "mkdir", "-p", "/mnt/gentoo/home", "/mnt/gentoo/.snapshots" }, "subvol mountpoints"));
+        try c.append(alloc, argv(alloc, &.{ "mount", "-o", "subvol=@home,compress=zstd:1,noatime", dev, "/mnt/gentoo/home" }, "mount @home"));
+        try c.append(alloc, argv(alloc, &.{ "mount", "-o", "subvol=@snapshots,compress=zstd:1,noatime", dev, "/mnt/gentoo/.snapshots" }, "mount @snapshots"));
+    }
     try c.append(alloc, .{ .note = "bind mounts (/proc /sys /dev /run) happen at enter-chroot" });
     return step(alloc, "mount", "Mount target", c);
 }
@@ -294,16 +307,17 @@ fn planStage3(alloc: Allocator, cfg: *const Config) !Step {
     const arch = @tagName(cfg.arch);
     const base = s(alloc, "{s}/releases/{s}/autobuilds", .{ cfg.stage3.mirror, arch });
     try c.append(alloc, argv(alloc, &.{ "curl", "-fsSL", "-o", "/tmp/latest.txt", s(alloc, "{s}/latest-stage3-{s}.txt", .{ base, stem }) }, "resolve stage3 pointer"));
-    // Resolve filename from the pointer, fetch tarball+signature+digests,
-    // and link them under canonical names for the verify/extract cmds.
+    // Resolve filename from the pointer, fetch tarball+signature+digests.
+    // latest.txt entries may carry a dated subdir (2026…/stage3-….tar.xz):
+    // use the full path in the URL but save locally under the basename.
     try c.append(alloc, .{ .exec = .{
         .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc,
             "f=$(grep -oE '[^ ]*stage3-[^ ]*\\.tar\\.xz' /tmp/latest.txt | head -n1); " ++
-            "test -n \"$f\" || exit 1; " ++
-            "curl -fsSL -o \"/tmp/$f\" '{s}/'$f && " ++
-            "curl -fsSL -o \"/tmp/$f.asc\" '{s}/'$f.asc && " ++
+            "test -n \"$f\" || exit 1; b=${{f##*/}}; " ++
+            "curl -fsSL -o \"/tmp/$b\" '{s}/'$f && " ++
+            "curl -fsSL -o \"/tmp/$b.asc\" '{s}/'$f.asc && " ++
             "curl -fsSL -o /tmp/stage3.DIGESTS '{s}/'$f.DIGESTS && " ++
-            "ln -sf \"$f\" /tmp/stage3.tar.xz && ln -sf \"$f.asc\" /tmp/stage3.tar.xz.asc",
+            "ln -sf \"$b\" /tmp/stage3.tar.xz && ln -sf \"$b.asc\" /tmp/stage3.tar.xz.asc",
             .{ base, base, base }) }),
         .desc = "download stage3 tarball + .asc + .DIGESTS (resolved from latest.txt)",
     } });
@@ -571,9 +585,17 @@ fn planFstab(alloc: Allocator, cfg: *const Config) !Step {
         try w.print("{s}\t/efi\tvfat\tdefaults\t0 2\n", .{partPath(alloc, cfg.disk.device, 1)});
     if (cfg.disk.swap == .partition)
         try w.print("{s}\tnone\tswap\tsw\t0 0\n", .{partPath(alloc, cfg.disk.device, 2)});
+    if (cfg.disk.root_fs == .btrfs) {
+        try w.print("{s}\t/home\tbtrfs\tsubvol=@home,compress=zstd:1,noatime\t0 2\n", .{root.dev});
+        try w.print("{s}\t/.snapshots\tbtrfs\tsubvol=@snapshots,compress=zstd:1,noatime\t0 2\n", .{root.dev});
+    }
     if (cfg.disk.swap == .zram)
         try w.writeAll("# zram swap configured via /etc/systemd/zram-generator.conf or OpenRC zram service\n");
     try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/fstab", aw.written()));
+    // LUKS root: crypttab names the GPT partlabel (we set -cN:root), so
+    // initramfs unlockers find the raw container behind /dev/mapper/cryptroot.
+    if (cfg.disk.luks)
+        try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/crypttab", "cryptroot /dev/disk/by-partlabel/root none luks\n"));
     return step(alloc, "fstab", "Generate fstab", c);
 }
 
@@ -683,6 +705,16 @@ fn planServices(alloc: Allocator, cfg: *const Config) !Step {
     if (cfg.services.sshd) try enables.append(alloc, .{ .name = "sshd", .runlevel = "default" });
     if (cfg.services.logger and init != .systemd) try enables.append(alloc, .{ .name = "sysklogd", .runlevel = "default" });
 
+    // Alt-init packages: the stage3 is OpenRC-flavoured, so the chosen
+    // init is installed on top. Service-level migration (sv dirs, dinit
+    // links) lands with the init backends in M6.
+    switch (init) {
+        .dinit => try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-process/dinit" }), .chroot = true, .desc = "dinit package (service migration is M6)" } }),
+        .runit => try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-process/runit" }), .chroot = true, .desc = "runit package (service migration is M6)" } }),
+        .s6 => try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-apps/s6", "sys-apps/s6-rc" }), .chroot = true, .desc = "s6 + s6-rc packages (service migration is M6)" } }),
+        else => {},
+    }
+
     for (enables.items) |e| {
         switch (init) {
             .systemd => try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "systemctl", "enable", e.name }), .chroot = true, .desc = s(alloc, "enable {s}", .{e.name}) } }),
@@ -693,6 +725,36 @@ fn planServices(alloc: Allocator, cfg: *const Config) !Step {
         }
     }
     return step(alloc, "services", "Enable services", c);
+}
+
+/// packages step: preset-resolved sets + config atoms actually emerge.
+fn planPackages(alloc: Allocator, cfg: *const Config, sets: Sets) !Step {
+    var c: std.ArrayList(Cmd) = .empty;
+    // overlay repos a set asked for (e.g. cosmic) — enable + sync first.
+    for (sets.repos) |repo| {
+        try c.append(alloc, .{ .exec = .{
+            .argv = try alloc.dupe([]const u8, &.{ "eselect", "repository", "enable", repo }),
+            .chroot = true,
+            .desc = s(alloc, "enable {s} overlay", .{repo}),
+        } });
+        try c.append(alloc, .{ .exec = .{
+            .argv = try alloc.dupe([]const u8, &.{ "emerge", "--sync", repo }),
+            .chroot = true,
+            .desc = s(alloc, "sync {s} overlay", .{repo}),
+        } });
+    }
+    var atoms: std.ArrayList([]const u8) = .empty;
+    try atoms.appendSlice(alloc, sets.atoms);
+    try atoms.appendSlice(alloc, cfg.packages.atoms);
+    if (atoms.items.len > 0)
+        try c.append(alloc, .{ .exec = .{
+            .argv = try prepend(alloc, "emerge", try alloc.dupe([]const u8, atoms.items)),
+            .chroot = true,
+            .desc = "package sets + extra atoms",
+        } });
+    if (c.items.len == 0)
+        try c.append(alloc, .{ .note = "no extra packages" });
+    return step(alloc, "packages", "Install packages", c);
 }
 
 fn planBootloader(alloc: Allocator, cfg: *const Config) !Step {
@@ -712,9 +774,9 @@ fn planBootloader(alloc: Allocator, cfg: *const Config) !Step {
                     .desc = "ESP layout",
                 } });
                 try c.append(alloc, .{ .exec = .{
-                    .argv = try alloc.dupe([]const u8, &.{ "cp", "/usr/share/limine/BOOTX64.EFI", "/efi/EFI/BOOT/" }),
+                    .argv = try alloc.dupe([]const u8, &.{ "cp", s(alloc, "/usr/share/limine/{s}", .{efiBootFile(cfg)}), "/efi/EFI/BOOT/" }),
                     .chroot = true,
-                    .desc = "limine EFI binary (amd64)",
+                    .desc = s(alloc, "limine EFI binary ({s})", .{efiBootFile(cfg)}),
                 } });
             } else {
                 try c.append(alloc, argv(alloc, &.{ "limine", "bios-install", cfg.disk.device }, "limine BIOS stages"));
@@ -744,10 +806,10 @@ fn planBootloader(alloc: Allocator, cfg: *const Config) !Step {
             var grub_args: std.ArrayList([]const u8) = .empty;
             try grub_args.appendSlice(alloc, &.{ "emerge", "sys-boot/grub" });
             try c.append(alloc, .{ .exec = .{ .argv = grub_args.items, .chroot = true, .desc = "grub" } });
-            const target = if (cfg.boot_mode == .uefi) "efi" else "i386-pc";
+            const target = if (cfg.boot_mode == .uefi) grubEfiTarget(cfg) else "i386-pc";
             if (cfg.boot_mode == .uefi)
                 try c.append(alloc, .{ .exec = .{
-                    .argv = try alloc.dupe([]const u8, &.{ "grub-install", "--target=x86_64-efi", "--efi-directory=/efi" }),
+                    .argv = try alloc.dupe([]const u8, &.{ "grub-install", s(alloc, "--target={s}", .{grubEfiTarget(cfg)}), "--efi-directory=/efi" }),
                     .chroot = true,
                     .desc = "grub-install UEFI",
                 } })
@@ -825,12 +887,38 @@ fn profilePath(alloc: Allocator, cfg: *const Config) ![]const u8 {
     return s(alloc, "default/linux/{s}/23.0/{s}", .{ @tagName(cfg.arch), joined });
 }
 
+/// Fallback-loader EFI filename for the target arch (matches what
+/// sys-boot/limine ships and what firmware looks for on EFI/BOOT).
+fn efiBootFile(cfg: *const Config) []const u8 {
+    return switch (cfg.arch) {
+        .amd64 => "BOOTX64.EFI",
+        .arm64 => "BOOTAA64.EFI",
+        .riscv64 => "BOOTRISCV64.EFI",
+        else => "BOOTX64.EFI",
+    };
+}
+
+fn grubEfiTarget(cfg: *const Config) []const u8 {
+    return switch (cfg.arch) {
+        .amd64 => "x86_64-efi",
+        .arm64 => "arm64-efi",
+        .riscv64 => "riscv64-efi",
+        else => "x86_64-efi",
+    };
+}
+
 fn limineConf(alloc: Allocator, cfg: *const Config) []const u8 {
     var aw: std.Io.Writer.Allocating = .init(alloc);
     const w = &aw.writer;
     w.writeAll("# generated by gentoo-installer\n") catch {};
     w.writeAll("timeout: 5\n\n") catch {};
-    const root_args = s(alloc, "root={s}", .{fsDevice(alloc, cfg)});
+    var root_args = s(alloc, "root={s}", .{fsDevice(alloc, cfg)});
+    // btrfs: install mounted subvol=@root — boot must select it too.
+    if (cfg.disk.root_fs == .btrfs)
+        root_args = s(alloc, "{s} rootflags=subvol=@root", .{root_args});
+    // LUKS: dracut unlocks via crypttab/rd.luks at initramfs time.
+    if (cfg.disk.luks)
+        root_args = s(alloc, "{s} rd.luks=1", .{root_args});
     w.print("/Gentoo\n", .{}) catch {};
     w.writeAll("    protocol: linux\n") catch {};
     w.writeAll("    kernel_path: boot:///vmlinuz\n") catch {};
@@ -887,13 +975,14 @@ test "golden plan: uefi + luks + lvm + btrfs + limine" {
     defer arena.deinit();
     const alloc = arena.allocator();
     const cfg = try config.decode(alloc, doc);
-    const plan = try build(alloc, &cfg, null);
+    const plan = try build(alloc, &cfg, null, .{});
 
     const expected_ids = [_][]const u8{
         "detect",       "partition",      "mount",          "stage3",
         "portage-config", "enter-chroot", "repo-sync",      "profile",
         "world-update", "base-config",    "firmware-kernel", "fstab",
-        "system-config", "services",      "bootloader",     "finish",
+        "system-config", "services",      "packages",       "bootloader",
+        "finish",
     };
     try std.testing.expectEqual(expected_ids.len, plan.steps.len);
     for (expected_ids, plan.steps) |id, st| try std.testing.expectEqualStrings(id, st.id);
@@ -921,9 +1010,12 @@ test "golden plan: uefi + luks + lvm + btrfs + limine" {
 
     // bootloader step emits a limine.conf write_file.
     var saw_limine = false;
-    for (plan.steps[14].cmds) |cmd| {
-        if (cmd == .write_file and std.mem.endsWith(u8, cmd.write_file.path, "limine.conf"))
-            saw_limine = true;
+    for (plan.steps) |st| {
+        if (!std.mem.eql(u8, st.id, "bootloader")) continue;
+        for (st.cmds) |cmd| {
+            if (cmd == .write_file and std.mem.endsWith(u8, cmd.write_file.path, "limine.conf"))
+                saw_limine = true;
+        }
     }
     try std.testing.expect(saw_limine);
 }

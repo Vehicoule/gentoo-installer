@@ -208,7 +208,18 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    const p = try engine.plan.build(alloc, &cfg, if (env_opt) |*e| e else null);
+    // Resolve preset package sets → atoms + overlay repos (M1: preset
+    // supplies the set table; absent preset = stock gentoo ids only).
+    var pkg_sets: engine.plan.Sets = .{};
+    const rs = try engine.preset.resolveSets(alloc, if (preset) |*pp| pp else null, cfg.packages.sets);
+    for (rs.errs) |e| try errw.print("{s}\n", .{e});
+    if (rs.errs.len > 0) {
+        try errw.flush();
+        std.process.exit(1);
+    }
+    pkg_sets = .{ .atoms = rs.resolved.atoms, .repos = rs.resolved.repos };
+
+    const p = try engine.plan.build(alloc, &cfg, if (env_opt) |*e| e else null, pkg_sets);
     try engine.runner.run(io, alloc, p, .{
         .mode = if (dry_run or cmd == .plan) .dry_run else .exec,
         .journal_path = if (cmd == .run and !dry_run) journal_path else null,
@@ -245,9 +256,6 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
     var fr = std.Io.File.stdin().reader(io, &stdin_buf);
     const r = &fr.interface;
 
-    try out.writeAll("{\"type\":\"ready\",\"version\":\"m1\"}\n");
-    try out.flush();
-
     var line_buf: std.Io.Writer.Allocating = .init(alloc);
     defer line_buf.deinit();
     while (true) {
@@ -267,27 +275,75 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
             continue;
         } else break;
         const op = opField(line) orelse {
-            try out.writeAll("{\"type\":\"error\",\"error\":\"missing op\"}\n");
+            try writeErr(out, reqField(line), "missing op");
             try out.flush();
             continue;
         };
-        if (std.mem.eql(u8, op, "detect")) {
+        const req = reqField(line);
+        if (std.mem.eql(u8, op, "hello")) {
+            // the hello reply doubles as ready, per docs/protocol.md
+            try out.writeAll("{\"ev\":\"hello\",");
+            try writeReq(out, req);
+            try out.writeAll("\"engine\":\"0.1.0\",\"version\":1,\"caps\":[\"detect\",\"install\",\"validate\"]}\n");
+        } else if (std.mem.eql(u8, op, "detect")) {
             const env = try engine.detect.detect(alloc, io);
-            try out.writeAll("{\"type\":\"env\",\"env\":");
-            try engine.detect.envToJson(alloc, &env, out);
+            try out.writeAll("{\"ev\":\"env\",");
+            try writeReq(out, req);
+            try engine.detect.envFieldsJson(alloc, &env, out);
             try out.writeAll("}\n");
-        } else if (std.mem.eql(u8, op, "hello")) {
-            try out.writeAll("{\"type\":\"hello\",\"version\":\"m1\",\"ready\":true}\n");
         } else if (std.mem.eql(u8, op, "quit")) {
-            try out.writeAll("{\"type\":\"bye\"}\n");
+            try out.writeAll("{\"ev\":\"result\",");
+            try writeReq(out, req);
+            try out.writeAll("\"ok\":true}\n");
             try out.flush();
             return;
         } else {
-            try out.print("{{\"type\":\"error\",\"error\":\"unknown op '{s}' (m1 supports hello/detect/quit)\"}}\n", .{op});
+            var aw: std.Io.Writer.Allocating = .init(alloc);
+            aw.writer.writeAll("unknown op '") catch return error.OutOfMemory;
+            jsonEsc(&aw.writer, op);
+            aw.writer.writeAll("' (m1 supports hello/detect/quit)") catch return error.OutOfMemory;
+            try writeErr(out, req, aw.written());
         }
         try out.flush();
         // consume the delimiter streamDelimiter left buffered; EOF → break
         const avail = r.peekGreedy(1) catch break;
         if (avail.len > 0 and avail[0] == '\n') r.toss(1);
     }
+}
+
+/// Emit `{"ev":"error","req":N,"error":"<escaped>"}`.
+fn writeErr(out: *std.Io.Writer, req: ?u64, msg: []const u8) !void {
+    try out.writeAll("{\"ev\":\"error\",");
+    try writeReq(out, req);
+    try out.writeAll("\"error\":\"");
+    jsonEsc(out, msg);
+    try out.writeAll("\"}\n");
+}
+
+/// `"req":N,` prefix when the request carried one.
+fn writeReq(out: *std.Io.Writer, req: ?u64) !void {
+    if (req) |rq| try out.print("\"req\":{},", .{rq});
+}
+
+fn jsonEsc(w: *std.Io.Writer, str: []const u8) void {
+    for (str) |ch| {
+        switch (ch) {
+            '"', '\\' => w.print("\\{c}", .{ch}) catch return,
+            '\n' => w.writeAll("\\n") catch return,
+            '\r' => w.writeAll("\\r") catch return,
+            '\t' => w.writeAll("\\t") catch return,
+            else => if (ch < 0x20) w.print("\\u{x:0>4}", .{ch}) catch return else w.writeByte(ch) catch return,
+        }
+    }
+}
+
+/// Extract a top-level integer `"req"` token (echo correlation).
+fn reqField(line: []const u8) ?u64 {
+    const k = std.mem.indexOf(u8, line, "\"req\"") orelse return null;
+    var i = k + 5;
+    while (i < line.len and (line[i] == ' ' or line[i] == ':')) i += 1;
+    var end = i;
+    while (end < line.len and line[end] >= '0' and line[end] <= '9') end += 1;
+    if (end == i) return null;
+    return std.fmt.parseInt(u64, line[i..end], 10) catch null;
 }

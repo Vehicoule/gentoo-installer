@@ -204,11 +204,19 @@ fn detectDisks(alloc: Allocator, io: std.Io) ![]const DiskInfo {
     return out.items;
 }
 
-/// Emit env as a JSON object — the protocol's `env` event payload.
+/// Emit env as a JSON object — the standalone `detect` CLI output.
 pub fn envToJson(alloc: Allocator, env: *const Env, w: *std.Io.Writer) !void {
-    try w.writeAll("{\"boot_mode\":\"");
+    try w.writeAll("{");
+    try envFieldsJson(alloc, env, w);
+    try w.writeAll("}");
+}
+
+/// The env event payload fields (no braces) — flat, per
+/// docs/protocol.md's env event contract.
+pub fn envFieldsJson(alloc: Allocator, env: *const Env, w: *std.Io.Writer) !void {
+    try w.writeAll("\"boot\":\"");
     try w.writeAll(@tagName(env.boot_mode));
-    try w.print("\",\"arch\":\"{s}\",\"ram_mib\":{},\"net_reachable\":{},", .{ @tagName(env.arch), env.ram_mib, env.net_reachable });
+    try w.print("\",\"arch\":\"{s}\",\"ram_mib\":{},\"net\":{},", .{ @tagName(env.arch), env.ram_mib, env.net_reachable });
     try w.writeAll("\"gpus\":[");
     for (env.gpus, 0..) |g, i| {
         if (i > 0) try w.writeAll(",");
@@ -217,13 +225,13 @@ pub fn envToJson(alloc: Allocator, env: *const Env, w: *std.Io.Writer) !void {
     try w.writeAll("],\"disks\":[");
     for (env.disks, 0..) |d, i| {
         if (i > 0) try w.writeAll(",");
-        try w.print("{{\"name\":\"{s}\",\"path\":\"{s}\",\"size_bytes\":{},\"removable\":{}}}", .{ d.name, d.path, d.size_bytes, d.removable });
+        try w.print("{{\"name\":\"{s}\",\"path\":\"{s}\",\"size_gib\":{},\"removable\":{}}}", .{ d.name, d.path, d.size_bytes / (1 << 30), d.removable });
     }
     try w.writeAll("],\"cpu_flags\":[");
     for (env.cpu_flags, 0..) |f, i| {
         if (i > 0) try w.writeAll(",");
         try w.print("\"{s}\"", .{f});
     }
-    try w.writeAll("]}");
+    try w.writeAll("]");
     _ = alloc;
 }
