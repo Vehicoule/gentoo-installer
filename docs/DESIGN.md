@@ -19,6 +19,8 @@ extensibility toward a downstream Gentoo-based distribution.
 - **Dual-boot**: detect existing OSes (Windows, other Linux, FreeBSD) and
   install alongside them — shrink/make room, keep the existing ESP,
   register both systems in the boot menu.
+- **UEFI and BIOS/CSM** boot paths on amd64 (UEFI primary; BIOS supported
+  for legacy hardware).
 - **Secure Boot**: a real signing flow — sbctl-managed keys or shim+MOK —
   so UKI/GRUB installs boot with SB enabled.
 - **Mass-install automation**: `--config` answer files plus the headless
@@ -31,8 +33,6 @@ extensibility toward a downstream Gentoo-based distribution.
 
 ## Non-goals (v1)
 
-- BIOS/CSM boot on amd64 (UEFI first; BIOS is a later milestone — dual-boot
-  support targets UEFI systems first).
 - Split-usr and x32 stage3 flavors (accepted by the config schema, gated
   behind "expert" until validated).
 - Replacing the Handbook for experts — `gentoo-installer --config` gives a
@@ -75,6 +75,9 @@ hottest interface for nothing).
   `gentoo-installer wizard --headless` exposes `GET page`, `SET field`, `NEXT`,
   `BACK`, `VALIDATE` over JSONL, so TUI and GUI can never drift apart and
   `--config file` (unattended) is the same engine with a prefilled config.
+  Two flows — **Express** (opinionated defaults pre-selected; asks only
+  for disk, confirmation, credentials) and **Advanced** (every field
+  editable) — differ only in page visibility, never in behavior.
 - **Every side effect is a `Cmd` through a `Runner`.** `RealRunner` execs;
   `DryRunner` logs. Nothing in the pipeline touches the OS except through this
   seam — that is what makes `--dry-run`, unit tests, and the QEMU harness work.
@@ -143,14 +146,41 @@ sensible):
     logger (sysklogd on OpenRC), cron (cronie), chrony.
 15. **bootloader** — GRUB (BIOS `grub-install /dev/X`; UEFI
     `grub-install --efi-directory=/efi` + `grub-mkconfig`), systemd-boot
-    (`bootctl install`, kernels at `/efi`), or EFI-stub/UKI via
-    `installkernel[uki dracut]`; `--removable` fallback offered when efivars
-    are unavailable. **Secure Boot**: sign the boot path — sbctl-generated
-    keys enrolled via firmware setup mode (or shim+MOK for GRUB),
-    `sbctl sign` on UKIs/bootloader binaries, ukify hooks so future kernel
-    installs stay signed. **Dual-boot**: grub `os-prober` output or
-    systemd-boot's auto-discovered ESP entries get merged into the menu;
-    Windows Boot Manager entry preserved.
+    (`bootctl install`, kernels at `/efi`), EFI-stub/UKI via
+    `installkernel[uki dracut]`, **Limine** (UEFI + BIOS modes — a shipped
+    kernel-install plugin rewrites `limine.conf` on kernel emerge), or
+    **rEFInd** (UEFI; auto-discovers kernels/UKIs on the ESP).
+    `--removable` fallback offered when efivars are unavailable.
+    **Seamless upgrades** are a hard requirement: every supported
+    bootloader regenerates/picks up new kernel entries automatically via
+    installkernel hooks. **Rollback** is bootloader-agnostic and two-
+    layered: kernel rollback keeps the last `keep_kernels`
+    kernels+initramfs with live boot entries (never pruned unprompted);
+    system snapshots come from a hook that snapshots root before each
+    `world-update` or kernel install — btrfs `@snapshots` subvol on the
+    default layout, or an LVM-thin snapshot when `lvm=on` (the planner
+    then provisions a thin pool + thin root LV, not just a VG) — and
+    registers a boot entry per snapshot. Entry generation is per-
+    bootloader: limine/grub/systemd-boot emit menu entries from our
+    hooks; rEFInd gets generated `refind.conf` `menuentry` stanzas —
+    `options "root=… rootflags=subvol=@snapshots/<n> …"` preserving the
+    normal kernel args plus the snapshot subvol (auto-discovery alone
+    only finds ESP kernels, never snapshot roots); efistub has no menu
+    at all — snapshots stay recoverable by adding `rootflags=subvol=`
+    to a manual UEFI entry or from live media (no per-snapshot NVRAM
+    churn). CoW-less roots (xfs/ext4/f2fs without LVM) get kernel
+    rollback only — P1 surfaces that trade-off at fs selection.
+    **Secure Boot**: sign the boot path —
+    sbctl-generated keys enrolled via firmware setup mode (or shim+MOK
+    for GRUB), `sbctl sign` on UKIs/bootloader binaries, ukify hooks so
+    future kernel installs stay signed. **Dual-boot**: every detected OS
+    gets a menu entry on every menu-capable bootloader — grub merges
+    `os-prober` output, systemd-boot auto-discovers ESP entries, rEFInd
+    discovers them too, and our limine plugin emits `efi_chainload`
+    entries for ESP-resident loaders (e.g.
+    `EFI/Microsoft/Boot/bootmgfw.efi`). efistub needs nothing — the
+    firmware boot menu already lists the foreign entries. Windows Boot
+    Manager entry always preserved.
 16. **finish** — `passwd -l root` when `root.lock_root`, artifact cleanup
     (`/stage3-*`), preset post-install hook, summary + reboot prompt.
 
@@ -167,41 +197,58 @@ boot_mode   = "uefi"             # detected; uefi | bios
 device      = "/dev/sda"
 wipe        = true               # must be false when scheme = "alongside"
 scheme      = "efi-swap-root"    # | bios-boot-swap-root | alongside | manual
-root_fs     = "xfs"              # xfs | ext4 | btrfs | f2fs
-swap_mib    = 4096               # 0 = none
-luks        = false              # LUKS2 on root
-lvm         = false              # LVM2 vg on the raw root part (or on LUKS)
+root_fs     = "btrfs"            # btrfs | xfs | ext4 | f2fs (+expert bcachefs)
+swap        = "zram"             # zram | partition | none
+swap_mib    = 4096               # only when swap=partition
+boot_part   = false              # separate /boot (expert crypto layouts)
+luks        = false              # LUKS2 on root (passphrase via stdin only)
+lvm         = false              # LVM2 vg on the raw root part (or inside
+                                # LUKS); with snapshots!=off provisions a thin
+                                # pool + thin root LV
 
 # alongside mode only:
-shrink_part = "/dev/sda3"         # partition to shrink (ntfs/ext4/btrfs)
-shrink_mib  = 61440               # space to free for the new install
-# unattended dual-boot = scheme "alongside" + shrink_* ; omitting them in
-# interactive mode lets the wizard pick the shrink candidate.
+space_src   = "shrink"            # shrink | free-space — free-space reuses the
+                                # largest contiguous unallocated region (≥ min
+                                # install size) and touches no partition
+shrink_part = "/dev/sda3"         # shrink only: partition to shrink (ntfs/ext4/btrfs)
+shrink_mib  = 61440               # shrink only: space to free for the new install
+# unattended dual-boot = scheme "alongside" + space_src: "shrink" requires
+# shrink_part + shrink_mib; "free-space" needs neither shrink_* field.
 
 [stage3]
-variant     = "desktop-systemd"  # see matrix below — glibc/musl,
-                               # gcc/llvm, hardened, selinux all flow
-                               # through this one field
+# axes-based selection; variant stem is resolved from these
+libc        = "glibc"            # glibc | musl (musl disables systemd)
+toolchain   = "gcc"              # gcc | llvm
+variant     = "hardened-selinux-systemd"  # resolved stem; per-arch
+                               # availability via the axes table
 mirror      = "https://distfiles.gentoo.org"
 
 [system]
-init        = "systemd"          # openrc | systemd — first-class;
-                               # runit | s6 | dinit accepted under expert
-                               # (no stage3s; installed as a post-stage3
-                               # init swap — see "Init systems" below)
+init        = "systemd"          # openrc | systemd | runit | s6 | dinit
+                               # all offered; alt inits install via
+                               # post-stage3 swap — see "Init systems"
 hostname    = "gentoo"
-timezone    = "UTC"
-locale      = "en_US.UTF-8"
+timezone    = "UTC"              # autodetected via geoip when possible
+locales     = ["en_US.UTF-8"]    # locale.gen entries
+locale      = "en_US.UTF-8"      # default LANG (⊂ locales)
 keymap      = "us"
 kernel      = "dist-bin"         # dist-bin | dist | manual
-bootloader  = "auto"             # auto | grub | systemd-boot | efistub
+bootloader  = "auto"             # auto | grub | systemd-boot | efistub | limine | refind
+                               # Express pins limine (uniform BIOS+UEFI); auto
+                               # is the Advanced-flow default resolution
 initramfs   = "dracut"           # dracut | ugrd | none
 uki         = false              # unified kernel image
 binhost     = true               # official gentoo binhost
+privilege   = "doas"             # doas | sudo | none (none ⇒ root unlocked)
+keep_kernels = 3                 # boot entries retained; 0 = never prune
+snapshots   = "auto"             # auto | off — auto: btrfs @snapshots, or
+                                # lvm-thin when lvm=on; CoW-less roots get
+                                # kernel rollback only
 
 [makeconf]
 cflags      = "native"           # safe | native | custom "<flags>"
 jobs        = 0                  # 0 = auto (nproc, mem-capped)
+mem_cap_gib = 0                  # 0 = auto (~2 GiB/job heuristic)
 video_cards = "auto"
 accept_license = "@FREE"
 
@@ -237,11 +284,24 @@ lock_root = false                   # `passwd -l root` at finish (sudo-only box)
 # yield a system no one can log into.
 
 [security]
-secure_boot = "off"              # off | sbctl | shim  (uki/bootloader signing)
-selinux     = false              # forces hardened-selinux stage3 + profile
+secure_boot = "off"              # off | sbctl | shim — UEFI only
+hardening   = "hardened-selinux" # standard | hardened | hardened-selinux
+                               # default ON per project direction; selects
+                               # the hardened-* stage3 stem (toolchain is
+                               # baked in — cannot be layered on later)
+selinux     = true               # additive: sec-policy/* + refpolicy;
+                               # forces a hardened-selinux stem
+
+[packages]
+sets = ["minimal"]               # preset-defined package sets
+atoms = []                       # extra package atoms (world)
+
+[use]
+global = {}                      # "flag" = true|false (unset = profile default)
+[use.pkg]                        # per-package package.use records
+# "sys-kernel/gentoo-kernel" = "dracut uki"
 
 [extra]
-packages = []                    # additional emerges
 update_world = true
 ```
 
@@ -251,12 +311,21 @@ update_world = true
 `nomultilib-*`, `hardened-*`, `hardened-selinux-*`, `musl-*`,
 `musl-hardened-*`, `musl-llvm-*`, `llvm-*`, `openrc-splitusr`, `x32-*`.
 
-v1 guided path offers: `openrc`, `systemd`, `desktop-openrc`,
-`desktop-systemd`, `musl-*`, `llvm-*` (+ `nomultilib-*`, `hardened-*`,
-`hardened-selinux-*` under expert — promoted goals, each flagged
-"untested path" until the QEMU matrix covers it). `musl-llvm-*` combines
-both axes. selinux additionally requires `security.selinux = true` so the
-profile/policy packages land (sec-policy/*, refpolicy).
+Selection is **axes-based**: `libc × toolchain × hardening × init` map to
+a stage3 stem (glibc+llvm+hardened ⇒ `hardened-llvm-*`; musl+llvm ⇒
+`musl-llvm-*`; plain glibc+gcc+systemd ⇒ `systemd`). Hardening is baked
+into the stage3 toolchain — it cannot be applied atop a standard stage3
+— while SELinux policy is additive (sec-policy/*, refpolicy). Defaults:
+glibc, gcc, `hardened+selinux`, per project direction.
+
+The userland is GNU on every stem (glibc or musl libc + coreutils):
+portage ebuilds assume GNU/POSIX tools throughout the tree, so leaner
+userlands (busybox, uutils coreutils) are a preset-layer concern, not an
+install-time axis.
+
+Constraints: `musl` ⇒ no systemd (needs glibc); runit/s6/dinit OK on
+either libc; `*-systemd` stems ⇒ systemd. nomultilib and x32 stay
+expert-gated until the QEMU matrix covers them.
 
 arm64/riscv64 differences handled by an `arch table`: stage3 stems
 (`stage3-arm64-openrc`, `stage3-rv64_lp64d-openrc` …), profile names, boot
@@ -268,14 +337,13 @@ document the firmware step until validated).
 
 ### Init systems
 
-`openrc` and `systemd` are the only first-class inits — they are the only
-ones Gentoo ships stage3s and profiles for. `runit`, `s6` (+s6-rc), and
-`dinit` exist as packages (runit/s6 in ::gentoo, dinit via guru) with no
-official stage3 or install path: supporting them means extracting a
-normal stage3 and swapping the init — an `init-backend` engine interface
-(`services`, `logger`, `getty`, `boot` wiring per init) keeps the
-pipeline agnostic so these land as expert-flagged options once validated,
-not as a redesign.
+All five inits are offered in the wizard — `openrc`, `systemd` are
+first-class (they have stage3s and profiles); `runit`, `s6` (+s6-rc),
+`dinit` carry an "early support" badge: no official stage3s exist, so
+those installs extract a normal stage3 and swap the init. An
+`init-backend` engine interface (`services`, `logger`, `getty`, `boot`
+wiring per init) keeps the pipeline agnostic. Constraint: `musl` removes
+only systemd — the supervision inits work fine on musl.
 
 ## Headless protocol (GUI ↔ engine)
 
@@ -299,7 +367,9 @@ not as a redesign.
 
 Errors carry `{code, message, hint}`; the GUI renders them as dialogs, the
 TUI as an error page. `wizard` commands that need a choice
-(`confirm_wipe`, `ask_retry`) are first-class ops.
+(`confirm_wipe`, `ask_retry`) are first-class ops. Answer-file export
+serializes the current `InstallConfig` to TOML; interactive passwords are
+converted to `password_hash` at export (no plaintext, file mode 0600).
 
 ## Safety
 
@@ -352,7 +422,7 @@ GUI is a separate build artifact; the TUI/engine binary stays dependency-free.
 - **M4** — libcosmic GUI shell on the headless protocol.
 - **M5** — option matrix: LUKS, LVM, btrfs subvols, nomultilib, manual
   kernel, custom partitions; musl + llvm + hardened(-selinux) stage3
-  paths; arm64 + riscv64 bring-up.
+  paths; BIOS/CSM boot path; arm64 + riscv64 bring-up.
 - **M6** — secure boot signing flow (sbctl path first), dual-boot
   alongside-mode + menu merge, runit/s6/dinit init-backend exploration.
 - **M7** — distro preset layer hardening (branding, extra steps,
@@ -366,8 +436,9 @@ GUI is a separate build artifact; the TUI/engine binary stays dependency-free.
 2. Binary naming: `gentoo-installer` (cli+tui+headless) and
    `gentoo-installer-gui`? 
 3. Bootloader default on UEFI: `systemd-boot` (lighter, fits the efficiency
-   ethos) vs `grub` (most familiar)? Proposal: `auto` = systemd-boot on
-   systemd variants, grub on openrc.
+   ethos) vs `grub` (most familiar)? Proposal: `auto` resolves boot mode
+   first — BIOS ⇒ always grub; UEFI ⇒ systemd-boot on systemd variants,
+   grub on openrc. VALIDATE hard-rejects systemd-boot/efistub/uki on BIOS.
 4. Do we ship a `.zigmod`/`zig` version manager pin or rely on distro zig?
 5. First distro preset beyond stock gentoo — defer until M6, but the schema
    should be drafted against a real wish-list (your wayland WM + tools).
