@@ -133,8 +133,8 @@ sensible):
     (`bootctl install`, kernels at `/efi`), or EFI-stub/UKI via
     `installkernel[uki dracut]`; `--removable` fallback offered when efivars
     are unavailable.
-16. **finish** — `passwd -l root` option, artifact cleanup (`/stage3-*`),
-    preset post-install hook, summary + reboot prompt.
+16. **finish** — `passwd -l root` when `root.lock_root`, artifact cleanup
+    (`/stage3-*`), preset post-install hook, summary + reboot prompt.
 
 ## Config model
 
@@ -198,11 +198,14 @@ ssh_authorized_keys = ["ssh-ed25519 AAAA…"]
 
 [root]
 password_hash = "$6$…"              # same rule; absent = root stays locked
+lock_root = false                   # `passwd -l root` at finish (sudo-only box)
 
-# VALIDATE must prove at least one login path exists: a password_hash on
-# any account (root or user), OR services.sshd = true with at least one
-# ssh_authorized_keys. Key-only + sshd=false is rejected — it would yield
-# a system no one can log into.
+# VALIDATE must prove at least one login path exists *after* install
+# options are applied: a password_hash on an account that survives to the
+# finished system (lock_root = true doesn't count), OR services.sshd =
+# true with at least one ssh_authorized_keys. Key-only + sshd=false, or
+# root-hash + lock_root with nothing else, are rejected — they would
+# yield a system no one can log into.
 
 [extra]
 packages = []                    # additional emerges
