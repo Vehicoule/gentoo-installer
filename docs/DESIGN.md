@@ -153,7 +153,17 @@ sensible):
     `--removable` fallback offered when efivars are unavailable.
     **Seamless upgrades** are a hard requirement: every supported
     bootloader regenerates/picks up new kernel entries automatically via
-    installkernel hooks. **Secure Boot**: sign the boot path —
+    installkernel hooks. **Rollback** is bootloader-agnostic and two-
+    layered: kernel rollback keeps the last `keep_kernels`
+    kernels+initramfs with live boot entries (never pruned unprompted);
+    system snapshots come from a hook that snapshots root before each
+    `world-update` or kernel install — btrfs `@snapshots` subvol on the
+    default layout, LVM-thin when `lvm=on` — and registers a boot entry
+    per snapshot (our limine/grub/systemd-boot hooks emit these
+    uniformly; rEFInd discovers them itself). CoW-less roots
+    (xfs/ext4/f2fs without LVM) get kernel rollback only — P1 surfaces
+    that trade-off at fs selection.
+    **Secure Boot**: sign the boot path —
     sbctl-generated keys enrolled via firmware setup mode (or shim+MOK
     for GRUB), `sbctl sign` on UKIs/bootloader binaries, ukify hooks so
     future kernel installs stay signed. **Dual-boot**: grub `os-prober`
@@ -183,10 +193,13 @@ luks        = false              # LUKS2 on root (passphrase via stdin only)
 lvm         = false              # LVM2 vg on the raw root part (or inside LUKS)
 
 # alongside mode only:
-shrink_part = "/dev/sda3"         # partition to shrink (ntfs/ext4/btrfs)
-shrink_mib  = 61440               # space to free for the new install
-# unattended dual-boot = scheme "alongside" + shrink_* ; omitting them in
-# interactive mode lets the wizard pick the shrink candidate.
+space_src   = "shrink"            # shrink | free-space — free-space reuses the
+                                # largest contiguous unallocated region (≥ min
+                                # install size) and touches no partition
+shrink_part = "/dev/sda3"         # shrink only: partition to shrink (ntfs/ext4/btrfs)
+shrink_mib  = 61440               # shrink only: space to free for the new install
+# unattended dual-boot = scheme "alongside" + space_src; "free-space" needs
+# neither shrink_* field.
 
 [stage3]
 # axes-based selection; variant stem is resolved from these
@@ -207,10 +220,16 @@ locale      = "en_US.UTF-8"      # default LANG (⊂ locales)
 keymap      = "us"
 kernel      = "dist-bin"         # dist-bin | dist | manual
 bootloader  = "auto"             # auto | grub | systemd-boot | efistub | limine | refind
+                               # Express pins limine (uniform BIOS+UEFI); auto
+                               # is the Advanced-flow default resolution
 initramfs   = "dracut"           # dracut | ugrd | none
 uki         = false              # unified kernel image
 binhost     = true               # official gentoo binhost
 privilege   = "doas"             # doas | sudo | none (none ⇒ root unlocked)
+keep_kernels = 3                 # boot entries retained; 0 = never prune
+snapshots   = "auto"             # auto | off — auto: btrfs @snapshots, or
+                                # lvm-thin when lvm=on; CoW-less roots get
+                                # kernel rollback only
 
 [makeconf]
 cflags      = "native"           # safe | native | custom "<flags>"
@@ -284,6 +303,11 @@ a stage3 stem (glibc+llvm+hardened ⇒ `hardened-llvm-*`; musl+llvm ⇒
 into the stage3 toolchain — it cannot be applied atop a standard stage3
 — while SELinux policy is additive (sec-policy/*, refpolicy). Defaults:
 glibc, gcc, `hardened+selinux`, per project direction.
+
+The userland is GNU on every stem (glibc or musl libc + coreutils):
+portage ebuilds assume GNU/POSIX tools throughout the tree, so leaner
+userlands (busybox, uutils coreutils) are a preset-layer concern, not an
+install-time axis.
 
 Constraints: `musl` ⇒ no systemd (needs glibc); runit/s6/dinit OK on
 either libc; `*-systemd` stems ⇒ systemd. nomultilib and x32 stay

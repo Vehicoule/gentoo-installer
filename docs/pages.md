@@ -11,8 +11,8 @@ Two flows, picked on P0:
   the wizard only asks for the disk, confirmation, and credentials.
   Defaults: btrfs + zram, systemd, `hardened-selinux-systemd` stage3
   (glibc/gcc — one resolved stem; desktop-profile bits are applied
-  post-stage3), dist-bin kernel, auto bootloader, NM, doas, minimal
-  package set.
+  post-stage3), dist-bin kernel, **limine** bootloader (uniform across
+  BIOS/UEFI — one predictable path), NM, doas, minimal package set.
 - **Advanced** — every field on every page is editable; fields marked
   `expert` below appear only here.
 
@@ -53,7 +53,7 @@ alongside Windows** (only shown when Windows/another OS is detected),
 | device | enum (detected disks) | — | nonempty; excluded: the disk hosting the live env |
 | scheme | enum `normal (efi-swap-root)\|bios-boot-swap-root\|alongside\|advanced (manual)` | `normal` (UEFI) | `bios-*` shown only when booted via BIOS; `alongside` shown only when an existing OS is detected and requires free space or shrinkable partition |
 | wipe | bool | `true` | must be `false` when `scheme=alongside` (VALIDATE) |
-| root_fs | enum `xfs\|ext4\|btrfs\|f2fs` (+expert `bcachefs`) | `btrfs` | modern default; bcachefs needs a recent kernel — expert flag |
+| root_fs | enum `xfs\|ext4\|btrfs\|f2fs` (+expert `bcachefs`) | `btrfs` | modern default — CoW enables system snapshots/rollbacks (xfs/ext4/f2fs get kernel rollback only — surfaced here); bcachefs needs a recent kernel — expert flag |
 | swap | enum `zram\|partition\|none` | `zram` | `partition` reveals swap_mib; zram default fits memory-efficiency ethos (no disk swap) |
 | swap_mib | int | 4096 | only when `swap=partition` |
 | esp_mib | int (expert) | 512 | ≥128; ≥512 recommended for UKI/systemd-boot |
@@ -139,8 +139,9 @@ password on a surviving account, or `sshd=true` + authorized key.
 | kernel | enum with user-facing explanations: `dist-bin` = "prebuilt official kernel — fastest, recommended"; `dist` = "compiled from source with Gentoo defaults — tunable"; `manual` = "gentoo-sources, you configure it" (expert) | `dist-bin` | — |
 | initramfs | enum `dracut\|ugrd\|none` | `dracut` | `none` unsafe with LUKS/LVM/separate-/usr — VALIDATE warns/blocks |
 | uki | bool | false | implies dracut/ugrd + installkernel[uki] |
-| bootloader | enum `auto\|grub\|systemd-boot\|efistub\|limine\|refind` | `auto` | auto resolves **boot mode first**: BIOS ⇒ grub always; UEFI ⇒ systemd-boot on systemd, grub on openrc. Explicit `systemd-boot`/`efistub`/`uki`/`limine-efi`/`refind` on BIOS are hard-rejected by VALIDATE (limine BIOS mode exists — offered separately under `limine` with `bios` sub-option) |
-| secure_boot | enum `off\|sbctl\|shim` | `off` | UEFI-only — hidden and forced `off` on BIOS boots (VALIDATE rejects non-`off` there too); `sbctl` requires uki or signed grub; `shim` for grub only |
+| bootloader | enum `auto\|grub\|systemd-boot\|efistub\|limine\|refind` | `limine` in Express (pinned, uniform BIOS+UEFI); `auto` in Advanced | auto resolves **boot mode first**: BIOS ⇒ grub always; UEFI ⇒ systemd-boot on systemd, grub on openrc. Explicit `systemd-boot`/`efistub`/`uki`/`limine-efi`/`refind` on BIOS are hard-rejected by VALIDATE (limine BIOS mode exists — offered separately under `limine` with `bios` sub-option) |
+| secure_boot | enum `off\|sbctl\|shim` | `off` | UEFI-only — hidden and forced `off` on BIOS boots (VALIDATE rejects non-`off` there too); `sbctl` requires uki or signed bootloader; `shim` for grub only |
+| snapshots | enum `auto\|off` | `auto` | system snapshots before world-update/kernel installs; needs btrfs root or `lvm=on`, else kernel rollback only |
 | net_manager | enum `networkmanager\|dhcpcd\|netifrc\|systemd-networkd` | `networkmanager` | `systemd-networkd` needs init=systemd |
 | wifi_fw | bool | detected | `linux-firmware` + `sof-firmware` |
 | microcode | bool | detected (vendor) | intel-microcode / amd via linux-firmware |
@@ -151,6 +152,14 @@ installkernel regenerate boot entries on every kernel emerge —
 systemd-boot/grub via existing installkernel plugins; **limine** gets a
 shipped kernel-install plugin writing `limine.conf` entries; **rEFInd**
 auto-discovers kernels/UKIs on the ESP (no config regen needed).
+
+**Rollback**, same for every bootloader: (a) kernel rollback — the last
+`keep_kernels` (default 3) kernels+initramfs always keep live boot
+entries; (b) system snapshots — a hook snapshots root before each
+world-update/kernel install and registers a boot entry per snapshot
+(btrfs `@snapshots` on the default layout, LVM-thin when `lvm=on`).
+Shown as a `snapshots` toggle; on CoW-less roots it degrades to kernel
+rollback only, with a note.
 
 ## P6 — Packages & USE (the Gentoo page)
 
