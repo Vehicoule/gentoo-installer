@@ -10,8 +10,12 @@ const Config = config.Config;
 
 pub const Exec = struct {
     argv: []const []const u8,
-    /// Fed to the child's stdin (e.g. LUKS passphrase file contents).
+    /// Real bytes fed to the child's stdin (LUKS passphrase, password
+    /// hash line, …). Never printed — dry-run shows `stdin_label`.
     stdin: ?[]const u8 = null,
+    /// Redacted description shown in place of stdin data
+    /// (e.g. "<luks passphrase>").
+    stdin_label: ?[]const u8 = null,
     /// Runs inside /mnt/gentoo.
     chroot: bool = false,
     desc: []const u8 = "",
@@ -195,12 +199,14 @@ fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) 
     if (d.luks) {
         try c.append(alloc, .{ .exec = .{
             .argv = try alloc.dupe([]const u8, &.{ "cryptsetup", "luksFormat", "--type", "luks2", "--pbkdf", "argon2id", "--batch-mode", "--key-file", "-", root_part }),
-            .stdin = "<luks passphrase>",
+            .stdin = cfg.disk.luks_passphrase,
+            .stdin_label = "<luks passphrase>",
             .desc = s(alloc, "LUKS2+argon2id on {s} (passphrase on stdin)", .{root_part}),
         } });
         try c.append(alloc, .{ .exec = .{
             .argv = try alloc.dupe([]const u8, &.{ "cryptsetup", "open", "--key-file", "-", root_part, "cryptroot" }),
-            .stdin = "<luks passphrase>",
+            .stdin = cfg.disk.luks_passphrase,
+            .stdin_label = "<luks passphrase>",
             .desc = "open LUKS container",
         } });
         root_dev = "/dev/mapper/cryptroot";
@@ -225,7 +231,6 @@ fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) 
     const mk = mkfsTool(d.root_fs);
     var mkfs_argv: std.ArrayList([]const u8) = .empty;
     try mkfs_argv.append(alloc, mk.mkfs);
-    if (d.root_fs == .ext4) try mkfs_argv.append(alloc, "-O"); // placeholder for tuning flags
     try mkfs_argv.append(alloc, fs_dev);
     try c.append(alloc, fmtArgv(alloc, s(alloc, "format root as {s}", .{@tagName(d.root_fs)}), mkfs_argv.items));
 
@@ -289,11 +294,25 @@ fn planStage3(alloc: Allocator, cfg: *const Config) !Step {
     const arch = @tagName(cfg.arch);
     const base = s(alloc, "{s}/releases/{s}/autobuilds", .{ cfg.stage3.mirror, arch });
     try c.append(alloc, argv(alloc, &.{ "curl", "-fsSL", "-o", "/tmp/latest.txt", s(alloc, "{s}/latest-stage3-{s}.txt", .{ base, stem }) }, "resolve stage3 pointer"));
-    try c.append(alloc, .{ .note = "parse filename + digests lines from latest.txt" });
-    try c.append(alloc, argv(alloc, &.{ "curl", "-fsSL", "-o", "/tmp/stage3.tar.xz", "<resolved-url>" }, "download stage3 tarball"));
-    try c.append(alloc, argv(alloc, &.{ "curl", "-fsSL", "-o", "/tmp/stage3.tar.xz.asc", "<resolved-url>.asc" }, "download signature"));
+    // Resolve filename from the pointer, fetch tarball+signature+digests,
+    // and link them under canonical names for the verify/extract cmds.
+    try c.append(alloc, .{ .exec = .{
+        .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc,
+            "f=$(grep -oE '[^ ]*stage3-[^ ]*\\.tar\\.xz' /tmp/latest.txt | head -n1); " ++
+            "test -n \"$f\" || exit 1; " ++
+            "curl -fsSL -o \"/tmp/$f\" '{s}/'$f && " ++
+            "curl -fsSL -o \"/tmp/$f.asc\" '{s}/'$f.asc && " ++
+            "curl -fsSL -o /tmp/stage3.DIGESTS '{s}/'$f.DIGESTS && " ++
+            "ln -sf \"$f\" /tmp/stage3.tar.xz && ln -sf \"$f.asc\" /tmp/stage3.tar.xz.asc",
+            .{ base, base, base }) }),
+        .desc = "download stage3 tarball + .asc + .DIGESTS (resolved from latest.txt)",
+    } });
     try c.append(alloc, argv(alloc, &.{ "gpg", "--keyserver", "hkps://keys.gentoo.org", "--verify", "/tmp/stage3.tar.xz.asc", "/tmp/stage3.tar.xz" }, "GPG-verify stage3"));
-    try c.append(alloc, argv(alloc, &.{ "sha256sum", "-c", "/tmp/stage3.DIGESTS" }, "digest-verify stage3"));
+    // DIGESTS mixes SHA256/SHA512/WHIRLPOOL lines — feed sha256sum only the 64-hex lines.
+    try c.append(alloc, .{ .exec = .{
+        .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", "grep -E '^[0-9a-f]{64}  ' /tmp/stage3.DIGESTS | (cd /tmp && sha256sum -c --ignore-missing -)" }),
+        .desc = "digest-verify stage3 (SHA256 lines only)",
+    } });
     try c.append(alloc, argv(alloc, &.{ "tar", "--xattrs-include=*.*", "--numeric-owner", "-xpf", "/tmp/stage3.tar.xz", "-C", "/mnt/gentoo" }, "extract stage3"));
     return step(alloc, "stage3", "Stage3 download + extract", c);
 }
@@ -401,7 +420,7 @@ fn planPortage(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !S
     try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/package.use/installer", try packageUse(alloc, cfg)));
     try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/repos.conf/gentoo.conf", "[gentoo]\nlocation = /var/db/repos/gentoo\nsync-type = webrsync\n"));
     if (cfg.system.binhost)
-        try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/binrepos.conf/gentoobinhost.conf", "[gentoobinhost]\npriority = 9999\nsync-uri = https://distfiles.gentoo.org/releases/amd64/binpackages/23.0/x86-64/\n"));
+        try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/binrepos.conf/gentoobinhost.conf", s(alloc, "[gentoobinhost]\npriority = 9999\nsync-uri = https://distfiles.gentoo.org/releases/{s}/binpackages/23.0/x86-64/\n", .{@tagName(cfg.arch)})));
     return step(alloc, "portage-config", "Generate portage config", c);
 }
 
@@ -437,11 +456,11 @@ fn planProfile(alloc: Allocator, cfg: *const Config) !Step {
         .chroot = true,
         .desc = "list profiles (resolve stem → profile name)",
     } });
-    const stem = try config.stage3Stem(alloc, cfg);
+    const prof = try profilePath(alloc, cfg);
     try c.append(alloc, .{ .exec = .{
-        .argv = try alloc.dupe([]const u8, &.{ "eselect", "profile", "set", stem }),
+        .argv = try alloc.dupe([]const u8, &.{ "eselect", "profile", "set", prof }),
         .chroot = true,
-        .desc = "set profile",
+        .desc = s(alloc, "set profile {s}", .{prof}),
     } });
     return step(alloc, "profile", "Select portage profile", c);
 }
@@ -466,10 +485,11 @@ fn planBaseConfig(alloc: Allocator, cfg: *const Config) !Step {
     try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/locale.gen", gen.written()));
     try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "locale-gen" }), .chroot = true, .desc = "generate locales" } });
     try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "eselect", "locale", "set", cfg.system.locale }), .chroot = true, .desc = "default locale" } });
-    if (cfg.system.init == .openrc)
-        try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/conf.d/keymaps", s(alloc, "keymap=\"{s}\"\n", .{cfg.system.keymap})))
+    // localectl needs a running systemd — write the config files directly.
+    if (cfg.system.init == .systemd)
+        try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/vconsole.conf", s(alloc, "KEYMAP={s}\n", .{cfg.system.keymap})))
     else
-        try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "localectl", "set-keymap", cfg.system.keymap }), .chroot = true, .desc = "console keymap" } });
+        try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/conf.d/keymaps", s(alloc, "keymap=\"{s}\"\n", .{cfg.system.keymap})));
     return step(alloc, "base-config", "Base system config", c);
 }
 
@@ -545,12 +565,12 @@ fn planFstab(alloc: Allocator, cfg: *const Config) !Step {
     var aw: std.Io.Writer.Allocating = .init(alloc);
     const w = &aw.writer;
     const root = rootMountArgs(alloc, cfg);
-    try w.writeAll("# generated by gentoo-installer\n");
-    try w.print("PARTUUID=<root-partuuid>\t/\t{s}\t{s}defaults\t0 1\n", .{ @tagName(cfg.disk.root_fs), if (root.opts.len > 0) s(alloc, "{s},", .{root.opts}) else "" });
+    try w.writeAll("# generated by gentoo-installer (device paths; PARTUUID in M3)\n");
+    try w.print("{s}\t/\t{s}\t{s}defaults\t0 1\n", .{ root.dev, @tagName(cfg.disk.root_fs), if (root.opts.len > 0) s(alloc, "{s},", .{root.opts}) else "" });
     if (cfg.boot_mode == .uefi)
-        try w.writeAll("PARTUUID=<esp-partuuid>\t/efi\tvfat\tdefaults\t0 2\n");
+        try w.print("{s}\t/efi\tvfat\tdefaults\t0 2\n", .{partPath(alloc, cfg.disk.device, 1)});
     if (cfg.disk.swap == .partition)
-        try w.writeAll("PARTUUID=<swap-partuuid>\tnone\tswap\tsw\t0 0\n");
+        try w.print("{s}\tnone\tswap\tsw\t0 0\n", .{partPath(alloc, cfg.disk.device, 2)});
     if (cfg.disk.swap == .zram)
         try w.writeAll("# zram swap configured via /etc/systemd/zram-generator.conf or OpenRC zram service\n");
     try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/fstab", aw.written()));
@@ -562,12 +582,15 @@ fn planSystemConfig(alloc: Allocator, cfg: *const Config) !Step {
     try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/hostname", cfg.system.hostname));
     try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/hosts", s(alloc, "127.0.0.1 localhost\n::1 localhost\n127.0.1.1 {s}.local {s}\n", .{ cfg.system.hostname, cfg.system.hostname })));
 
-    // root credential
+    // root credential — the hash travels on stdin via chpasswd -e so it
+    // never lands on argv (journal/ps-safe).
     if (cfg.root.password_hash) |h| {
         try c.append(alloc, .{ .exec = .{
-            .argv = try alloc.dupe([]const u8, &.{ "usermod", "-p", "<hash>", "root" }),
+            .argv = try alloc.dupe([]const u8, &.{ "chpasswd", "-e" }),
+            .stdin = s(alloc, "root:{s}\n", .{h}),
+            .stdin_label = "<root password hash>",
             .chroot = true,
-            .desc = s(alloc, "set root password hash ({d} chars)", .{h.len}),
+            .desc = "set root password hash",
         } });
     }
     for (cfg.users) |u| {
@@ -579,14 +602,33 @@ fn planSystemConfig(alloc: Allocator, cfg: *const Config) !Step {
         }
         try args.append(alloc, u.name);
         try c.append(alloc, .{ .exec = .{ .argv = args.items, .chroot = true, .desc = s(alloc, "create user {s}", .{u.name}) } });
-        if (u.password_hash != null)
+        if (u.password_hash) |h|
             try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "usermod", "-p", "<hash>", u.name }),
+                .argv = try alloc.dupe([]const u8, &.{ "chpasswd", "-e" }),
+                .stdin = s(alloc, "{s}:{s}\n", .{ u.name, h }),
+                .stdin_label = s(alloc, "<{s} password hash>", .{u.name}),
                 .chroot = true,
                 .desc = s(alloc, "set password for {s}", .{u.name}),
             } });
-        if (u.ssh_authorized_keys.len > 0)
-            try c.append(alloc, .{ .note = s(alloc, "install {} ssh keys for {s} (~/.ssh/authorized_keys, 0600)", .{ u.ssh_authorized_keys.len, u.name }) });
+        if (u.ssh_authorized_keys.len > 0) {
+            const home = s(alloc, "/home/{s}", .{u.name});
+            const ssh_dir = s(alloc, "/mnt/gentoo{s}/.ssh", .{home});
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "install", "-d", "-m", "0700", "-o", u.name, "-g", u.name, s(alloc, "{s}/.ssh", .{home}) }),
+                .chroot = true,
+                .desc = s(alloc, "~{s}/.ssh", .{u.name}),
+            } });
+            try c.append(alloc, .{ .write_file = .{
+                .path = s(alloc, "{s}/authorized_keys", .{ssh_dir}),
+                .content = try std.mem.join(alloc, "\n", u.ssh_authorized_keys),
+                .mode = 0o600,
+            } });
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "chown", "-R", s(alloc, "{s}:{s}", .{ u.name, u.name }), s(alloc, "{s}/.ssh", .{home}) }),
+                .chroot = true,
+                .desc = s(alloc, "~{s}/.ssh ownership", .{u.name}),
+            } });
+        }
     }
 
     switch (cfg.system.privilege) {
@@ -617,6 +659,7 @@ fn planServices(alloc: Allocator, cfg: *const Config) !Step {
 
     var svc_atoms: std.ArrayList([]const u8) = .empty;
     if (cfg.network.manager == .networkmanager) try svc_atoms.append(alloc, "net-misc/networkmanager");
+    if (cfg.network.manager == .dhcpcd) try svc_atoms.append(alloc, "net-misc/dhcpcd");
     if (cfg.services.cron) try svc_atoms.append(alloc, "sys-process/cronie");
     if (cfg.services.ntp) try svc_atoms.append(alloc, "net-misc/chrony");
     if (cfg.services.sshd) try svc_atoms.append(alloc, "net-misc/openssh");
@@ -677,7 +720,26 @@ fn planBootloader(alloc: Allocator, cfg: *const Config) !Step {
                 try c.append(alloc, argv(alloc, &.{ "limine", "bios-install", cfg.disk.device }, "limine BIOS stages"));
             }
             try c.append(alloc, wf(alloc, "/mnt/gentoo/efi/limine.conf", limineConf(alloc, cfg)));
-        },
+            // kernel-install hook: stage kernel+initramfs at the fixed ESP
+            // paths limine.conf references. installkernel invokes this on
+            // every kernel add/remove — upgrades stay seamless.
+            try c.append(alloc, .{ .write_file = .{
+                .path = "/mnt/gentoo/etc/kernel/install.d/91-limine.install",
+                .content =
+                \\#!/bin/sh
+                \\# gentoo-installer limine hook (kernel-install): stage
+                \\# kernel + initramfs at the fixed ESP paths limine.conf uses.
+                \\# args: $1=command $2=kver $3=entry_dir_abs $4=kernel_image
+                \\[ "$1" = add ] || exit 0
+                \\esp=/efi
+                \\cp -f "$4" "$esp/vmlinuz" || exit 1
+                \\initrd=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img /boot/initrd-* 2>/dev/null | head -n1)
+                \\[ -n "$initrd" ] && cp -f "$initrd" "$esp/initramfs.img"
+                \\exit 0
+                ,
+                .mode = 0o755,
+            } });
+        }, 
         .grub => {
             var grub_args: std.ArrayList([]const u8) = .empty;
             try grub_args.appendSlice(alloc, &.{ "emerge", "sys-boot/grub" });
@@ -714,7 +776,53 @@ fn planBootloader(alloc: Allocator, cfg: *const Config) !Step {
         } }),
         .auto => unreachable,
     }
+
+    // Secure boot: sign every boot binary with the locally-generated key.
+    switch (cfg.security.secure_boot) {
+        .sbctl => {
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "emerge", "app-crypt/sbctl" }),
+                .chroot = true,
+                .desc = "sbctl (secure boot key mgmt)",
+            } });
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "sbctl", "create-keys" }),
+                .chroot = true,
+                .desc = "generate secure boot keys",
+            } });
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", "for f in /efi/EFI/BOOT/*.EFI /efi/vmlinuz /efi/initramfs.img /efi/EFI/Linux/*.efi; do [ -f \"$f\" ] && sbctl sign -s \"$f\"; done; true" }),
+                .chroot = true,
+                .desc = "sign bootloader + kernels (sbctl)",
+            } });
+        },
+        .shim => try c.append(alloc, .{ .exec = .{
+            .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-boot/shim", "app-crypt/sbsigntools" }),
+            .chroot = true,
+            .desc = "shim + sbsigntools (secure boot)",
+        } }),
+        .off => {},
+    }
     return step(alloc, "bootloader", "Install bootloader", c);
+}
+
+/// stem → eselect profile path: `default/linux/{arch}/23.0/` + stem
+/// segments joined with `/` (nomultilib → no-multilib).
+fn profilePath(alloc: Allocator, cfg: *const Config) ![]const u8 {
+    const stem = try config.stage3Stem(alloc, cfg);
+    var out: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, stem, '-');
+    while (it.next()) |seg| {
+        if (std.mem.eql(u8, seg, "nomultilib")) {
+            try out.append(alloc, "no-multilib");
+        } else if (std.mem.eql(u8, seg, "usr") and out.items.len > 0 and std.mem.eql(u8, out.items[out.items.len - 1], "split")) {
+            out.items[out.items.len - 1] = "split-usr";
+        } else {
+            try out.append(alloc, seg);
+        }
+    }
+    const joined = try std.mem.join(alloc, "/", out.items);
+    return s(alloc, "default/linux/{s}/23.0/{s}", .{ @tagName(cfg.arch), joined });
 }
 
 fn limineConf(alloc: Allocator, cfg: *const Config) []const u8 {
@@ -722,7 +830,7 @@ fn limineConf(alloc: Allocator, cfg: *const Config) []const u8 {
     const w = &aw.writer;
     w.writeAll("# generated by gentoo-installer\n") catch {};
     w.writeAll("timeout: 5\n\n") catch {};
-    const root_args = if (cfg.disk.luks) "root=/dev/mapper/cryptroot" else "root=PARTUUID=<root>";
+    const root_args = s(alloc, "root={s}", .{fsDevice(alloc, cfg)});
     w.print("/Gentoo\n", .{}) catch {};
     w.writeAll("    protocol: linux\n") catch {};
     w.writeAll("    kernel_path: boot:///vmlinuz\n") catch {};
@@ -797,7 +905,7 @@ test "golden plan: uefi + luks + lvm + btrfs + limine" {
     var saw_keyfile_stdin = false;
     for (part_cmds) |cmd| {
         if (cmd == .exec and std.mem.eql(u8, cmd.exec.argv[0], "cryptsetup"))
-            saw_keyfile_stdin = saw_keyfile_stdin or (cmd.exec.stdin != null);
+            saw_keyfile_stdin = saw_keyfile_stdin or (cmd.exec.stdin_label != null);
     }
     try std.testing.expect(saw_keyfile_stdin);
 

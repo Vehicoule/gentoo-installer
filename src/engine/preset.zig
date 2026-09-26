@@ -24,12 +24,18 @@ pub const Preset = struct {
 pub const LoadError = error{ BadPreset, InvalidToml, OutOfMemory };
 
 pub fn load(alloc: Allocator, path: []const u8, io: std.Io) LoadError!Preset {
-    const text = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(4 << 20)) catch
+    // Accept a preset directory (containing preset.toml) or a file path.
+    var file_path = path;
+    if (std.Io.Dir.cwd().openDir(io, path, .{}) catch null) |dir| {
+        dir.close(io);
+        file_path = std.fmt.allocPrint(alloc, "{s}/preset.toml", .{path}) catch return error.OutOfMemory;
+    }
+    const text = std.Io.Dir.cwd().readFileAlloc(io, file_path, alloc, .limited(4 << 20)) catch
         return error.BadPreset;
     var perr: toml.ParseError = undefined;
     const doc = toml.parse(alloc, text, &perr) catch |e| {
         if (e == error.InvalidToml)
-            std.log.err("preset {s}:{}: {s}", .{ path, perr.line, perr.msg });
+            std.log.err("preset {s}:{}: {s}", .{ file_path, perr.line, perr.msg });
         return e;
     };
     var p: Preset = .{ .doc = doc };
@@ -39,15 +45,73 @@ pub fn load(alloc: Allocator, path: []const u8, io: std.Io) LoadError!Preset {
     if (doc.root.get("name")) |v| {
         if (v == .string) p.name = v.string;
     }
+    // [locks] fields = ["system.init", ...]
     if (doc.root.get("locks")) |v| {
         if (v == .table) {
-            var locks: std.ArrayList([]const u8) = .empty;
-            var it = v.table.iterator();
-            while (it.next()) |kv| try locks.append(alloc, kv.key_ptr.*);
-            p.locks = locks.items;
+            if (v.table.get("fields")) |f| {
+                if (f == .array) {
+                    var locks: std.ArrayList([]const u8) = .empty;
+                    for (f.array) |item| {
+                        if (item == .string) try locks.append(alloc, item.string);
+                    }
+                    p.locks = locks.items;
+                }
+            }
         }
     }
     return p;
+}
+
+/// Enforce [locks]: for each locked dotted path, the user document may
+/// either leave it unset (preset default fills it) or set exactly the
+/// preset's [defaults] value. Divergence is a validation error.
+pub fn checkLocks(alloc: Allocator, preset: *const Preset, user_doc: *const toml.Document) ![][]const u8 {
+    var errs: std.ArrayList([]const u8) = .empty;
+    const defaults = blk: {
+        const v = preset.doc.root.get("defaults") orelse return errs.items;
+        break :blk switch (v) {
+            .table => |t| t,
+            else => return errs.items,
+        };
+    };
+    for (preset.locks) |path| {
+        const want = lookup(defaults, path) orelse continue;
+        const got = lookup(user_doc.root, path);
+        if (got == null) continue; // unset → default wins, fine
+        if (!valueEq(got.?, want))
+            try errs.append(alloc, std.fmt.allocPrint(alloc,
+                "preset lock: '{s}' is fixed by preset '{s}' — remove it or match the preset default",
+                .{ path, preset.id }) catch @panic("oom"));
+    }
+    return errs.items;
+}
+
+fn lookup(root: toml.Value.Table, dotted: []const u8) ?toml.Value {
+    var cur = root;
+    var it = std.mem.splitScalar(u8, dotted, '.');
+    while (it.next()) |seg| {
+        const v = cur.get(seg) orelse return null;
+        if (it.peek() == null) return v;
+        cur = switch (v) {
+            .table => |t| t,
+            else => return null,
+        };
+    }
+    return null;
+}
+
+fn valueEq(a: toml.Value, b: toml.Value) bool {
+    return switch (a) {
+        .string => |as| b == .string and std.mem.eql(u8, as, b.string),
+        .integer => |ai| b == .integer and ai == b.integer,
+        .float => |af| b == .float and af == b.float,
+        .boolean => |ab| b == .boolean and ab == b.boolean,
+        .array => |aa| b == .array and aa.len == b.array.len and blk: {
+            for (aa, b.array) |x, y| if (!valueEq(x, y)) break :blk false;
+            break :blk true;
+        },
+        .table => false,
+    };
 }
 
 /// Merge preset `[defaults]` under the user document: user keys win,
@@ -70,7 +134,8 @@ fn mergeTable(alloc: Allocator, dst: *toml.Value.Table, src: toml.Value.Table) !
     while (it.next()) |kv| {
         const key = kv.key_ptr.*;
         const val = kv.value_ptr.*;
-        const gop = try dst.getOrPut(alloc, key);
+        // key slices live in the preset's arena — dupe into ours.
+        const gop = try dst.getOrPut(alloc, try alloc.dupe(u8, key));
         if (!gop.found_existing) {
             gop.value_ptr.* = try deepCopy(alloc, val);
             continue;

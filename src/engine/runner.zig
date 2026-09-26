@@ -1,6 +1,7 @@
-//! Executes a Plan, or prints it under --dry-run. Appends a JSONL
-//! journal line per command so a real run can resume — the journal
-//! lives on the live-env tmpfs and is consumed by `detect --repair`.
+//! Executes a Plan, or prints it under --dry-run. Appends one complete
+//! JSONL journal record per command so a real run can resume — the
+//! journal lives on the live-env tmpfs and is consumed by
+//! `detect --repair`. stdin payloads are never journaled or printed.
 
 const std = @import("std");
 const plan = @import("plan.zig");
@@ -10,8 +11,7 @@ pub const Mode = enum { dry_run, exec };
 
 pub const Options = struct {
     mode: Mode,
-    /// Where the journal goes; null = journal disabled (default for
-    /// dry runs).
+    /// Where the journal goes; null = journal disabled (dry runs).
     journal_path: ?[]const u8 = null,
     /// Steps to skip entirely (resume support lands later — flag exists
     /// so callers can express it).
@@ -29,12 +29,74 @@ pub const Journal = struct {
         return .{ .file = .{ .handle = fd, .flags = .{ .nonblocking = false } }, .io = io };
     }
 
-    pub fn write(j: *Journal, comptime fmt: []const u8, args: anytype) void {
+    /// Start a JSON object: `{"step":"<id>",` — callers append fields,
+    /// `finish` closes and appends the line.
+    fn begin(aw: *std.Io.Writer.Allocating, step_id: []const u8) void {
+        aw.writer.writeAll("{\"step\":\"") catch return;
+        esc(&aw.writer, step_id);
+        aw.writer.writeAll("\",") catch return;
+    }
+
+    fn finish(j: *Journal, aw: *std.Io.Writer.Allocating) void {
         const f = j.file orelse return;
-        var buf: [4096]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, fmt, args) catch return;
-        f.writePositionalAll(j.io, line, 0) catch {}; // O_APPEND → offset ignored
-        f.writePositionalAll(j.io, "\n", 0) catch {};
+        aw.writer.writeAll("}\n") catch return;
+        f.writePositionalAll(j.io, aw.written(), 0) catch {}; // O_APPEND → offset ignored
+    }
+
+    /// json-escape a string value (no surrounding quotes).
+    fn esc(w: *std.Io.Writer, s: []const u8) void {
+        for (s) |ch| {
+            switch (ch) {
+                '"', '\\' => w.print("\\{c}", .{ch}) catch return,
+                '\n' => w.writeAll("\\n") catch return,
+                '\r' => w.writeAll("\\r") catch return,
+                '\t' => w.writeAll("\\t") catch return,
+                else => if (ch < 0x20) w.print("\\u{x:0>4}", .{ch}) catch return else w.writeByte(ch) catch return,
+            }
+        }
+    }
+
+    pub fn cmdExec(j: *Journal, step_id: []const u8, e: plan.Exec, status: []const u8) void {
+        if (j.file == null) return;
+        var aw: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+        defer aw.deinit();
+        const w = &aw.writer;
+        begin(&aw, step_id);
+        w.writeAll("\"type\":\"exec\",\"argv\":\"") catch return;
+        for (e.argv, 0..) |a, i| {
+            if (i > 0) w.writeAll(" ") catch return;
+            esc(w, a);
+        }
+        w.writeAll("\",\"status\":\"") catch return;
+        w.writeAll(status) catch return;
+        w.writeAll("\"") catch return;
+        j.finish(&aw);
+    }
+
+    pub fn cmdWriteFile(j: *Journal, step_id: []const u8, wf: plan.WriteFile, status: []const u8) void {
+        if (j.file == null) return;
+        var aw: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+        defer aw.deinit();
+        const w = &aw.writer;
+        begin(&aw, step_id);
+        w.writeAll("\"type\":\"write_file\",\"path\":\"") catch return;
+        esc(w, wf.path);
+        w.writeAll("\",\"status\":\"") catch return;
+        w.writeAll(status) catch return;
+        w.writeAll("\"") catch return;
+        j.finish(&aw);
+    }
+
+    pub fn stepDone(j: *Journal, step_id: []const u8, skipped_: bool) void {
+        if (j.file == null) return;
+        var aw: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+        defer aw.deinit();
+        const w = &aw.writer;
+        begin(&aw, step_id);
+        w.writeAll("\"type\":\"step\",\"status\":\"") catch return;
+        w.writeAll(if (skipped_) "skipped" else "done") catch return;
+        w.writeAll("\"") catch return;
+        j.finish(&aw);
     }
 
     pub fn close(j: *Journal) void {
@@ -49,7 +111,10 @@ pub fn run(io: std.Io, alloc: Allocator, p: plan.Plan, opts: Options) !void {
     const out = opts.out;
 
     for (p.steps, 0..) |step, i| {
-        if (skipped(step.id, opts.skip_steps)) continue;
+        if (skipped(step.id, opts.skip_steps)) {
+            journal.stepDone(step.id, true);
+            continue;
+        }
         try out.print("[{d:0>2}] {s}  ({s})\n", .{ i + 1, step.title, step.id });
         for (step.cmds) |cmd| {
             switch (cmd) {
@@ -57,25 +122,34 @@ pub fn run(io: std.Io, alloc: Allocator, p: plan.Plan, opts: Options) !void {
                 .write_file => |w| {
                     try out.print("     write {s} ({} bytes, {o})\n", .{ w.path, w.content.len, w.mode });
                     if (opts.mode == .exec) {
-                        try writeFile(io, w.path, w.content, w.mode);
+                        if (writeFile(io, w.path, w.content, w.mode)) {
+                            journal.cmdWriteFile(step.id, w, "ok");
+                        } else |err| {
+                            journal.cmdWriteFile(step.id, w, "fail");
+                            return err;
+                        }
                     }
                 },
                 .exec => |e| {
                     try out.print("     $", .{});
                     if (e.chroot) try out.writeAll(" chroot /mnt/gentoo");
                     for (e.argv) |a| try out.print(" {s}", .{a});
-                    if (e.stdin) |sin| try out.print("  <stdin:{s}>", .{sin});
+                    if (e.stdin_label != null) try out.print("  <stdin:{s}>", .{e.stdin_label.?});
                     if (e.desc.len > 0) try out.print("    # {s}", .{e.desc});
                     try out.writeAll("\n");
-                    journal.write("{{\"step\":\"{s}\",\"argv\":\"", .{step.id});
                     if (opts.mode == .exec) {
-                        try execCmd(io, alloc, e);
-                        journal.write("exec done", .{});
+                        if (e.stdin_label != null and e.stdin == null)
+                            return error.MissingStdinData;
+                        execCmd(io, alloc, e) catch |err| {
+                            journal.cmdExec(step.id, e, "fail");
+                            return err;
+                        };
+                        journal.cmdExec(step.id, e, "ok");
                     }
                 },
             }
         }
-        journal.write("{{\"step\":\"{s}\",\"status\":\"done\"}}", .{step.id});
+        journal.stepDone(step.id, false);
     }
     try out.flush();
 }
@@ -102,7 +176,18 @@ fn execCmd(io: std.Io, alloc: Allocator, e: plan.Exec) !void {
         try argv_buf.appendSlice(alloc, &.{ "chroot", "/mnt/gentoo" });
     }
     try argv_buf.appendSlice(alloc, e.argv);
-    var child = try std.process.spawn(io, .{ .argv = argv_buf.items });
+    var child = try std.process.spawn(io, .{
+        .argv = argv_buf.items,
+        .stdin = if (e.stdin != null) .pipe else .inherit,
+    });
+    if (e.stdin) |data| {
+        // Feed the payload, then close so the child sees EOF.
+        var wbuf: [4096]u8 = undefined;
+        var fw = child.stdin.?.writer(io, &wbuf);
+        fw.interface.writeAll(data) catch {};
+        child.stdin.?.close(io);
+        child.stdin = null;
+    }
     const term = try child.wait(io);
     switch (term) {
         .exited => |code| {

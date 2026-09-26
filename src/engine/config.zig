@@ -37,6 +37,9 @@ pub const User = struct {
 pub const Config = struct {
     arch: Arch = .detect,
     boot_mode: BootMode = .uefi,
+    /// set by decode() when the config doc names boot_mode — detection
+    /// fills it only when not explicitly set.
+    boot_mode_explicit: bool = false,
 
     disk: struct {
         device: []const u8 = "",
@@ -48,6 +51,10 @@ pub const Config = struct {
         boot_part: bool = false,
         luks: bool = false,
         lvm: bool = false,
+        /// Exec-mode LUKS passphrase (fed to cryptsetup on stdin; never
+        /// argv, never journaled). Wizard collects it interactively;
+        /// mass-install configs must set it for luks=true.
+        luks_passphrase: ?[]const u8 = null,
         space_src: SpaceSrc = .shrink,
         shrink_part: []const u8 = "",
         shrink_mib: u32 = 0,
@@ -200,7 +207,10 @@ pub fn decode(alloc: Allocator, doc: toml.Document) DecodeError!Config {
     var cfg: Config = .{};
 
     if (doc.root.get("arch")) |v| cfg.arch = try enumOr(Arch, v, "arch");
-    if (doc.root.get("boot_mode")) |v| cfg.boot_mode = try enumOr(BootMode, v, "boot_mode");
+    if (doc.root.get("boot_mode")) |v| {
+        cfg.boot_mode = try enumOr(BootMode, v, "boot_mode");
+        cfg.boot_mode_explicit = true;
+    }
 
     if (doc.root.get("disk")) |v| {
         const t = try tableOf(v, "disk");
@@ -212,6 +222,7 @@ pub fn decode(alloc: Allocator, doc: toml.Document) DecodeError!Config {
         if (field(t, "swap_mib")) |x| cfg.disk.swap_mib = try intOr(x, "disk.swap_mib");
         if (field(t, "boot_part")) |x| cfg.disk.boot_part = try boolOr(x, "disk.boot_part");
         if (field(t, "luks")) |x| cfg.disk.luks = try boolOr(x, "disk.luks");
+        if (field(t, "luks_passphrase")) |x| cfg.disk.luks_passphrase = try strOr(x, "disk.luks_passphrase");
         if (field(t, "lvm")) |x| cfg.disk.lvm = try boolOr(x, "disk.lvm");
         if (field(t, "space_src")) |x| cfg.disk.space_src = try enumOr(SpaceSrc, x, "disk.space_src");
         if (field(t, "shrink_part")) |x| cfg.disk.shrink_part = try strOr(x, "disk.shrink_part");
@@ -378,6 +389,50 @@ pub fn stage3Stem(alloc: Allocator, cfg: *const Config) ![]const u8 {
 pub fn validate(alloc: Allocator, cfg: *const Config, has_nvidia: ?bool) ![][]const u8 {
     var errs: std.ArrayList([]const u8) = .empty;
 
+    if (cfg.disk.device.len == 0)
+        try errs.append(alloc, "disk.device is required (e.g. /dev/vda)");
+    if (cfg.disk.luks and cfg.disk.luks_passphrase == null)
+        try errs.append(alloc, "disk.luks requires disk.luks_passphrase in exec mode (wizard collects it interactively)");
+
+    // Control chars / newlines in values interpolated into generated
+    // files or argv would inject extra directives — reject them all.
+    const injectable = [_]?[]const u8{
+        cfg.disk.device,
+        cfg.disk.shrink_part,
+        cfg.stage3.mirror,
+        cfg.system.hostname,
+        cfg.system.timezone,
+        cfg.system.locale,
+        cfg.system.keymap,
+        cfg.makeconf.mirrors,
+        cfg.makeconf.accept_license,
+        cfg.makeconf.video_cards,
+        cfg.root.password_hash,
+        cfg.disk.luks_passphrase,
+    };
+    for (injectable) |ms| {
+        const v = ms orelse continue;
+        if (hasCtl(v)) try errs.append(alloc, fmt(alloc, "value contains control characters: '{s}'", .{v}));
+    }
+    if (cfg.makeconf.cflags == .custom) {
+        const v = cfg.makeconf.cflags.custom;
+        if (hasCtl(v)) try errs.append(alloc, "makeconf.cflags contains control characters");
+    }
+    for (cfg.system.locales) |l|
+        if (hasCtl(l)) try errs.append(alloc, fmt(alloc, "locale contains control characters: '{s}'", .{l}));
+    for (cfg.users) |u| {
+        if (hasCtl(u.name) or hasCtl(u.shell))
+            try errs.append(alloc, fmt(alloc, "user '{s}' has control chars in name/shell", .{u.name}));
+        for (u.groups) |g|
+            if (hasCtl(g)) try errs.append(alloc, fmt(alloc, "group '{s}' has control characters", .{g}));
+        for (u.ssh_authorized_keys) |k|
+            if (hasCtl(k)) try errs.append(alloc, fmt(alloc, "ssh key for '{s}' has control characters", .{u.name}));
+    }
+    var uit = cfg.use.global.iterator();
+    while (uit.next()) |kv| {
+        if (hasCtl(kv.key_ptr.*)) try errs.append(alloc, "USE flag name has control characters");
+    }
+
     if (cfg.disk.scheme == .alongside) {
         if (cfg.disk.wipe) try errs.append(alloc, "disk.scheme=alongside requires wipe=false");
         if (cfg.disk.space_src == .shrink and cfg.disk.shrink_part.len == 0)
@@ -437,6 +492,15 @@ pub fn validate(alloc: Allocator, cfg: *const Config, has_nvidia: ?bool) ![][]co
     if (!found) try errs.append(alloc, "system.locale must be one of system.locales");
 
     return errs.items;
+}
+
+fn hasCtl(v: []const u8) bool {
+    for (v) |ch| if (ch < 0x20 or ch == 0x7f) return true;
+    return false;
+}
+
+fn fmt(alloc: Allocator, comptime f: []const u8, args: anytype) []const u8 {
+    return std.fmt.allocPrint(alloc, f, args) catch @panic("oom");
 }
 
 test "decode defaults" {

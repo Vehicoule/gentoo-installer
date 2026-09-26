@@ -43,6 +43,7 @@ pub fn main(init: std.process.Init) !void {
     var config_path: ?[]const u8 = null;
     var preset_path: ?[]const u8 = null;
     var journal_path: []const u8 = "/tmp/gentoo-installer.journal";
+    var confirm_dev: ?[]const u8 = null;
     var dry_run = false;
     var skips: std.ArrayList([]const u8) = .empty;
 
@@ -57,6 +58,8 @@ pub fn main(init: std.process.Init) !void {
             config_path = it.next() orelse return fatal(errw, "--config needs a path");
         } else if (std.mem.eql(u8, arg, "--preset")) {
             preset_path = it.next() orelse return fatal(errw, "--preset needs a path");
+        } else if (std.mem.eql(u8, arg, "--confirm")) {
+            confirm_dev = it.next() orelse return fatal(errw, "--confirm needs the target device");
         } else if (std.mem.eql(u8, arg, "--dry-run")) {
             dry_run = true;
         } else if (std.mem.eql(u8, arg, "--journal")) {
@@ -128,6 +131,12 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(2);
         };
         try engine.preset.mergeDefaults(&preset.?, &doc);
+        const lock_errs = try engine.preset.checkLocks(alloc, &preset.?, &doc);
+        for (lock_errs) |e| try errw.print("preset: {s}\n", .{e});
+        if (lock_errs.len > 0) {
+            try errw.flush();
+            std.process.exit(2);
+        }
     }
 
     var cfg = engine.config.decode(alloc, doc) catch {
@@ -142,9 +151,15 @@ pub fn main(init: std.process.Init) !void {
         env_opt = engine.detect.detect(alloc, io) catch null;
         if (env_opt) |*e| {
             if (cfg.arch == .detect) cfg.arch = e.arch;
-            // config boot_mode wins only if explicitly set; detection
-            // overrides the default when it disagrees
-            cfg.boot_mode = e.boot_mode;
+            // boot_mode: detection fills the default; an explicit config
+            // value wins, and a mismatch is a hard stop.
+            if (!cfg.boot_mode_explicit) {
+                cfg.boot_mode = e.boot_mode;
+            } else if (cfg.boot_mode != e.boot_mode) {
+                try errw.print("config requests {s} but the live env booted {s} — refusing (fix the config or boot firmware settings)\n", .{ @tagName(cfg.boot_mode), @tagName(e.boot_mode) });
+                try errw.flush();
+                std.process.exit(2);
+            }
         }
     }
 
@@ -168,6 +183,22 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // Destructive exec runs require --confirm <device> matching the
+    // configured disk — an answer file alone must never wipe a disk.
+    const destructive = cfg.disk.scheme == .@"efi-swap-root" or cfg.disk.scheme == .@"bios-boot-swap-root";
+    if (cmd == .run and !dry_run and destructive) {
+        const cd = confirm_dev orelse {
+            try errw.print("refusing to run without --confirm {s} (this will wipe the target disk)\n", .{cfg.disk.device});
+            try errw.flush();
+            std.process.exit(2);
+        };
+        if (!std.mem.eql(u8, cd, cfg.disk.device)) {
+            try errw.print("--confirm {s} does not match disk.device {s}\n", .{ cd, cfg.disk.device });
+            try errw.flush();
+            std.process.exit(2);
+        }
+    }
+
     const p = try engine.plan.build(alloc, &cfg, if (env_opt) |*e| e else null);
     try engine.runner.run(io, alloc, p, .{
         .mode = if (dry_run or cmd == .plan) .dry_run else .exec,
@@ -175,6 +206,18 @@ pub fn main(init: std.process.Init) !void {
         .skip_steps = skips.items,
         .out = out,
     });
+}
+
+/// Extract the string value of a top-level `"op"` key from an NDJSON
+/// line. Minimal extractor — full JSON parse arrives with the M2 op set.
+fn opField(line: []const u8) ?[]const u8 {
+    const k = std.mem.indexOf(u8, line, "\"op\"") orelse return null;
+    var i = k + 4;
+    while (i < line.len and (line[i] == ' ' or line[i] == ':')) i += 1;
+    if (i >= line.len or line[i] != '"') return null;
+    const start = i + 1;
+    const end = std.mem.indexOfScalarPos(u8, line, start, '"') orelse return null;
+    return line[start..end];
 }
 
 fn fatal(w: *std.Io.Writer, msg: []const u8) noreturn {
@@ -214,19 +257,24 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
             r.toss(1);
             continue;
         } else break;
-        if (std.mem.indexOf(u8, line, "\"detect\"") != null) {
+        const op = opField(line) orelse {
+            try out.writeAll("{\"type\":\"error\",\"error\":\"missing op\"}\n");
+            try out.flush();
+            continue;
+        };
+        if (std.mem.eql(u8, op, "detect")) {
             const env = try engine.detect.detect(alloc, io);
             try out.writeAll("{\"type\":\"env\",\"env\":");
             try engine.detect.envToJson(alloc, &env, out);
             try out.writeAll("}\n");
-        } else if (std.mem.indexOf(u8, line, "\"hello\"") != null) {
+        } else if (std.mem.eql(u8, op, "hello")) {
             try out.writeAll("{\"type\":\"hello\",\"version\":\"m1\",\"ready\":true}\n");
-        } else if (std.mem.indexOf(u8, line, "\"quit\"") != null) {
+        } else if (std.mem.eql(u8, op, "quit")) {
             try out.writeAll("{\"type\":\"bye\"}\n");
             try out.flush();
             return;
         } else {
-            try out.writeAll("{\"type\":\"error\",\"error\":\"unknown op (m1 supports hello/detect/quit)\"}\n");
+            try out.print("{{\"type\":\"error\",\"error\":\"unknown op '{s}' (m1 supports hello/detect/quit)\"}}\n", .{op});
         }
         try out.flush();
         // consume the delimiter streamDelimiter left buffered; EOF → break

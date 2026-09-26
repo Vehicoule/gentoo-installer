@@ -59,7 +59,8 @@ pub fn detect(alloc: Allocator, io: std.Io) !Env {
     };
 
     // Boot mode: presence of the EFI sysfs interface.
-    if (std.Io.Dir.cwd().openDir(io, "/sys/firmware/efi", .{}) catch null) |_| {
+    if (std.Io.Dir.cwd().openDir(io, "/sys/firmware/efi", .{}) catch null) |dir| {
+        dir.close(io);
         env.boot_mode = .uefi;
     }
 
