@@ -75,6 +75,9 @@ hottest interface for nothing).
   `gentoo-installer wizard --headless` exposes `GET page`, `SET field`, `NEXT`,
   `BACK`, `VALIDATE` over JSONL, so TUI and GUI can never drift apart and
   `--config file` (unattended) is the same engine with a prefilled config.
+  Two flows — **Express** (opinionated defaults pre-selected; asks only
+  for disk, confirmation, credentials) and **Advanced** (every field
+  editable) — differ only in page visibility, never in behavior.
 - **Every side effect is a `Cmd` through a `Runner`.** `RealRunner` execs;
   `DryRunner` logs. Nothing in the pipeline touches the OS except through this
   seam — that is what makes `--dry-run`, unit tests, and the QEMU harness work.

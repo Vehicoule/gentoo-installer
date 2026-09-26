@@ -3,11 +3,20 @@
 Pages are **data owned by the engine**: each page is a schema (fields,
 defaults, validation rules, visibility conditions) served over the wizard
 protocol. TUI and GUI render the same schema; neither frontend implements
-validation itself. "Expert mode" (`mode=expert`) only unhides fields
-marked `expert:` — it does not add pages.
+validation itself.
 
-Field notation: `name: type = default` — `expert` fields are hidden in
-guided mode; `secret` fields are never echoed or persisted.
+Two flows, picked on P0:
+
+- **Express** — opinionated defaults are pre-selected for every choice;
+  the wizard only asks for the disk, confirmation, and credentials.
+  Defaults: btrfs + zram, systemd, desktop-systemd stage3 (glibc/gcc),
+  hardened+selinux, dist-bin kernel, auto bootloader, NM, doas, minimal
+  package set.
+- **Advanced** — every field on every page is editable; fields marked
+  `expert` below appear only here.
+
+Field notation: `name: type = default` — `expert` fields appear only in
+Advanced flow; `secret` fields are never echoed or persisted.
 
 ## P0 — Welcome / mode
 
@@ -17,7 +26,7 @@ interaction mode.
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | locale | enum (preset list) | `en_US.UTF-8` | display language for the wizard itself |
-| mode | enum `guided\|expert` | `guided` | sets field visibility globally |
+| mode | enum `express\|advanced` | `express` | sets the flow: express skips all non-essential pages; advanced exposes every field |
 | answer_file | path (optional) | — | loads a saved config and jumps to P7 Review |
 
 Env card (read-only, from `detect`): arch, boot mode (UEFI/BIOS), RAM,
