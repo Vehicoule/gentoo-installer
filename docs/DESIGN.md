@@ -393,8 +393,8 @@ converted to `password_hash` at export (no plaintext, file mode 0600).
   drive/9p, runs `--config test.conf` over serial, asserts the guest boots
   to a login prompt. The same script scales to arm64 (qemu-system-aarch64 +
   UEFI firmware) and riscv64 later.
-- CI matrix (later): {openrc,systemd} × {ext4,xfs,btrfs} × {grub,systemd-boot}
-  × {amd64,arm64,riscv64}.
+- CI matrix (later): {openrc,systemd} × {ext4,xfs,btrfs} × {limine,grub,systemd-boot}
+  × {amd64,arm64,riscv64} — limine must be in it, it's the `auto` default.
 
 ## Repo layout
 
@@ -404,7 +404,7 @@ src/engine/                     # zig library: steps, runner, wizard, model
 src/tui/                        # zig, libvaxis/vxfw
 src/main.zig                    # cli: tui|headless|--config|--dry-run
 gui/                            # rust crate, libcosmic; spawns headless engine
-presets/gentoo.toml             # the built-in stock preset
+presets/gentoo/                 # the built-in stock preset (preset.toml + assets)
 scripts/qemu-test.sh
 docs/                           # DESIGN.md, protocol.md, presets.md
 ```
@@ -417,7 +417,8 @@ GUI is a separate build artifact; the TUI/engine binary stays dependency-free.
 - **M1** — engine: config model, runner, partition/mount/stage3/chroot,
   portage gen; `--dry-run` end-to-end. Unit + golden tests.
 - **M2** — TUI wizard over the shared state machine; happy path
-  (UEFI/GPT, openrc|systemd, ext4/xfs, dist-bin kernel, grub|systemd-boot).
+  (UEFI/GPT, openrc|systemd, ext4/xfs, dist-bin kernel, limine +
+  grub|systemd-boot explicit picks).
 - **M3** — QEMU green: real install boots on amd64 for the happy path.
 - **M4** — libcosmic GUI shell on the headless protocol.
 - **M5** — option matrix: LUKS, LVM, btrfs subvols, nomultilib, manual
