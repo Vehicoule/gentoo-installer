@@ -162,8 +162,9 @@ sensible):
     then provisions a thin pool + thin root LV, not just a VG) — and
     registers a boot entry per snapshot. Entry generation is per-
     bootloader: limine/grub/systemd-boot emit menu entries from our
-    hooks; rEFInd gets generated `refind.conf` stanzas carrying
-    `options="rootflags=subvol=@snapshots/<n>"` (auto-discovery alone
+    hooks; rEFInd gets generated `refind.conf` `menuentry` stanzas —
+    `options "root=… rootflags=subvol=@snapshots/<n> …"` preserving the
+    normal kernel args plus the snapshot subvol (auto-discovery alone
     only finds ESP kernels, never snapshot roots); efistub has no menu
     at all — snapshots stay recoverable by adding `rootflags=subvol=`
     to a manual UEFI entry or from live media (no per-snapshot NVRAM

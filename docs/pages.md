@@ -160,9 +160,10 @@ entries; (b) system snapshots — a hook snapshots root before each
 world-update/kernel install and registers a boot entry per snapshot
 (btrfs `@snapshots` on the default layout, LVM-thin when `lvm=on`).
 Entries are emitted per bootloader: limine/grub/systemd-boot via our
-hooks, rEFInd via generated `refind.conf` stanzas carrying
-`rootflags=subvol=@snapshots/<n>`; efistub has no menu — snapshots there
-recover via the same `rootflags` override or live media. Shown as a
+hooks, rEFInd via generated `refind.conf` `menuentry` stanzas whose
+`options "…"` line adds `rootflags=subvol=@snapshots/<n>` to the normal
+kernel args; efistub has no menu — snapshots there recover via the same
+`rootflags` override or live media. Shown as a
 `snapshots` toggle; on CoW-less roots it degrades to kernel rollback
 only, with a note.
 
