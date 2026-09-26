@@ -107,7 +107,8 @@ sensible):
 1. **detect** — boot mode (UEFI vs BIOS via `/sys/firmware/efi`), arch
    (`uname -m` → amd64/arm64/riscv64), RAM, CPU flags (`cpuid2cpuflags`
    equivalent), network reachability, clock sanity (offer `chronyd -q`),
-   GPUs from udev sysfs (`gpus[]` → `video_cards`/`gpu.driver`).
+   GPUs from udev sysfs incl. PCI IDs (`gpus[]` → `video_cards`/
+   `gpu.driver`; NVIDIA generation detection drives Turing+ vs legacy).
 2. **partition** — guided layouts: `efi+swap+root` (GPT, EF00/8200/8304
    DPS GUIDs) or `bios-boot+swap+root`; LUKS2 container option; LVM option;
    `alongside` mode for dual-boot (probe existing OSes via os-prober-style
@@ -258,10 +259,13 @@ mirrors     = "auto"             # auto ⇒ geoip → nearest distfiles mirror;
 [gpu]
 driver      = "auto"             # auto | nouveau | nvidia-open | nvidia-drivers
                                # auto ⇒ in-kernel/mesa everywhere; NVIDIA ⇒
-                               # nvidia-open (opinionated default). nvidia-*
-                               # picks appear only when an NVIDIA GPU is
-                               # detected — they imply ACCEPT_LICENSE=+NVIDIA
-                               # and module signing under secure_boot
+                               # generation-aware: nvidia-open on Turing+
+                               # (GTX 16xx/RTX 20xx+), nvidia-drivers or
+                               # nouveau on older silicon. VALIDATE rejects
+                               # nvidia-open on pre-Turing. nvidia-* picks
+                               # appear only when NVIDIA is detected — imply
+                               # ACCEPT_LICENSE=+NVIDIA + module signing
+                               # under secure_boot
 
 [network]
 manager     = "networkmanager"   # networkmanager | dhcpcd | netifrc | systemd-networkd
@@ -434,7 +438,7 @@ GUI is a separate build artifact; the TUI/engine binary stays dependency-free.
 - **M4** — libcosmic GUI shell on the headless protocol.
 - **M5** — option matrix: LUKS, LVM, btrfs subvols, nomultilib, manual
   kernel, custom partitions; musl + llvm + hardened(-selinux) stage3;
-  proprietary-NVIDIA driver path
+  proprietary NVIDIA driver selection
   paths; BIOS/CSM boot path; arm64 + riscv64 bring-up.
 - **M6** — secure boot signing flow (sbctl path first), dual-boot
   alongside-mode + menu merge, runit/s6/dinit init-backend exploration.

@@ -144,7 +144,8 @@ post_install = "scripts/post-install.sh"  # last thing inside chroot,
 
 ## The stock preset
 
-`presets/gentoo/` in-tree: `id="gentoo"`, zero locks, `minimal`
-package set only, no extra steps, branding = Gentoo. It exists to keep
-the generic installer fully functional and to serve as the reference
-preset.
+`presets/gentoo/` in-tree: `id="gentoo"`, zero locks, three package sets
+(`minimal` / `cosmic` / `cosmic-full` via the upstream `cosmic` overlay —
+a distro preset may vendor its own `sync_uri` later), no extra steps,
+branding = Gentoo. It exists to keep the generic installer fully
+functional and to serve as the reference preset.

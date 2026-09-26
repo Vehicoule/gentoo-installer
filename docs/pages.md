@@ -146,7 +146,7 @@ password on a surviving account, or `sshd=true` + authorized key.
 | keep_kernels | int | 3 | kernel boot entries retained; 0 = never prune |
 | net_manager | enum `networkmanager\|dhcpcd\|netifrc\|systemd-networkd` | `networkmanager` | `systemd-networkd` needs init=systemd |
 | wifi_fw | bool | detected | `linux-firmware` + `sof-firmware` |
-| gpu_driver | enum `auto\|nouveau\|nvidia-open\|nvidia-drivers` | `auto` | `auto` = in-kernel/mesa; on NVIDIA `auto` ⇒ **`nvidia-open`** (Express's opinionated pick — nouveau stays an Advanced pick). `nvidia-*` options appear only when `env.gpus[]` reports an NVIDIA device — they imply `ACCEPT_LICENSE=+NVIDIA` and kernel-module signing when secure_boot is on |
+| gpu_driver | enum `auto\|nouveau\|nvidia-open\|nvidia-drivers` | `auto` | `auto` = in-kernel/mesa; NVIDIA ⇒ generation-aware: **`nvidia-open`** on Turing+ (GTX 16xx/RTX 20xx+ — Express's opinionated pick), `nvidia-drivers` or `nouveau` on older silicon. `nvidia-*` options appear only when `env.gpus[]` reports NVIDIA; VALIDATE rejects `nvidia-open` on pre-Turing. They imply `ACCEPT_LICENSE=+NVIDIA` and kernel-module signing when secure_boot is on |
 | microcode | bool | detected (vendor) | intel-microcode / amd via linux-firmware; loaded early via the initramfs (dracut `early_microcode`) |
 | services.sshd / .logger / .cron | bool | false/true/true | — |
 
