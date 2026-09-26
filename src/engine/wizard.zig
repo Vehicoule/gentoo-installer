@@ -1,0 +1,1578 @@
+//! Wizard state machine — the engine-owned page surface every frontend
+//! (TUI today, libcosmic GUI at M4) renders. Pages are data: field
+//! schemas with types, defaults, options, and visibility predicates
+//! evaluated HERE — frontends only draw what the page event carries.
+//! See docs/pages.md (field spec) and docs/protocol.md (wire format).
+
+const std = @import("std");
+const config = @import("config.zig");
+const detect = @import("detect.zig");
+const toml = @import("toml.zig");
+const Allocator = std.mem.Allocator;
+const Config = config.Config;
+const Env = detect.Env;
+
+pub const Flow = enum { express, advanced };
+pub const FType = enum { @"enum", bool, int, string, secret, list, record, table, path };
+
+pub const WizardError = error{
+    UnknownField,
+    BadType,
+    BadValue,
+    OutOfMemory,
+    HashFailed,
+    ReadFailed,
+    InvalidToml,
+    BadConfig,
+};
+
+const Opt = struct {
+    v: []const u8,
+    label: []const u8,
+    help: ?[]const u8 = null,
+    visible: ?*const fn (*const Wizard) bool = null,
+};
+
+const Field = struct {
+    name: []const u8, // dotted config path, or a pseudo-field (see setField)
+    ftype: FType,
+    label: []const u8,
+    help: ?[]const u8 = null,
+    options: []const Opt = &.{},
+    expert: bool = false, // Advanced flow only
+    confirm: bool = false, // secret fields: frontend asks twice
+    min_len: ?usize = null,
+    visible: ?*const fn (*const Wizard) bool = null,
+};
+
+const Page = struct {
+    id: []const u8,
+    title: []const u8,
+    essential: bool, // visited in Express flow
+    fields: []const Field = &.{},
+    /// validation error field-prefixes owned by this page
+    prefixes: []const []const u8 = &.{},
+};
+
+// ---------- visibility predicates ----------
+
+fn isUefi(w: *const Wizard) bool {
+    return w.cfg.boot_mode == .uefi;
+}
+fn isBios(w: *const Wizard) bool {
+    return w.cfg.boot_mode == .bios;
+}
+fn luksOn(w: *const Wizard) bool {
+    return w.cfg.disk.luks;
+}
+fn swapIsPart(w: *const Wizard) bool {
+    return w.cfg.disk.swap == .partition;
+}
+fn btrfsRoot(w: *const Wizard) bool {
+    return w.cfg.disk.root_fs == .btrfs;
+}
+fn isAlongside(w: *const Wizard) bool {
+    return w.cfg.disk.scheme == .alongside;
+}
+fn shrinkSrc(w: *const Wizard) bool {
+    return w.cfg.disk.scheme == .alongside and cfg_space(w) == .shrink;
+}
+fn cfg_space(w: *const Wizard) config.SpaceSrc {
+    return w.cfg.disk.space_src;
+}
+fn hasOtherOs(w: *const Wizard) bool {
+    _ = w;
+    // OS probing lands with dual-boot (M6) — until then `alongside`
+    // stays hidden and unexecutable.
+    return false;
+}
+fn rootByPassword(w: *const Wizard) bool {
+    return !w.cfg.root.lock_root;
+}
+fn hasNvidia(w: *const Wizard) bool {
+    const e = w.env orelse return false;
+    for (e.gpus) |g| if (std.mem.eql(u8, g.vendor, "nvidia")) return true;
+    return false;
+}
+fn systemdInit(w: *const Wizard) bool {
+    return w.cfg.system.init == .systemd;
+}
+fn notSystemd(w: *const Wizard) bool {
+    return w.cfg.system.init != .systemd;
+}
+fn isExpress(w: *const Wizard) bool {
+    return w.flow == .express;
+}
+fn isAdvanced(w: *const Wizard) bool {
+    return w.flow == .advanced;
+}
+
+// ---------- field tables ----------
+
+const keymap_opts = [_]Opt{
+    .{ .v = "us", .label = "US English" },
+    .{ .v = "uk", .label = "UK English" },
+    .{ .v = "de", .label = "German" },
+    .{ .v = "fr", .label = "French" },
+    .{ .v = "es", .label = "Spanish" },
+    .{ .v = "it", .label = "Italian" },
+    .{ .v = "pt", .label = "Portuguese" },
+    .{ .v = "br", .label = "Brazilian" },
+    .{ .v = "ru", .label = "Russian" },
+    .{ .v = "jp", .label = "Japanese" },
+    .{ .v = "dvorak", .label = "Dvorak" },
+};
+
+const welcome_fields = [_]Field{
+    .{ .name = "system.keymap", .ftype = .@"enum", .label = "Keyboard layout", .help = "applies to this live session immediately", .options = &keymap_opts },
+    .{ .name = "flow.mode", .ftype = .@"enum", .label = "Install mode", .options = &.{
+        .{ .v = "express", .label = "Express", .help = "opinionated defaults — pick a disk and accounts only" },
+        .{ .v = "advanced", .label = "Advanced", .help = "every option exposed" },
+    } },
+    .{ .name = "answer_file", .ftype = .path, .label = "Load answer file", .help = "a saved --config TOML; jumps straight to Review", .expert = false },
+};
+
+const disk_fields = [_]Field{
+    .{ .name = "disk.device", .ftype = .@"enum", .label = "Target disk", .help = "the disk to install onto" },
+    .{ .name = "disk.scheme", .ftype = .@"enum", .label = "Partitioning", .options = &.{
+        .{ .v = "efi-swap-root", .label = "Normal — erase disk (UEFI layout)", .visible = isUefi },
+        .{ .v = "bios-boot-swap-root", .label = "Normal — erase disk (BIOS layout)", .visible = isBios },
+        .{ .v = "alongside", .label = "Install alongside existing OS", .visible = hasOtherOs },
+        .{ .v = "manual", .label = "Manual partition table", .help = "expert", .visible = null },
+    } },
+    .{ .name = "disk.root_fs", .ftype = .@"enum", .label = "Root filesystem", .options = &.{
+        .{ .v = "btrfs", .label = "btrfs", .help = "recommended — CoW snapshots/rollback" },
+        .{ .v = "xfs", .label = "xfs" },
+        .{ .v = "ext4", .label = "ext4" },
+        .{ .v = "f2fs", .label = "f2fs" },
+        .{ .v = "bcachefs", .label = "bcachefs", .help = "expert — needs a recent kernel" },
+    } },
+    .{ .name = "disk.swap", .ftype = .@"enum", .label = "Swap", .options = &.{
+        .{ .v = "zram", .label = "zram (in-RAM compressed)", .help = "recommended — no disk swap" },
+        .{ .v = "partition", .label = "swap partition" },
+        .{ .v = "none", .label = "none" },
+    } },
+    .{ .name = "disk.swap_mib", .ftype = .int, .label = "Swap size (MiB)", .visible = swapIsPart },
+    .{ .name = "disk.esp_mib", .ftype = .int, .label = "ESP size (MiB)", .help = "≥128; ≥512 for UKI/systemd-boot", .expert = true, .visible = isUefi },
+    .{ .name = "disk.boot_part", .ftype = .bool, .label = "Separate /boot partition", .expert = true },
+    .{ .name = "disk.luks", .ftype = .bool, .label = "Encrypt root (LUKS2)", .help = "argon2id, passphrase on stdin" },
+    .{ .name = "disk.luks_passphrase", .ftype = .secret, .label = "Encryption passphrase", .min_len = 8, .confirm = true, .visible = luksOn },
+    .{ .name = "disk.lvm", .ftype = .bool, .label = "LVM volume group", .help = "thin pool when snapshots are on" },
+    .{ .name = "disk.home_part", .ftype = .bool, .label = "Separate /home (LVM LV)", .expert = true },
+    .{ .name = "disk.space_src", .ftype = .@"enum", .label = "Space source", .options = &.{
+        .{ .v = "free-space", .label = "Use free space" },
+        .{ .v = "shrink", .label = "Shrink a partition" },
+    }, .visible = isAlongside },
+    .{ .name = "disk.shrink_part", .ftype = .string, .label = "Partition to shrink", .visible = shrinkSrc },
+    .{ .name = "disk.shrink_mib", .ftype = .int, .label = "Shrink by (MiB)", .visible = shrinkSrc },
+};
+
+const variant_fields = [_]Field{
+    .{ .name = "system.init", .ftype = .@"enum", .label = "Init system", .options = &.{
+        .{ .v = "systemd", .label = "systemd", .help = "upstream default for desktops" },
+        .{ .v = "openrc", .label = "openrc", .help = "Gentoo's classic init" },
+        .{ .v = "runit", .label = "runit", .help = "early support" },
+        .{ .v = "s6", .label = "s6", .help = "early support" },
+        .{ .v = "dinit", .label = "dinit", .help = "early support" },
+    } },
+    .{ .name = "stage3.libc", .ftype = .@"enum", .label = "C library", .options = &.{
+        .{ .v = "glibc", .label = "glibc" },
+        .{ .v = "musl", .label = "musl", .help = "leaner; removes systemd" },
+    } },
+    .{ .name = "stage3.toolchain", .ftype = .@"enum", .label = "Toolchain", .options = &.{
+        .{ .v = "gcc", .label = "gcc" },
+        .{ .v = "llvm", .label = "llvm/clang" },
+    } },
+    .{ .name = "security.hardening", .ftype = .@"enum", .label = "Hardening", .help = "lives in the stage3 toolchain — picks a different tarball", .options = &.{
+        .{ .v = "hardened-selinux", .label = "hardened + SELinux", .help = "default" },
+        .{ .v = "hardened", .label = "hardened" },
+        .{ .v = "standard", .label = "standard" },
+    } },
+    .{ .name = "stage3.variant", .ftype = .string, .label = "Stage3 stem override", .help = "e.g. hardened-selinux-systemd", .expert = true },
+    .{ .name = "system.binhost", .ftype = .bool, .label = "Use official binary packages", .help = "signature-verified binhost" },
+};
+
+const region_fields = [_]Field{
+    .{ .name = "system.timezone", .ftype = .string, .label = "Timezone", .help = "zoneinfo name, e.g. Europe/Lisbon" },
+    .{ .name = "system.locales", .ftype = .list, .label = "Locales to generate", .help = "locale.gen entries" },
+    .{ .name = "system.locale", .ftype = .string, .label = "Default locale" },
+    .{ .name = "system.keymap", .ftype = .@"enum", .label = "Console keymap", .options = &keymap_opts },
+    .{ .name = "services.ntp", .ftype = .bool, .label = "Network time sync", .help = "chrony / systemd-timesyncd" },
+};
+
+const accounts_fields = [_]Field{
+    .{ .name = "root.mode", .ftype = .@"enum", .label = "Root account", .options = &.{
+        .{ .v = "password", .label = "Set a root password" },
+        .{ .v = "locked", .label = "Locked", .help = "needs a wheel user or ssh key" },
+    } },
+    .{ .name = "root.password", .ftype = .secret, .label = "Root password", .min_len = 8, .confirm = true, .visible = rootByPassword },
+    .{ .name = "user.name", .ftype = .string, .label = "User name", .help = "your login — added to wheel", .visible = isExpress },
+    .{ .name = "user.password", .ftype = .secret, .label = "User password", .min_len = 8, .confirm = true, .visible = isExpress },
+    .{ .name = "users", .ftype = .table, .label = "User accounts", .help = "name, password, groups, shell, ssh keys", .visible = isAdvanced },
+    .{ .name = "system.privilege", .ftype = .@"enum", .label = "Privilege escalation", .options = &.{
+        .{ .v = "doas", .label = "doas", .help = "minimal-footprint default" },
+        .{ .v = "sudo", .label = "sudo" },
+        .{ .v = "none", .label = "none" },
+    } },
+};
+
+const system_fields = [_]Field{
+    .{ .name = "system.hostname", .ftype = .string, .label = "Hostname" },
+    .{ .name = "system.kernel", .ftype = .@"enum", .label = "Kernel", .options = &.{
+        .{ .v = "dist-bin", .label = "Prebuilt official kernel", .help = "fastest, recommended" },
+        .{ .v = "dist", .label = "Compiled with Gentoo defaults", .help = "tunable" },
+        .{ .v = "manual", .label = "gentoo-sources — configure it yourself", .help = "expert" },
+    } },
+    .{ .name = "system.initramfs", .ftype = .@"enum", .label = "Initramfs", .options = &.{
+        .{ .v = "dracut", .label = "dracut" },
+        .{ .v = "ugrd", .label = "ugrd" },
+        .{ .v = "none", .label = "none", .help = "unsafe with LUKS/LVM" },
+    } },
+    .{ .name = "system.uki", .ftype = .bool, .label = "Unified kernel image (UKI)", .visible = isUefi },
+    .{ .name = "system.bootloader", .ftype = .@"enum", .label = "Bootloader", .options = &.{
+        .{ .v = "auto", .label = "Automatic (limine)", .help = "recommended — works on BIOS and UEFI" },
+        .{ .v = "limine", .label = "Limine" },
+        .{ .v = "grub", .label = "GRUB" },
+        .{ .v = "systemd-boot", .label = "systemd-boot", .visible = systemdInit },
+        .{ .v = "efistub", .label = "efistub (firmware entry)", .visible = isUefi },
+        .{ .v = "refind", .label = "rEFInd", .visible = isUefi },
+    } },
+    .{ .name = "security.secure_boot", .ftype = .@"enum", .label = "Secure boot", .options = &.{
+        .{ .v = "off", .label = "off" },
+        .{ .v = "sbctl", .label = "sbctl (self-signed keys)" },
+        .{ .v = "shim", .label = "shim + MOK (grub only)" },
+    }, .visible = isUefi },
+    .{ .name = "system.snapshots", .ftype = .@"enum", .label = "System snapshots", .options = &.{
+        .{ .v = "auto", .label = "auto (btrfs/LVM when available)" },
+        .{ .v = "off", .label = "off" },
+    } },
+    .{ .name = "system.keep_kernels", .ftype = .int, .label = "Kernels kept (rollback)", .help = "0 = never prune" },
+    .{ .name = "network.manager", .ftype = .@"enum", .label = "Network manager", .options = &.{
+        .{ .v = "networkmanager", .label = "NetworkManager" },
+        .{ .v = "dhcpcd", .label = "dhcpcd" },
+        .{ .v = "netifrc", .label = "netifrc", .visible = notSystemd },
+        .{ .v = "systemd-networkd", .label = "systemd-networkd", .visible = systemdInit },
+    } },
+    .{ .name = "network.wifi", .ftype = .bool, .label = "Wi-Fi support", .help = "linux-firmware + iwd" },
+    .{ .name = "gpu.driver", .ftype = .@"enum", .label = "NVIDIA driver", .options = &.{
+        .{ .v = "auto", .label = "auto", .help = "open modules on Turing+; nouveau otherwise" },
+        .{ .v = "nvidia-open", .label = "nvidia-open", .help = "proprietary, Turing and newer" },
+        .{ .v = "nvidia-drivers", .label = "nvidia-drivers", .help = "proprietary, legacy GPUs" },
+        .{ .v = "nouveau", .label = "nouveau", .help = "open source" },
+    }, .visible = hasNvidia },
+    .{ .name = "services.sshd", .ftype = .bool, .label = "SSH server" },
+    .{ .name = "services.logger", .ftype = .bool, .label = "System logger" },
+    .{ .name = "services.cron", .ftype = .bool, .label = "Cron daemon" },
+};
+
+const packages_fields = [_]Field{
+    .{ .name = "packages.sets", .ftype = .list, .label = "Package sets", .help = "from the active preset (minimal/cosmic/cosmic-full)" },
+    .{ .name = "packages.atoms", .ftype = .list, .label = "Extra packages", .help = "portage atoms, e.g. app-editors/vim" },
+    .{ .name = "use.global", .ftype = .record, .label = "Global USE flags", .help = "tri-state: true/false/absent" },
+    .{ .name = "use.pkg", .ftype = .record, .label = "Per-package USE", .help = "atom → \"flag -flag\"", .expert = true },
+    .{ .name = "makeconf.accept_license", .ftype = .string, .label = "ACCEPT_LICENSE" },
+    .{ .name = "makeconf.cflags", .ftype = .@"enum", .label = "CFLAGS", .options = &.{
+        .{ .v = "native", .label = "native (-march=native)" },
+        .{ .v = "safe", .label = "safe (-O2 -pipe)" },
+        .{ .v = "custom", .label = "custom…", .help = "expert" },
+    } },
+    .{ .name = "makeconf.cflags_custom", .ftype = .string, .label = "Custom CFLAGS", .expert = true },
+    .{ .name = "makeconf.jobs", .ftype = .int, .label = "Parallel jobs", .help = "0 = auto (nproc, ~2 GiB/job)" },
+    .{ .name = "makeconf.mem_cap_gib", .ftype = .int, .label = "Memory cap (GiB)", .help = "0 = auto" },
+    .{ .name = "makeconf.video_cards", .ftype = .string, .label = "VIDEO_CARDS", .help = "auto-detected" },
+};
+
+pub const pages = [_]Page{
+    .{ .id = "welcome", .title = "Welcome", .essential = true, .fields = &welcome_fields, .prefixes = &.{"system.keymap"} },
+    .{ .id = "disk", .title = "Disk & partitioning", .essential = true, .fields = &disk_fields, .prefixes = &.{"disk."} },
+    .{ .id = "variant", .title = "Variant", .essential = false, .fields = &variant_fields, .prefixes = &.{ "stage3.", "system.init", "system.binhost", "security.hardening" } },
+    .{ .id = "region", .title = "Region & input", .essential = false, .fields = &region_fields, .prefixes = &.{ "system.timezone", "system.locale", "system.locales", "services.ntp" } },
+    .{ .id = "accounts", .title = "Accounts", .essential = true, .fields = &accounts_fields, .prefixes = &.{ "root.", "users", "system.privilege", "login", "privilege" } },
+    .{ .id = "system", .title = "System", .essential = false, .fields = &system_fields, .prefixes = &.{ "system.", "network.", "gpu.", "services.", "security.secure_boot", "bootloader", "uki" } },
+    .{ .id = "packages", .title = "Packages & USE", .essential = false, .fields = &packages_fields, .prefixes = &.{ "packages.", "use.", "makeconf." } },
+    .{ .id = "review", .title = "Review & install", .essential = true, .prefixes = &.{} },
+};
+
+// ---------- the wizard ----------
+
+pub const Wizard = struct {
+    alloc: Allocator,
+    io: std.Io,
+    cfg: Config,
+    env: ?Env = null,
+    flow: Flow = .express,
+    /// index into `pages` (not the filtered flow order — order is
+    /// computed by nextInFlow())
+    page_idx: usize = 0,
+    detected_boot: ?config.BootMode = null,
+
+    pub fn init(alloc: Allocator, io: std.Io, cfg: Config) Wizard {
+        var w = Wizard{ .alloc = alloc, .io = io, .cfg = cfg };
+        w.applyExpressDefaults();
+        return w;
+    }
+
+    /// Express flow picks the opinionated set the distro preset locks:
+    /// btrfs, zram, limine, dist-bin, doas, hardened+selinux.
+    fn applyExpressDefaults(w: *Wizard) void {
+        if (w.flow != .express) return;
+        w.cfg.disk.root_fs = .btrfs;
+        w.cfg.disk.swap = .zram;
+        w.cfg.system.bootloader = .limine;
+        w.cfg.system.kernel = .@"dist-bin";
+        w.cfg.system.privilege = .doas;
+        w.cfg.security.hardening = .@"hardened-selinux";
+    }
+
+    /// Pages visible under the current flow, in order.
+    fn flowOrder(w: *const Wizard, buf: *[pages.len]usize) []const usize {
+        var n: usize = 0;
+        for (pages, 0..) |pg, i| {
+            if (w.flow == .express and !pg.essential) continue;
+            buf[n] = i;
+            n += 1;
+        }
+        return buf[0..n];
+    }
+
+    pub fn currentPage(w: *const Wizard) *const Page {
+        return &pages[w.page_idx];
+    }
+
+    /// Emit the `page` event for the current (or named) page.
+    pub fn emitPage(w: *Wizard, out: *std.Io.Writer, req: ?u64, name: ?[]const u8) !void {
+        if (name) |nm| {
+            var found = false;
+            for (pages, 0..) |pg, i| {
+                if (std.mem.eql(u8, pg.id, nm)) {
+                    w.page_idx = i;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return error.BadValue;
+        }
+        const pg = w.currentPage();
+        try out.writeAll("{\"ev\":\"page\",");
+        if (req) |r| try out.print("\"req\":{},", .{r});
+        try out.print("\"page\":\"{s}\",\"index\":{},\"of\":{},\"title\":\"", .{ pg.id, w.flowIndex() + 1, w.flowLen() });
+        jesc(out, pg.title);
+        try out.writeAll("\",\"fields\":[");
+        var first = true;
+        for (pg.fields) |f| {
+            if (f.expert and w.flow == .express) continue;
+            if (f.visible) |vis| if (!vis(w)) continue;
+            if (!first) try out.writeAll(",");
+            first = false;
+            try w.emitField(out, f);
+        }
+        if (std.mem.eql(u8, pg.id, "review")) {
+            try out.writeAll("],\"summary\":[");
+            try w.emitSummary(out);
+        } else {
+            try out.writeAll("]");
+        }
+        try out.writeAll(",\"actions\":[");
+        try w.emitActions(out);
+        try out.writeAll("]}\n");
+    }
+
+    /// Grouped "label: value" summary of the whole config for the
+    /// review page — secrets render as set/unset, never values.
+    fn emitSummary(w: *Wizard, out: *std.Io.Writer) !void {
+        var buf: [pages.len]usize = undefined;
+        const order = w.flowOrder(&buf);
+        var first_g = true;
+        for (order) |pi| {
+            const pg = pages[pi];
+            if (std.mem.eql(u8, pg.id, "review")) continue;
+            if (!first_g) try out.writeAll(",");
+            first_g = false;
+            try out.writeAll("{\"title\":\"");
+            jesc(out, pg.title);
+            try out.writeAll("\",\"lines\":[");
+            var first_l = true;
+            for (pg.fields) |f| {
+                if (f.expert and w.flow == .express) continue;
+                if (f.visible) |vis| if (!vis(w)) continue;
+                if (!first_l) try out.writeAll(",");
+                first_l = false;
+                var aw: std.Io.Writer.Allocating = .init(w.alloc);
+                defer aw.deinit();
+                try aw.writer.writeAll(f.label);
+                try aw.writer.writeAll(": ");
+                try w.fmtField(&aw.writer, f);
+                try jstr(out, aw.written());
+            }
+            try out.writeAll("]}");
+        }
+        try out.writeAll("]");
+    }
+
+    /// Human-readable field value — same policy as emitValue but text.
+    fn fmtField(w: *Wizard, out: *std.Io.Writer, f: Field) !void {
+        if (f.ftype == .secret or std.mem.eql(u8, f.name, "user.password")) {
+            const set = if (std.mem.eql(u8, f.name, "user.password"))
+                w.cfg.users.len > 0 and w.cfg.users[0].password_hash != null
+            else
+                w.secretIsSet(f.name);
+            try out.writeAll(if (set) "●●●●●●" else "(unset)");
+            return;
+        }
+        // reuse the JSON emitter, then unwrap strings
+        var aw: std.Io.Writer.Allocating = .init(w.alloc);
+        defer aw.deinit();
+        try w.emitValue(&aw.writer, f);
+        const s = aw.written();
+        const unquoted = if (s.len >= 2 and s[0] == '"' and s[s.len - 1] == '"') s[1 .. s.len - 1] else s;
+        if (unquoted.len == 0 or std.mem.eql(u8, unquoted, "null")) {
+            try out.writeAll("(unset)");
+        } else {
+            try out.writeAll(unquoted);
+        }
+    }
+
+    fn flowLen(w: *const Wizard) usize {
+        var buf: [pages.len]usize = undefined;
+        return w.flowOrder(&buf).len;
+    }
+    fn flowIndex(w: *const Wizard) usize {
+        var buf: [pages.len]usize = undefined;
+        const order = w.flowOrder(&buf);
+        for (order, 0..) |pi, i| if (pi == w.page_idx) return i;
+        return 0;
+    }
+
+    fn emitActions(w: *const Wizard, out: *std.Io.Writer) !void {
+        const last = w.flowIndex() == w.flowLen() - 1;
+        try out.writeAll("\"back\"");
+        if (w.page_idx == 0) try out.writeAll(",\"quit\"");
+        if (!last) {
+            try out.writeAll(",\"next\"");
+        } else {
+            // review page
+            try out.writeAll(",\"install\",\"export_answer\",\"plan\"");
+        }
+    }
+
+    fn emitField(w: *Wizard, out: *std.Io.Writer, f: Field) !void {
+        try out.writeAll("{\"name\":\"");
+        jesc(out, f.name);
+        try out.writeAll("\",\"type\":\"");
+        jesc(out, @tagName(f.ftype));
+        try out.writeAll("\",\"label\":\"");
+        jesc(out, f.label);
+        try out.writeAll("\"");
+        if (f.help) |h| {
+            try out.writeAll(",\"help\":\"");
+            jesc(out, h);
+            try out.writeAll("\"");
+        }
+        if (f.min_len) |m| try out.print(",\"min\":{}", .{m});
+        if (f.confirm) try out.writeAll(",\"confirm\":true");
+        // disk.device options are the detected disks — dynamic.
+        const dev_opts = std.mem.eql(u8, f.name, "disk.device");
+        if (f.options.len > 0 or dev_opts) {
+            try out.writeAll(",\"options\":[");
+            var first = true;
+            if (dev_opts and w.env != null) {
+                for (w.env.?.disks) |d| {
+                    if (!first) try out.writeAll(",");
+                    first = false;
+                    try out.writeAll("{\"v\":\"");
+                    jesc(out, d.path);
+                    try out.writeAll("\",\"label\":\"");
+                    jesc(out, d.name);
+                    try out.print(" · {} GiB\"}}", .{d.size_bytes / (1 << 30)});
+                }
+            }
+            for (f.options) |o| {
+                if (o.visible) |vis| if (!vis(w)) continue;
+                if (!first) try out.writeAll(",");
+                first = false;
+                try out.writeAll("{\"v\":\"");
+                jesc(out, o.v);
+                try out.writeAll("\",\"label\":\"");
+                jesc(out, o.label);
+                try out.writeAll("\"");
+                if (o.help) |h| {
+                    try out.writeAll(",\"help\":\"");
+                    jesc(out, h);
+                    try out.writeAll("\"");
+                }
+                try out.writeAll("}");
+            }
+            try out.writeAll("]");
+        }
+        try out.writeAll(",\"value\":");
+        try w.emitValue(out, f);
+        try out.writeAll(",\"default\":");
+        try w.emitDefault(out, f);
+        try out.writeAll("}");
+    }
+
+    fn emitValue(w: *Wizard, out: *std.Io.Writer, f: Field) !void {
+        // secrets never leave the engine — masked per protocol.md
+        if (f.ftype == .secret) {
+            const set = w.secretIsSet(f.name);
+            try out.print("{{\"secret\":true,\"is_set\":{}}}", .{set});
+            return;
+        }
+        if (std.mem.eql(u8, f.name, "flow.mode")) {
+            try jstr(out, @tagName(w.flow));
+            return;
+        }
+        if (std.mem.eql(u8, f.name, "root.mode")) {
+            try jstr(out, if (w.cfg.root.lock_root) "locked" else "password");
+            return;
+        }
+        if (std.mem.eql(u8, f.name, "user.name")) {
+            try jstr(out, if (w.cfg.users.len > 0) w.cfg.users[0].name else "");
+            return;
+        }
+        if (std.mem.eql(u8, f.name, "user.password")) {
+            try out.print("{{\"secret\":true,\"is_set\":{}}}", .{w.cfg.users.len > 0 and w.cfg.users[0].password_hash != null});
+            return;
+        }
+        if (std.mem.eql(u8, f.name, "answer_file")) {
+            try out.writeAll("null");
+            return;
+        }
+        try emitCfgValue(w, out, f.name, f.ftype);
+    }
+
+    fn emitDefault(w: *Wizard, out: *std.Io.Writer, f: Field) !void {
+        _ = w;
+        _ = f;
+        try out.writeAll("null");
+    }
+
+    /// Fold a detected env into wizard state — the same defaults the
+    /// CLI fills on run/plan (arch, boot_mode, BIOS scheme flip).
+    pub fn applyEnv(w: *Wizard, env: Env) void {
+        w.env = env;
+        if (w.cfg.arch == .detect) w.cfg.arch = env.arch;
+        if (!w.cfg.boot_mode_explicit) {
+            w.cfg.boot_mode = env.boot_mode;
+            w.detected_boot = env.boot_mode;
+            if (!w.cfg.disk.scheme_explicit and env.boot_mode == .bios)
+                w.cfg.disk.scheme = .@"bios-boot-swap-root";
+        }
+    }
+
+    fn secretIsSet(w: *Wizard, name: []const u8) bool {
+        if (std.mem.eql(u8, name, "disk.luks_passphrase")) return w.cfg.disk.luks_passphrase != null;
+        if (std.mem.eql(u8, name, "root.password")) return w.cfg.root.password_hash != null;
+        if (std.mem.eql(u8, name, "user.password")) return w.cfg.users.len > 0 and w.cfg.users[0].password_hash != null;
+        return false;
+    }
+
+    /// `set` op: apply a JSON value to the field. Secrets hash on input
+    /// — plaintext never survives in cfg beyond the luks passphrase,
+    /// which is protocol-defined as in-memory only.
+    pub fn setField(w: *Wizard, name: []const u8, v: std.json.Value) WizardError!void {
+        if (std.mem.eql(u8, name, "flow.mode")) {
+            const s = try strOf(v);
+            w.flow = std.meta.stringToEnum(Flow, s) orelse return error.BadValue;
+            w.applyExpressDefaults();
+            return;
+        }
+        if (std.mem.eql(u8, name, "answer_file")) {
+            const s = try strOf(v);
+            return w.loadAnswerFile(s);
+        }
+        if (std.mem.eql(u8, name, "root.password")) {
+            const s = try strOf(v);
+            if (s.len < 8) return error.BadValue;
+            w.cfg.root.password_hash = try w.hashPassword(s);
+            w.cfg.root.lock_root = false;
+            return;
+        }
+        if (std.mem.eql(u8, name, "user.name")) {
+            const s = try dstr(w, v);
+            if (s.len == 0) return error.BadValue;
+            const old_hash: ?[]const u8 = if (w.cfg.users.len > 0) w.cfg.users[0].password_hash else null;
+            const u = config.User{
+                .name = s,
+                .groups = @constCast(&.{"wheel"}),
+                .shell = "/bin/bash",
+                .password_hash = old_hash,
+            };
+            const items = try w.alloc.alloc(config.User, 1);
+            items[0] = u;
+            w.cfg.users = items;
+            return;
+        }
+        if (std.mem.eql(u8, name, "user.password")) {
+            const s = try strOf(v);
+            if (s.len < 8) return error.BadValue;
+            const h = try w.hashPassword(s);
+            if (w.cfg.users.len == 0) {
+                const items = try w.alloc.alloc(config.User, 1);
+                items[0] = .{ .name = "user", .groups = @constCast(&.{"wheel"}), .shell = "/bin/bash", .password_hash = h };
+                w.cfg.users = items;
+            } else {
+                const items = try w.alloc.alloc(config.User, w.cfg.users.len);
+                @memcpy(items, w.cfg.users);
+                items[0].password_hash = h;
+                w.cfg.users = items;
+            }
+            return;
+        }
+        if (std.mem.eql(u8, name, "root.mode")) {
+            const s = try strOf(v);
+            if (std.mem.eql(u8, s, "locked")) {
+                w.cfg.root.lock_root = true;
+            } else if (std.mem.eql(u8, s, "password")) {
+                w.cfg.root.lock_root = false;
+            } else return error.BadValue;
+            return;
+        }
+        if (std.mem.eql(u8, name, "users")) {
+            return w.setUsers(v);
+        }
+        if (std.mem.eql(u8, name, "use.global")) {
+            const t = switch (v) {
+                .object => |o| tableFromObj(w.alloc, o) catch return error.OutOfMemory,
+                else => return error.BadType,
+            };
+            w.cfg.use.global = t;
+            return;
+        }
+        if (std.mem.eql(u8, name, "use.pkg")) {
+            const t = switch (v) {
+                .object => |o| tableFromObj(w.alloc, o) catch return error.OutOfMemory,
+                else => return error.BadType,
+            };
+            w.cfg.use.pkg = t;
+            return;
+        }
+        if (std.mem.eql(u8, name, "makeconf.cflags_custom")) {
+            w.cfg.makeconf.cflags = .{ .custom = try strOf(v) };
+            return;
+        }
+        return setPath(w, name, v);
+    }
+
+    /// Hash a plaintext password via openssl — stdin only, never argv.
+    fn hashPassword(w: *Wizard, pw: []const u8) WizardError![]const u8 {
+        var child = std.process.spawn(w.io, .{
+            .argv = &.{ "openssl", "passwd", "-6", "-stdin" },
+            .stdin = .pipe,
+            .stdout = .pipe,
+        }) catch return error.HashFailed;
+        var wbuf: [4096]u8 = undefined;
+        var fw = child.stdin.?.writer(w.io, &wbuf);
+        fw.interface.writeAll(pw) catch return error.HashFailed;
+        fw.interface.writeAll("\n") catch return error.HashFailed;
+        fw.interface.flush() catch return error.HashFailed;
+        child.stdin.?.close(w.io);
+        child.stdin = null;
+        var rbuf: [4096]u8 = undefined;
+        var fr = child.stdout.?.reader(w.io, &rbuf);
+        var out: std.Io.Writer.Allocating = .init(w.alloc);
+        const n = fr.interface.streamRemaining(&out.writer) catch return error.HashFailed;
+        _ = n;
+        const term = child.wait(w.io) catch return error.HashFailed;
+        switch (term) {
+            .exited => |code| if (code != 0) return error.HashFailed,
+            else => return error.HashFailed,
+        }
+        return std.mem.trim(u8, out.written(), " \t\r\n");
+    }
+
+    fn setUsers(w: *Wizard, v: std.json.Value) WizardError!void {
+        const arr = switch (v) {
+            .array => |a| a,
+            else => return error.BadType,
+        };
+        var users: std.ArrayList(config.User) = .empty;
+        for (arr.items) |item| {
+            const o = switch (item) {
+                .object => |o| o,
+                else => return error.BadType,
+            };
+            var u = config.User{};
+            if (o.get("name")) |nv| u.name = try dstr(w, nv);
+            if (o.get("shell")) |sv| u.shell = try dstr(w, sv);
+            if (o.get("groups")) |gv| {
+                const ga = switch (gv) {
+                    .array => |a| a,
+                    else => return error.BadType,
+                };
+                var groups: std.ArrayList([]const u8) = .empty;
+                for (ga.items) |g| try groups.append(w.alloc, try dstr(w, g));
+                u.groups = groups.items;
+            }
+            if (o.get("password")) |pv| {
+                const pw = try strOf(pv);
+                if (pw.len > 0) u.password_hash = try w.hashPassword(pw);
+            }
+            if (o.get("ssh_authorized_keys")) |kv| {
+                const ka = switch (kv) {
+                    .array => |a| a,
+                    else => return error.BadType,
+                };
+                var keys: std.ArrayList([]const u8) = .empty;
+                for (ka.items) |k| try keys.append(w.alloc, try dstr(w, k));
+                u.ssh_authorized_keys = keys.items;
+            }
+            try users.append(w.alloc, u);
+        }
+        w.cfg.users = users.items;
+    }
+
+    /// Load an answer file: parse TOML, decode into cfg, jump to review.
+    fn loadAnswerFile(w: *Wizard, path: []const u8) WizardError!void {
+        const text = std.Io.Dir.cwd().readFileAlloc(w.io, path, w.alloc, .limited(4 << 20)) catch
+            return error.ReadFailed;
+        var doc = toml.parse(w.alloc, text, null) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.InvalidToml,
+        };
+        // decode handles explicitness flags itself; keep secrets from
+        // the live session (answer files never carry plaintext).
+        const keep_luks = w.cfg.disk.luks_passphrase;
+        const keep_roothash = w.cfg.root.password_hash;
+        w.cfg = config.decode(w.alloc, doc) catch return error.BadConfig;
+        if (w.cfg.disk.luks_passphrase == null) w.cfg.disk.luks_passphrase = keep_luks;
+        if (w.cfg.root.password_hash == null) w.cfg.root.password_hash = keep_roothash;
+        w.cfg.boot_mode_explicit = docHas(&doc, "boot", "mode");
+        // jump to review
+        for (pages, 0..) |pg, i| {
+            if (std.mem.eql(u8, pg.id, "review")) {
+                w.page_idx = i;
+                break;
+            }
+        }
+    }
+
+    /// `next` — validate the current page, advance within the flow.
+    /// Returns error.BadValue when the page has errors (caller emits
+    /// the validate delta).
+    pub fn next(w: *Wizard, alloc: Allocator, nvidia: ?config.NvidiaTier) !bool {
+        const errs = try w.pageErrors(alloc, nvidia, w.currentPage());
+        if (errs.len > 0) return false;
+        var buf: [pages.len]usize = undefined;
+        const order = w.flowOrder(&buf);
+        const i = w.flowIndex();
+        if (i + 1 < order.len) {
+            w.page_idx = order[i + 1];
+            return true;
+        }
+        return true; // already at review
+    }
+
+    pub fn back(w: *Wizard) void {
+        var buf: [pages.len]usize = undefined;
+        const order = w.flowOrder(&buf);
+        const i = w.flowIndex();
+        if (i > 0) w.page_idx = order[i - 1];
+    }
+
+    /// Errors whose field prefix belongs to `pg` — the whole-config
+    /// validator stays the single source of truth.
+    pub fn pageErrors(w: *Wizard, alloc: Allocator, nvidia: ?config.NvidiaTier, pg: *const Page) ![][]const u8 {
+        const all = try config.validate(alloc, &w.cfg, nvidia);
+        var out: std.ArrayList([]const u8) = .empty;
+        for (all) |e| {
+            for (pg.prefixes) |p| {
+                if (std.mem.indexOf(u8, e, p) != null) {
+                    try out.append(alloc, e);
+                    break;
+                }
+            }
+        }
+        // wizard-side requirements the config can't express
+        if (std.mem.eql(u8, pg.id, "disk")) {
+            if (w.cfg.disk.luks) {
+                const p = w.cfg.disk.luks_passphrase orelse "";
+                if (p.len < 8) try out.append(alloc, "disk.luks_passphrase needs ≥8 characters");
+            }
+        }
+        if (std.mem.eql(u8, pg.id, "accounts")) {
+            var login = false;
+            if (w.cfg.root.password_hash != null and !w.cfg.root.lock_root) login = true;
+            for (w.cfg.users) |u| {
+                if (u.password_hash != null) login = true;
+                if (w.cfg.services.sshd and u.ssh_authorized_keys.len > 0) login = true;
+            }
+            if (!login) try out.append(alloc, "no usable login path — set a password or an ssh key");
+        }
+        return out.items;
+    }
+
+    /// Serialise cfg to JSON for `get_config` — secrets masked.
+    pub fn emitConfigJson(w: *Wizard, out: *std.Io.Writer, req: ?u64) !void {
+        try out.writeAll("{\"ev\":\"config\",");
+        if (req) |r| try out.print("\"req\":{},", .{r});
+        try out.writeAll("\"config\":{");
+        try out.writeAll("\"boot_mode\":\"");
+        try out.writeAll(@tagName(w.cfg.boot_mode));
+        try out.writeAll("\",\"disk\":{");
+        try fieldStr(out, "device", w.cfg.disk.device);
+        try out.writeAll(",");
+        try fieldBool(out, "wipe", w.cfg.disk.wipe);
+        try out.writeAll(",");
+        try fieldStr(out, "scheme", @tagName(w.cfg.disk.scheme));
+        try out.writeAll(",");
+        try fieldStr(out, "root_fs", @tagName(w.cfg.disk.root_fs));
+        try out.writeAll(",");
+        try fieldStr(out, "swap", @tagName(w.cfg.disk.swap));
+        try out.writeAll(",");
+        try fieldInt(out, "swap_mib", w.cfg.disk.swap_mib);
+        try out.writeAll(",");
+        try fieldInt(out, "esp_mib", w.cfg.disk.esp_mib);
+        try out.writeAll(",");
+        try fieldBool(out, "boot_part", w.cfg.disk.boot_part);
+        try out.writeAll(",");
+        try fieldBool(out, "luks", w.cfg.disk.luks);
+        try out.writeAll(",\"luks_passphrase\":{\"secret\":true,\"is_set\":");
+        try out.writeAll(if (w.cfg.disk.luks_passphrase != null) "true" else "false");
+        try out.writeAll("},");
+        try fieldBool(out, "lvm", w.cfg.disk.lvm);
+        try out.writeAll("},\"stage3\":{");
+        try fieldStr(out, "libc", @tagName(w.cfg.stage3.libc));
+        try out.writeAll(",");
+        try fieldStr(out, "toolchain", @tagName(w.cfg.stage3.toolchain));
+        try out.writeAll(",");
+        try fieldStr(out, "variant", w.cfg.stage3.variant);
+        try out.writeAll("},\"system\":{");
+        try fieldStr(out, "init", @tagName(w.cfg.system.init));
+        try out.writeAll(",");
+        try fieldStr(out, "hostname", w.cfg.system.hostname);
+        try out.writeAll(",");
+        try fieldStr(out, "kernel", @tagName(w.cfg.system.kernel));
+        try out.writeAll(",");
+        try fieldStr(out, "bootloader", @tagName(w.cfg.system.bootloader));
+        try out.writeAll(",");
+        try fieldStr(out, "initramfs", @tagName(w.cfg.system.initramfs));
+        try out.writeAll(",");
+        try fieldBool(out, "uki", w.cfg.system.uki);
+        try out.writeAll(",");
+        try fieldBool(out, "binhost", w.cfg.system.binhost);
+        try out.writeAll(",");
+        try fieldStr(out, "privilege", @tagName(w.cfg.system.privilege));
+        try out.writeAll(",");
+        try fieldStr(out, "timezone", w.cfg.system.timezone);
+        try out.writeAll(",");
+        try fieldStr(out, "locale", w.cfg.system.locale);
+        try out.writeAll(",");
+        try fieldStr(out, "keymap", w.cfg.system.keymap);
+        try out.writeAll("},\"network\":{");
+        try fieldStr(out, "manager", @tagName(w.cfg.network.manager));
+        try out.writeAll(",");
+        try fieldBool(out, "wifi", w.cfg.network.wifi);
+        try out.writeAll("},\"security\":{");
+        try fieldStr(out, "secure_boot", @tagName(w.cfg.security.secure_boot));
+        try out.writeAll(",");
+        try fieldStr(out, "hardening", @tagName(w.cfg.security.hardening));
+        try out.writeAll(",");
+        try fieldBool(out, "selinux", w.cfg.security.selinux);
+        try out.writeAll("},\"root\":{");
+        try out.writeAll("\"password_hash\":{\"secret\":true,\"is_set\":");
+        try out.writeAll(if (w.cfg.root.password_hash != null) "true" else "false");
+        try out.writeAll("},");
+        try fieldBool(out, "lock_root", w.cfg.root.lock_root);
+        try out.writeAll("}}}\n");
+    }
+
+    /// `export_answer` — write the current config as a reusable TOML
+    /// answer file (0600; hashes only — plaintext is never written).
+    pub fn exportAnswer(w: *Wizard, path: []const u8) !void {
+        var aw: std.Io.Writer.Allocating = .init(w.alloc);
+        defer aw.deinit();
+        const o = &aw.writer;
+        try o.writeAll("# gentoo-installer answer file\n");
+        try o.print("[disk]\ndevice = \"{s}\"\nscheme = \"{s}\"\nroot_fs = \"{s}\"\nswap = \"{s}\"\nswap_mib = {}\nesp_mib = {}\nboot_part = {}\nluks = {}\nlvm = {}\n", .{
+            w.cfg.disk.device,         @tagName(w.cfg.disk.scheme), @tagName(w.cfg.disk.root_fs),
+            @tagName(w.cfg.disk.swap), w.cfg.disk.swap_mib,         w.cfg.disk.esp_mib,
+            w.cfg.disk.boot_part,      w.cfg.disk.luks,             w.cfg.disk.lvm,
+        });
+        if (w.cfg.disk.luks)
+            try o.writeAll("# luks_passphrase = \"…\"  # plaintext is never exported — set before exec\n");
+        try o.print("[stage3]\nlibc = \"{s}\"\ntoolchain = \"{s}\"\nvariant = \"{s}\"\nmirror = \"{s}\"\n", .{ @tagName(w.cfg.stage3.libc), @tagName(w.cfg.stage3.toolchain), w.cfg.stage3.variant, w.cfg.stage3.mirror });
+        try o.print("[system]\ninit = \"{s}\"\nhostname = \"{s}\"\nkernel = \"{s}\"\nbootloader = \"{s}\"\ninitramfs = \"{s}\"\nuki = {}\nbinhost = {}\nprivilege = \"{s}\"\ntimezone = \"{s}\"\nlocale = \"{s}\"\nkeymap = \"{s}\"\nkeep_kernels = {}\nsnapshots = \"{s}\"\n", .{
+            @tagName(w.cfg.system.init),       w.cfg.system.hostname,            @tagName(w.cfg.system.kernel),
+            @tagName(w.cfg.system.bootloader), @tagName(w.cfg.system.initramfs), w.cfg.system.uki,
+            w.cfg.system.binhost,              @tagName(w.cfg.system.privilege), w.cfg.system.timezone,
+            w.cfg.system.locale,               w.cfg.system.keymap,              w.cfg.system.keep_kernels,
+            @tagName(w.cfg.system.snapshots),
+        });
+        try o.writeAll("locales = [");
+        for (w.cfg.system.locales, 0..) |l, i| {
+            if (i > 0) try o.writeAll(", ");
+            try o.print("\"{s}\"", .{l});
+        }
+        try o.writeAll("]\n");
+        try o.print("[network]\nmanager = \"{s}\"\nwifi = {}\n", .{ @tagName(w.cfg.network.manager), w.cfg.network.wifi });
+        try o.print("[services]\nsshd = {}\nlogger = {}\ncron = {}\nntp = {}\n", .{ w.cfg.services.sshd, w.cfg.services.logger, w.cfg.services.cron, w.cfg.services.ntp });
+        try o.print("[security]\nsecure_boot = \"{s}\"\nhardening = \"{s}\"\nselinux = {}\n", .{ @tagName(w.cfg.security.secure_boot), @tagName(w.cfg.security.hardening), w.cfg.security.selinux });
+        try o.print("[gpu]\ndriver = \"{s}\"\n", .{@tagName(w.cfg.gpu.driver)});
+        try o.print("[makeconf]\ncflags = ", .{});
+        switch (w.cfg.makeconf.cflags) {
+            .safe => try o.writeAll("\"safe\""),
+            .native => try o.writeAll("\"native\""),
+            .custom => |c| try o.print("\"{s}\"", .{c}),
+        }
+        try o.print("\njobs = {}\nmem_cap_gib = {}\nvideo_cards = \"{s}\"\naccept_license = \"{s}\"\nmirrors = \"{s}\"\n", .{ w.cfg.makeconf.jobs, w.cfg.makeconf.mem_cap_gib, w.cfg.makeconf.video_cards, w.cfg.makeconf.accept_license, w.cfg.makeconf.mirrors });
+        try o.writeAll("[packages]\nsets = [");
+        for (w.cfg.packages.sets, 0..) |s, i| {
+            if (i > 0) try o.writeAll(", ");
+            try o.print("\"{s}\"", .{s});
+        }
+        try o.writeAll("]\natoms = [");
+        for (w.cfg.packages.atoms, 0..) |a, i| {
+            if (i > 0) try o.writeAll(", ");
+            try o.print("\"{s}\"", .{a});
+        }
+        try o.writeAll("]\n");
+        var it = w.cfg.use.global.iterator();
+        if (w.cfg.use.global.count() > 0) {
+            try o.writeAll("[use.global]\n");
+            while (it.next()) |kv| {
+                try o.print("\"{s}\" = {}\n", .{ kv.key_ptr.*, kv.value_ptr.* == .boolean and kv.value_ptr.boolean });
+            }
+        }
+        for (w.cfg.users) |u| {
+            try o.print("[[users]]\nname = \"{s}\"\nshell = \"{s}\"\n", .{ u.name, u.shell });
+            if (u.password_hash) |h| try o.print("password_hash = \"{s}\"\n", .{h});
+            if (u.groups.len > 0) {
+                try o.writeAll("groups = [");
+                for (u.groups, 0..) |g, i| {
+                    if (i > 0) try o.writeAll(", ");
+                    try o.print("\"{s}\"", .{g});
+                }
+                try o.writeAll("]\n");
+            }
+            if (u.ssh_authorized_keys.len > 0) {
+                try o.writeAll("ssh_authorized_keys = [");
+                for (u.ssh_authorized_keys, 0..) |k, i| {
+                    if (i > 0) try o.writeAll(", ");
+                    try o.print("\"{s}\"", .{k});
+                }
+                try o.writeAll("]\n");
+            }
+        }
+        try o.writeAll("[root]\nlock_root = ");
+        try o.print("{}\n", .{w.cfg.root.lock_root});
+        if (w.cfg.root.password_hash) |h| try o.print("password_hash = \"{s}\"\n", .{h});
+        try std.Io.Dir.cwd().writeFile(w.io, .{
+            .sub_path = path,
+            .data = aw.written(),
+            .flags = .{ .truncate = true, .permissions = .fromMode(0o600) },
+        });
+    }
+};
+
+// ---------- path get/set ----------
+
+fn strOf(v: std.json.Value) WizardError![]const u8 {
+    return switch (v) {
+        .string => |s| s,
+        else => error.BadType,
+    };
+}
+
+/// Stored strings must outlive the request arena — dupe onto w.alloc.
+fn dstr(w: *Wizard, v: std.json.Value) WizardError![]const u8 {
+    const s = try strOf(v);
+    return w.alloc.dupe(u8, s) catch return error.OutOfMemory;
+}
+
+fn tableFromObj(alloc: Allocator, o: std.json.ObjectMap) !toml.Value.Table {
+    var t: toml.Value.Table = .empty;
+    var it = o.iterator();
+    while (it.next()) |kv| {
+        const tv: toml.Value = switch (kv.value_ptr.*) {
+            .string => |s| .{ .string = try alloc.dupe(u8, s) },
+            .integer => |i| .{ .integer = i },
+            .bool => |b| .{ .boolean = b },
+            else => continue,
+        };
+        try t.put(alloc, try alloc.dupe(u8, kv.key_ptr.*), tv);
+    }
+    return t;
+}
+
+fn docHas(doc: *toml.Document, sec: []const u8, key: []const u8) bool {
+    const t = doc.root.get(sec) orelse return false;
+    if (t != .table) return false;
+    return t.table.get(key) != null;
+}
+
+fn setPath(w: *Wizard, name: []const u8, v: std.json.Value) WizardError!void {
+    const cfg = &w.cfg;
+    // enum fields
+    inline for (enum_fields) |ef| {
+        if (std.mem.eql(u8, name, ef.name)) {
+            const s = try strOf(v);
+            try setEnum(cfg, ef, s);
+            return;
+        }
+    }
+    inline for (bool_fields) |bf| {
+        if (std.mem.eql(u8, name, bf)) {
+            cfg_bool.set(cfg, bf, switch (v) {
+                .bool => |b| b,
+                else => return error.BadType,
+            });
+            return;
+        }
+    }
+    inline for (int_fields) |inf| {
+        if (std.mem.eql(u8, name, inf)) {
+            cfg_int.set(cfg, inf, switch (v) {
+                .integer => |i| @intCast(i),
+                else => return error.BadType,
+            });
+            return;
+        }
+    }
+    inline for (str_fields) |sf| {
+        if (std.mem.eql(u8, name, sf)) {
+            try cfg_str.set(cfg, w.alloc, sf, try strOf(v));
+            return;
+        }
+    }
+    inline for (list_fields) |lf| {
+        if (std.mem.eql(u8, name, lf)) {
+            const arr = switch (v) {
+                .array => |a| a,
+                else => return error.BadType,
+            };
+            var items: std.ArrayList([]const u8) = .empty;
+            for (arr.items) |it| try items.append(w.alloc, try dstr(w, it));
+            cfg_list.set(cfg, lf, items.items);
+            return;
+        }
+    }
+    return error.UnknownField;
+}
+
+const EField = struct { name: []const u8, tag: ETag };
+const ETag = enum { scheme, root_fs, swap, libc, toolchain, init, kernel, bootloader, initramfs, privilege, snapshots, hardening, secure_boot, netmanager, space_src, gpu_driver, cflags };
+const enum_fields = [_]EField{
+    .{ .name = "disk.scheme", .tag = .scheme },
+    .{ .name = "disk.root_fs", .tag = .root_fs },
+    .{ .name = "disk.swap", .tag = .swap },
+    .{ .name = "disk.space_src", .tag = .space_src },
+    .{ .name = "stage3.libc", .tag = .libc },
+    .{ .name = "stage3.toolchain", .tag = .toolchain },
+    .{ .name = "system.init", .tag = .init },
+    .{ .name = "system.kernel", .tag = .kernel },
+    .{ .name = "system.bootloader", .tag = .bootloader },
+    .{ .name = "system.initramfs", .tag = .initramfs },
+    .{ .name = "system.privilege", .tag = .privilege },
+    .{ .name = "system.snapshots", .tag = .snapshots },
+    .{ .name = "security.hardening", .tag = .hardening },
+    .{ .name = "security.secure_boot", .tag = .secure_boot },
+    .{ .name = "network.manager", .tag = .netmanager },
+    .{ .name = "gpu.driver", .tag = .gpu_driver },
+    .{ .name = "makeconf.cflags", .tag = .cflags },
+};
+fn setEnum(cfg: *Config, ef: EField, s: []const u8) WizardError!void {
+    switch (ef.tag) {
+        .scheme => cfg.disk.scheme = std.meta.stringToEnum(config.Scheme, s) orelse return error.BadValue,
+        .root_fs => cfg.disk.root_fs = std.meta.stringToEnum(config.RootFs, s) orelse return error.BadValue,
+        .swap => cfg.disk.swap = std.meta.stringToEnum(config.Swap, s) orelse return error.BadValue,
+        .space_src => cfg.disk.space_src = std.meta.stringToEnum(config.SpaceSrc, s) orelse return error.BadValue,
+        .libc => cfg.stage3.libc = std.meta.stringToEnum(config.Libc, s) orelse return error.BadValue,
+        .toolchain => cfg.stage3.toolchain = std.meta.stringToEnum(config.Toolchain, s) orelse return error.BadValue,
+        .init => cfg.system.init = std.meta.stringToEnum(config.Init, s) orelse return error.BadValue,
+        .kernel => cfg.system.kernel = std.meta.stringToEnum(config.Kernel, s) orelse return error.BadValue,
+        .bootloader => cfg.system.bootloader = std.meta.stringToEnum(config.Bootloader, s) orelse return error.BadValue,
+        .initramfs => cfg.system.initramfs = std.meta.stringToEnum(config.Initramfs, s) orelse return error.BadValue,
+        .privilege => cfg.system.privilege = std.meta.stringToEnum(config.Privilege, s) orelse return error.BadValue,
+        .snapshots => cfg.system.snapshots = std.meta.stringToEnum(config.Snapshots, s) orelse return error.BadValue,
+        .hardening => cfg.security.hardening = std.meta.stringToEnum(config.Hardening, s) orelse return error.BadValue,
+        .secure_boot => cfg.security.secure_boot = std.meta.stringToEnum(config.SecureBoot, s) orelse return error.BadValue,
+        .netmanager => cfg.network.manager = std.meta.stringToEnum(config.NetManager, s) orelse return error.BadValue,
+        .gpu_driver => cfg.gpu.driver = std.meta.stringToEnum(config.GpuDriver, s) orelse return error.BadValue,
+        .cflags => {
+            if (std.mem.eql(u8, s, "safe")) cfg.makeconf.cflags = .safe else if (std.mem.eql(u8, s, "native")) cfg.makeconf.cflags = .native else return error.BadValue;
+        },
+    }
+    // keep derived flags consistent
+    if (ef.tag == .scheme) cfg.disk.scheme_explicit = true;
+    if (ef.tag == .init) {
+        // musl ⇒ no systemd; systemd-networkd follows init
+        if (cfg.system.init == .systemd and cfg.stage3.libc == .musl) cfg.stage3.libc = .glibc;
+    }
+    if (ef.tag == .libc) {
+        if (cfg.stage3.libc == .musl and cfg.system.init == .systemd) cfg.system.init = .openrc;
+        if (cfg.stage3.libc == .musl and cfg.network.manager == .@"systemd-networkd") cfg.network.manager = .networkmanager;
+    }
+}
+
+const cfg_bool = struct {
+    fn set(cfg: *Config, name: []const u8, b: bool) void {
+        const map = .{
+            .{ "disk.wipe", &cfg.disk.wipe },
+            .{ "disk.boot_part", &cfg.disk.boot_part },
+            .{ "disk.luks", &cfg.disk.luks },
+            .{ "disk.lvm", &cfg.disk.lvm },
+            .{ "disk.home_part", &cfg.disk.home_part },
+            .{ "system.uki", &cfg.system.uki },
+            .{ "system.binhost", &cfg.system.binhost },
+            .{ "network.wifi", &cfg.network.wifi },
+            .{ "services.sshd", &cfg.services.sshd },
+            .{ "services.logger", &cfg.services.logger },
+            .{ "services.cron", &cfg.services.cron },
+            .{ "services.ntp", &cfg.services.ntp },
+            .{ "security.selinux", &cfg.security.selinux },
+        };
+        inline for (map) |m| {
+            if (std.mem.eql(u8, name, m[0])) {
+                m[1].* = b;
+                return;
+            }
+        }
+    }
+};
+const bool_fields = [_][]const u8{ "disk.wipe", "disk.boot_part", "disk.luks", "disk.lvm", "disk.home_part", "system.uki", "system.binhost", "network.wifi", "services.sshd", "services.logger", "services.cron", "services.ntp", "security.selinux" };
+
+const cfg_int = struct {
+    fn set(cfg: *Config, name: []const u8, n: u32) void {
+        const map = .{
+            .{ "disk.swap_mib", &cfg.disk.swap_mib },
+            .{ "disk.shrink_mib", &cfg.disk.shrink_mib },
+            .{ "disk.esp_mib", &cfg.disk.esp_mib },
+            .{ "system.keep_kernels", &cfg.system.keep_kernels },
+            .{ "makeconf.jobs", &cfg.makeconf.jobs },
+            .{ "makeconf.mem_cap_gib", &cfg.makeconf.mem_cap_gib },
+        };
+        inline for (map) |m| {
+            if (std.mem.eql(u8, name, m[0])) {
+                m[1].* = n;
+                return;
+            }
+        }
+    }
+};
+const int_fields = [_][]const u8{ "disk.swap_mib", "disk.shrink_mib", "disk.esp_mib", "system.keep_kernels", "makeconf.jobs", "makeconf.mem_cap_gib" };
+
+const cfg_str = struct {
+    fn set(cfg: *Config, alloc: Allocator, name: []const u8, s: []const u8) !void {
+        const map = .{
+            .{ "disk.device", &cfg.disk.device },
+            .{ "disk.shrink_part", &cfg.disk.shrink_part },
+            .{ "system.hostname", &cfg.system.hostname },
+            .{ "system.timezone", &cfg.system.timezone },
+            .{ "system.locale", &cfg.system.locale },
+            .{ "system.keymap", &cfg.system.keymap },
+            .{ "stage3.variant", &cfg.stage3.variant },
+            .{ "stage3.mirror", &cfg.stage3.mirror },
+            .{ "makeconf.accept_license", &cfg.makeconf.accept_license },
+            .{ "makeconf.video_cards", &cfg.makeconf.video_cards },
+            .{ "makeconf.mirrors", &cfg.makeconf.mirrors },
+        };
+        inline for (map) |m| {
+            if (std.mem.eql(u8, name, m[0])) {
+                m[1].* = try alloc.dupe(u8, s);
+                return;
+            }
+        }
+    }
+};
+const str_fields = [_][]const u8{ "disk.device", "disk.shrink_part", "system.hostname", "system.timezone", "system.locale", "system.keymap", "stage3.variant", "stage3.mirror", "makeconf.accept_license", "makeconf.video_cards", "makeconf.mirrors" };
+
+const cfg_list = struct {
+    fn set(cfg: *Config, name: []const u8, items: []const []const u8) void {
+        const map = .{
+            .{ "system.locales", &cfg.system.locales },
+            .{ "packages.sets", &cfg.packages.sets },
+            .{ "packages.atoms", &cfg.packages.atoms },
+        };
+        inline for (map) |m| {
+            if (std.mem.eql(u8, name, m[0])) {
+                m[1].* = items;
+                return;
+            }
+        }
+    }
+};
+const list_fields = [_][]const u8{ "system.locales", "packages.sets", "packages.atoms" };
+
+// ---------- JSON emit helpers ----------
+
+pub fn jesc(out: *std.Io.Writer, s: []const u8) void {
+    for (s) |ch| {
+        switch (ch) {
+            '"', '\\' => out.print("\\{c}", .{ch}) catch return,
+            '\n' => out.writeAll("\\n") catch return,
+            '\r' => out.writeAll("\\r") catch return,
+            '\t' => out.writeAll("\\t") catch return,
+            else => if (ch < 0x20) out.print("\\u{x:0>4}", .{ch}) catch return else out.writeByte(ch) catch return,
+        }
+    }
+}
+
+fn jstr(out: *std.Io.Writer, s: []const u8) !void {
+    try out.writeAll("\"");
+    jesc(out, s);
+    try out.writeAll("\"");
+}
+
+fn fieldStr(out: *std.Io.Writer, k: []const u8, v: []const u8) !void {
+    try out.writeAll("\"");
+    jesc(out, k);
+    try out.writeAll("\":");
+    try jstr(out, v);
+}
+fn fieldBool(out: *std.Io.Writer, k: []const u8, v: bool) !void {
+    try out.writeAll("\"");
+    jesc(out, k);
+    try out.writeAll("\":");
+    try out.writeAll(if (v) "true" else "false");
+}
+fn fieldInt(out: *std.Io.Writer, k: []const u8, v: u32) !void {
+    try out.writeAll("\"");
+    jesc(out, k);
+    try out.print("\":{}", .{v});
+}
+
+/// Emit a field's current value straight from cfg (non-secret types).
+fn emitCfgValue(w: *Wizard, out: *std.Io.Writer, name: []const u8, ftype: FType) !void {
+    const cfg = &w.cfg;
+    switch (ftype) {
+        .@"enum" => {
+            // enum fields are mostly enum-typed in cfg; string-backed
+            // ones (disk.device, system.keymap, …) fall through to strVal
+            if (enumVal(cfg, name)) |val| {
+                try jstr(out, val);
+            } else if (strVal(cfg, name)) |s| {
+                try jstr(out, s);
+            } else {
+                try out.writeAll("null");
+            }
+        },
+        .bool => {
+            const v = boolVal(cfg, name) orelse false;
+            try out.writeAll(if (v) "true" else "false");
+        },
+        .int => {
+            const v = intVal(cfg, name) orelse 0;
+            try out.print("{}", .{v});
+        },
+        .string, .path => {
+            const v = strVal(cfg, name) orelse "";
+            try jstr(out, v);
+        },
+        .list => {
+            const items = listVal(cfg, name) orelse &.{};
+            try out.writeAll("[");
+            for (items, 0..) |s, i| {
+                if (i > 0) try out.writeAll(",");
+                try jstr(out, s);
+            }
+            try out.writeAll("]");
+        },
+        .record => {
+            const t = if (std.mem.eql(u8, name, "use.global")) &cfg.use.global else &cfg.use.pkg;
+            try out.writeAll("{");
+            var it = t.iterator();
+            var first = true;
+            while (it.next()) |kv| {
+                if (!first) try out.writeAll(",");
+                first = false;
+                try jstr(out, kv.key_ptr.*);
+                try out.writeAll(":");
+                switch (kv.value_ptr.*) {
+                    .boolean => |b| try out.writeAll(if (b) "true" else "false"),
+                    .integer => |i| try out.print("{}", .{i}),
+                    .string => |s| try jstr(out, s),
+                    else => try out.writeAll("null"),
+                }
+            }
+            try out.writeAll("}");
+        },
+        .table => {
+            // users[]
+            try out.writeAll("[");
+            for (cfg.users, 0..) |u, i| {
+                if (i > 0) try out.writeAll(",");
+                try out.writeAll("{\"name\":");
+                try jstr(out, u.name);
+                try out.writeAll(",\"shell\":");
+                try jstr(out, u.shell);
+                try out.writeAll(",\"groups\":[");
+                for (u.groups, 0..) |g, gi| {
+                    if (gi > 0) try out.writeAll(",");
+                    try jstr(out, g);
+                }
+                try out.writeAll("],\"ssh_authorized_keys\":[");
+                for (u.ssh_authorized_keys, 0..) |k, ki| {
+                    if (ki > 0) try out.writeAll(",");
+                    try jstr(out, k);
+                }
+                try out.print("],\"password\":{{\"secret\":true,\"is_set\":{}}}}}", .{u.password_hash != null});
+            }
+            try out.writeAll("]");
+        },
+        .secret => unreachable, // handled in emitValue
+    }
+}
+
+fn enumVal(cfg: *Config, name: []const u8) ?[]const u8 {
+    inline for (enum_fields) |ef| {
+        if (std.mem.eql(u8, name, ef.name)) {
+            return switch (ef.tag) {
+                .scheme => @tagName(cfg.disk.scheme),
+                .root_fs => @tagName(cfg.disk.root_fs),
+                .swap => @tagName(cfg.disk.swap),
+                .space_src => @tagName(cfg.disk.space_src),
+                .libc => @tagName(cfg.stage3.libc),
+                .toolchain => @tagName(cfg.stage3.toolchain),
+                .init => @tagName(cfg.system.init),
+                .kernel => @tagName(cfg.system.kernel),
+                .bootloader => @tagName(cfg.system.bootloader),
+                .initramfs => @tagName(cfg.system.initramfs),
+                .privilege => @tagName(cfg.system.privilege),
+                .snapshots => @tagName(cfg.system.snapshots),
+                .hardening => @tagName(cfg.security.hardening),
+                .secure_boot => @tagName(cfg.security.secure_boot),
+                .netmanager => @tagName(cfg.network.manager),
+                .gpu_driver => @tagName(cfg.gpu.driver),
+                .cflags => switch (cfg.makeconf.cflags) {
+                    .safe => "safe",
+                    .native => "native",
+                    .custom => "custom",
+                },
+            };
+        }
+    }
+    return null;
+}
+
+fn boolVal(cfg: *Config, name: []const u8) ?bool {
+    const map = .{
+        .{ "disk.wipe", cfg.disk.wipe },
+        .{ "disk.boot_part", cfg.disk.boot_part },
+        .{ "disk.luks", cfg.disk.luks },
+        .{ "disk.lvm", cfg.disk.lvm },
+        .{ "disk.home_part", cfg.disk.home_part },
+        .{ "system.uki", cfg.system.uki },
+        .{ "system.binhost", cfg.system.binhost },
+        .{ "network.wifi", cfg.network.wifi },
+        .{ "services.sshd", cfg.services.sshd },
+        .{ "services.logger", cfg.services.logger },
+        .{ "services.cron", cfg.services.cron },
+        .{ "services.ntp", cfg.services.ntp },
+        .{ "security.selinux", cfg.security.selinux },
+    };
+    inline for (map) |m| {
+        if (std.mem.eql(u8, name, m[0])) return m[1];
+    }
+    return null;
+}
+
+fn intVal(cfg: *Config, name: []const u8) ?u32 {
+    const map = .{
+        .{ "disk.swap_mib", cfg.disk.swap_mib },
+        .{ "disk.shrink_mib", cfg.disk.shrink_mib },
+        .{ "disk.esp_mib", cfg.disk.esp_mib },
+        .{ "system.keep_kernels", cfg.system.keep_kernels },
+        .{ "makeconf.jobs", cfg.makeconf.jobs },
+        .{ "makeconf.mem_cap_gib", cfg.makeconf.mem_cap_gib },
+    };
+    inline for (map) |m| {
+        if (std.mem.eql(u8, name, m[0])) return m[1];
+    }
+    return null;
+}
+
+fn strVal(cfg: *Config, name: []const u8) ?[]const u8 {
+    const map = .{
+        .{ "disk.device", cfg.disk.device },
+        .{ "disk.shrink_part", cfg.disk.shrink_part },
+        .{ "system.hostname", cfg.system.hostname },
+        .{ "system.timezone", cfg.system.timezone },
+        .{ "system.locale", cfg.system.locale },
+        .{ "system.keymap", cfg.system.keymap },
+        .{ "stage3.variant", cfg.stage3.variant },
+        .{ "stage3.mirror", cfg.stage3.mirror },
+        .{ "makeconf.accept_license", cfg.makeconf.accept_license },
+        .{ "makeconf.video_cards", cfg.makeconf.video_cards },
+        .{ "makeconf.mirrors", cfg.makeconf.mirrors },
+    };
+    inline for (map) |m| {
+        if (std.mem.eql(u8, name, m[0])) return m[1];
+    }
+    return null;
+}
+
+fn listVal(cfg: *Config, name: []const u8) ?[]const []const u8 {
+    const map = .{
+        .{ "system.locales", cfg.system.locales },
+        .{ "packages.sets", cfg.packages.sets },
+        .{ "packages.atoms", cfg.packages.atoms },
+    };
+    inline for (map) |m| {
+        if (std.mem.eql(u8, name, m[0])) return m[1];
+    }
+    return null;
+}
+
+// ---------- tests ----------
+
+const testing = std.testing;
+
+fn testWizard() Wizard {
+    return Wizard.init(testing.allocator, testing.io, .{});
+}
+
+fn pageJsonHas(w: *Wizard, alloc: Allocator, page_id: []const u8, needle: []const u8) !bool {
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    try w.emitPage(&aw.writer, null, page_id);
+    return std.mem.indexOf(u8, aw.written(), needle) != null;
+}
+
+test "express flow visits only essential pages" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var w = testWizard();
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    try w.emitPage(&aw.writer, null, null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"of\":4") != null);
+    // welcome → disk → accounts → review
+    try testing.expect(try w.next(alloc, null));
+    try testing.expectEqualStrings("disk", w.currentPage().id);
+}
+
+test "advanced flow visits all pages" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var w = testWizard();
+    try w.setField("flow.mode", .{ .string = "advanced" });
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    try w.emitPage(&aw.writer, null, null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"of\":8") != null);
+}
+
+test "every page emits valid JSON in both flows" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    inline for (.{ Flow.express, Flow.advanced }) |fl| {
+        var w = testWizard();
+        w.flow = fl;
+        w.cfg.disk.luks = true; // widen visible field set
+        w.cfg.disk.luks_passphrase = "sup3rsecret";
+        w.cfg.disk.device = "/dev/vda";
+        for (pages) |pg| {
+            var aw: std.Io.Writer.Allocating = .init(alloc);
+            try w.emitPage(&aw.writer, null, pg.id);
+            _ = std.json.parseFromSlice(std.json.Value, alloc, aw.written(), .{}) catch |e| {
+                std.debug.print("invalid page JSON ({s}, page {s}): {s}\n", .{ @tagName(fl), pg.id, aw.written() });
+                return e;
+            };
+        }
+    }
+}
+
+test "back wraps at page zero" {
+    var w = testWizard();
+    w.back();
+    try testing.expectEqual(@as(usize, 0), w.page_idx);
+}
+
+test "secrets are masked in page emission and config" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var w = testWizard();
+    w.cfg.disk.luks = true;
+    w.cfg.disk.luks_passphrase = "sup3rsecret";
+    try testing.expect(try pageJsonHas(&w, alloc, "disk", "\"is_set\":true"));
+    try testing.expect(!(try pageJsonHas(&w, alloc, "disk", "sup3rsecret")));
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    try w.emitConfigJson(&aw.writer, null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "sup3rsecret") == null);
+}
+
+test "luks passphrase field only visible when luks on" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var w = testWizard();
+    w.flow = .advanced;
+    try testing.expect(!(try pageJsonHas(&w, alloc, "disk", "disk.luks_passphrase")));
+    try w.setField("disk.luks", .{ .bool = true });
+    try testing.expect(try pageJsonHas(&w, alloc, "disk", "disk.luks_passphrase"));
+}
+
+test "root.password set hashes via openssl" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var w = testWizard();
+    w.alloc = arena.allocator();
+    try w.setField("root.password", .{ .string = "correct horse battery" });
+    const h = w.cfg.root.password_hash orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.startsWith(u8, h, "$6$"));
+    try testing.expect(!std.mem.eql(u8, h, "correct horse battery"));
+}
+
+test "next blocks on invalid page" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var w = testWizard();
+    try testing.expect(try w.next(alloc, null)); // welcome ok
+    // disk: no device → stays
+    try testing.expect(!(try w.next(alloc, null)));
+    try testing.expectEqualStrings("disk", w.currentPage().id);
+}
+
+test "set enum coercion keeps derived state consistent" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var w = testWizard();
+    try w.setField("stage3.libc", .{ .string = "musl" });
+    // musl can't host systemd → init falls back to openrc
+    try testing.expect(w.cfg.system.init == .openrc);
+}
+
+test "users table set masks password as hash" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var w = testWizard();
+    w.alloc = alloc;
+    const arr = [_]std.json.Value{.{
+        .object = blk: {
+            var o: std.json.ObjectMap = try .init(alloc, &.{}, &.{});
+            try o.put(alloc, "name", .{ .string = "m" });
+            try o.put(alloc, "password", .{ .string = "hunter2xyz" });
+            break :blk o;
+        },
+    }};
+    var al = std.json.Array.init(alloc);
+    try al.appendSlice(&arr);
+    const v = std.json.Value{ .array = al };
+    try w.setField("users", v);
+    try testing.expectEqual(@as(usize, 1), w.cfg.users.len);
+    try testing.expectEqualStrings("m", w.cfg.users[0].name);
+    const h = w.cfg.users[0].password_hash orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.startsWith(u8, h, "$6$"));
+}
+
+test "exportAnswer round-trips through loadAnswerFile" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var w = testWizard();
+    w.alloc = alloc;
+    w.cfg.disk.device = "/dev/vda";
+    w.cfg.root.password_hash = "$6$abc$def";
+    const path = "/tmp/gi-wizard-test-ans.toml";
+    try w.exportAnswer(path);
+    var w2 = testWizard();
+    w2.alloc = alloc;
+    try w2.loadAnswerFile(path);
+    try testing.expectEqualStrings("/dev/vda", w2.cfg.disk.device);
+    try testing.expectEqualStrings("$6$abc$def", w2.cfg.root.password_hash.?);
+    try testing.expectEqualStrings("review", w2.currentPage().id);
+}

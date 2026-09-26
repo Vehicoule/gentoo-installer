@@ -10,6 +10,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const vaxis_dep = b.dependency("vaxis", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe = b.addExecutable(.{
         .name = "gentoo-installer",
         .root_module = b.createModule(.{
@@ -18,6 +23,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "engine", .module = engine_mod },
+                .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
             },
         }),
     });

@@ -85,9 +85,7 @@ pub fn checkLocks(alloc: Allocator, preset: *const Preset, user_doc: *const toml
         const got = lookup(user_doc.root, path);
         if (got == null) continue; // unset → default wins, fine
         if (!valueEq(got.?, want))
-            try errs.append(alloc, std.fmt.allocPrint(alloc,
-                "preset lock: '{s}' is fixed by preset '{s}' — remove it or match the preset default",
-                .{ path, preset.id }) catch @panic("oom"));
+            try errs.append(alloc, std.fmt.allocPrint(alloc, "preset lock: '{s}' is fixed by preset '{s}' — remove it or match the preset default", .{ path, preset.id }) catch @panic("oom"));
     }
     return errs.items;
 }

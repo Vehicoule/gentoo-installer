@@ -580,8 +580,7 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
 
     if (cfg.boot_mode == .bios) {
         switch (resolveBootloader(cfg)) {
-            .@"systemd-boot", .efistub, .refind =>
-                try errs.append(alloc, "bootloader requires UEFI on a BIOS boot"),
+            .@"systemd-boot", .efistub, .refind => try errs.append(alloc, "bootloader requires UEFI on a BIOS boot"),
             else => {},
         }
         if (cfg.system.uki) try errs.append(alloc, "uki requires UEFI");

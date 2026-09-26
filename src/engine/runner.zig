@@ -17,6 +17,10 @@ pub const Options = struct {
     /// so callers can express it).
     skip_steps: []const []const u8 = &.{},
     out: *std.Io.Writer,
+    /// Per-step observer for structured consumers (headless `step`
+    /// events, TUI progress page). state: started/done/failed/skipped.
+    on_step: ?*const fn (ctx: ?*anyopaque, i: usize, of: usize, id: []const u8, state: []const u8) void = null,
+    ctx: ?*anyopaque = null,
 };
 
 pub const Journal = struct {
@@ -113,8 +117,10 @@ pub fn run(io: std.Io, alloc: Allocator, p: plan.Plan, opts: Options) !void {
     for (p.steps, 0..) |step, i| {
         if (skipped(step.id, opts.skip_steps)) {
             journal.stepDone(step.id, true);
+            if (opts.on_step) |cb| cb(opts.ctx, i + 1, p.steps.len, step.id, "skipped");
             continue;
         }
+        if (opts.on_step) |cb| cb(opts.ctx, i + 1, p.steps.len, step.id, "started");
         try out.print("[{d:0>2}] {s}  ({s})\n", .{ i + 1, step.title, step.id });
         for (step.cmds) |cmd| {
             switch (cmd) {
@@ -126,6 +132,7 @@ pub fn run(io: std.Io, alloc: Allocator, p: plan.Plan, opts: Options) !void {
                             journal.cmdWriteFile(step.id, w, "ok");
                         } else |err| {
                             journal.cmdWriteFile(step.id, w, "fail");
+                            if (opts.on_step) |cb| cb(opts.ctx, i + 1, p.steps.len, step.id, "failed");
                             return err;
                         }
                     }
@@ -142,6 +149,7 @@ pub fn run(io: std.Io, alloc: Allocator, p: plan.Plan, opts: Options) !void {
                             return error.MissingStdinData;
                         execCmd(io, alloc, e) catch |err| {
                             journal.cmdExec(step.id, e, "fail");
+                            if (opts.on_step) |cb| cb(opts.ctx, i + 1, p.steps.len, step.id, "failed");
                             return err;
                         };
                         journal.cmdExec(step.id, e, "ok");
@@ -150,6 +158,7 @@ pub fn run(io: std.Io, alloc: Allocator, p: plan.Plan, opts: Options) !void {
             }
         }
         journal.stepDone(step.id, false);
+        if (opts.on_step) |cb| cb(opts.ctx, i + 1, p.steps.len, step.id, "done");
     }
     try out.flush();
 }
@@ -187,8 +196,12 @@ fn execCmd(io: std.Io, alloc: Allocator, e: plan.Exec) !void {
         var wbuf: [4096]u8 = undefined;
         var fw = child.stdin.?.writer(io, &wbuf);
         var werr: ?anyerror = null;
-        fw.interface.writeAll(data) catch |e2| { werr = e2; };
-        if (werr == null) fw.interface.flush() catch |e2| { werr = e2; };
+        fw.interface.writeAll(data) catch |e2| {
+            werr = e2;
+        };
+        if (werr == null) fw.interface.flush() catch |e2| {
+            werr = e2;
+        };
         child.stdin.?.close(io);
         child.stdin = null;
         if (werr) |e2| {

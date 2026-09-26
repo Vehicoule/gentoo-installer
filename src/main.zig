@@ -83,11 +83,7 @@ pub fn main(init: std.process.Init) !void {
             try out.flush();
             return;
         },
-        .tui => {
-            try errw.writeAll("tui: not yet implemented (M2)\n");
-            try errw.flush();
-            std.process.exit(2);
-        },
+        .tui => return @import("tui.zig").runTui(init, alloc, io),
         .detect => {
             const env = try engine.detect.detect(alloc, io);
             try engine.detect.envToJson(alloc, &env, out);
@@ -297,7 +293,8 @@ pub fn main(init: std.process.Init) !void {
             const resolved: ?[]const u8 = if (rlen) |n| rbuf[0..n] else null;
             for (e.disks) |dk| {
                 if (std.mem.eql(u8, dk.path, cfg.disk.device) or
-                    (resolved != null and std.mem.eql(u8, dk.path, resolved.?))) {
+                    (resolved != null and std.mem.eql(u8, dk.path, resolved.?)))
+                {
                     size_mib = dk.size_bytes / (1 << 20);
                     // Canonicalize to the kernel path: partPath appends
                     // 1/pN while udev names by-id partitions <id>-partN —
@@ -340,14 +337,15 @@ pub fn main(init: std.process.Init) !void {
     });
 }
 
-const JsonLine = struct { op: ?[]const u8, req: ?u64, version: ?u64, version_bad: bool, malformed: bool };
+const JsonLine = struct { op: ?[]const u8, req: ?u64, version: ?u64, version_bad: bool, malformed: bool, val: ?std.json.Value };
 
 /// Parse one NDJSON request line; op must be a string, req a non-negative
-/// integer. Non-object or invalid JSON reports `malformed`.
+/// integer. Non-object or invalid JSON reports `malformed`. The full
+/// object rides along in `val` for ops that carry payloads.
 fn parseLine(alloc: std.mem.Allocator, line: []const u8) JsonLine {
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch
-        return .{ .op = null, .req = null, .version = null, .version_bad = false, .malformed = true };
-    if (parsed.value != .object) return .{ .op = null, .req = null, .version = null, .version_bad = false, .malformed = true };
+    const none = JsonLine{ .op = null, .req = null, .version = null, .version_bad = false, .malformed = true, .val = null };
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch return none;
+    if (parsed.value != .object) return none;
     const obj = parsed.value.object;
     var op: ?[]const u8 = null;
     var req: ?u64 = null;
@@ -365,7 +363,26 @@ fn parseLine(alloc: std.mem.Allocator, line: []const u8) JsonLine {
         else
             version_bad = true; // present but not a non-negative int
     }
-    return .{ .op = op, .req = req, .version = version, .version_bad = version_bad, .malformed = false };
+    return .{ .op = op, .req = req, .version = version, .version_bad = version_bad, .malformed = false, .val = parsed.value };
+}
+
+fn jfield(jl: JsonLine, key: []const u8) ?std.json.Value {
+    const v = jl.val orelse return null;
+    return v.object.get(key);
+}
+fn jstr(jl: JsonLine, key: []const u8) ?[]const u8 {
+    const v = jfield(jl, key) orelse return null;
+    return switch (v) {
+        .string => |s| s,
+        else => null,
+    };
+}
+fn jbool(jl: JsonLine, key: []const u8) ?bool {
+    const v = jfield(jl, key) orelse return null;
+    return switch (v) {
+        .bool => |b| b,
+        else => null,
+    };
 }
 
 fn fatal(w: *std.Io.Writer, msg: []const u8) noreturn {
@@ -374,15 +391,19 @@ fn fatal(w: *std.Io.Writer, msg: []const u8) noreturn {
     std.process.exit(2);
 }
 
-/// Minimal NDJSON protocol surface for M1: reads op lines, answers
-/// `hello` (with env), `detect`, and `quit`. Full op set lands with
-/// the wizard state machine (M2).
+/// NDJSON protocol surface: hello/detect + the wizard ops (page, set,
+/// next, back, goto, get_config, set_config, validate, plan,
+/// export_answer, install) + quit. See docs/protocol.md.
 fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, errw: *std.Io.Writer) !void {
     _ = init;
     _ = errw;
     var stdin_buf: [8192]u8 = undefined;
     var fr = std.Io.File.stdin().reader(io, &stdin_buf);
     const r = &fr.interface;
+
+    var wiz = engine.wizard.Wizard.init(alloc, io, .{});
+    var wiz_arena = std.heap.ArenaAllocator.init(alloc);
+    defer wiz_arena.deinit();
 
     var line_buf: std.Io.Writer.Allocating = .init(alloc);
     defer line_buf.deinit();
@@ -431,10 +452,13 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
             } else {
                 try out.writeAll("{\"ev\":\"hello\",");
                 try writeReq(out, req);
-                try out.writeAll("\"engine\":\"0.1.0\",\"version\":1,\"caps\":[\"hello\",\"detect\",\"quit\"]}\n");
+                try out.writeAll("\"engine\":\"0.1.0\",\"version\":1,\"caps\":[\"hello\",\"detect\",\"wizard\",\"install\",\"quit\"]}\n");
             }
         } else if (std.mem.eql(u8, op, "detect")) {
-            const env = try engine.detect.detect(req_alloc, io);
+            // env must outlive the request — disks/gpus populate
+            // wizard field options for the rest of the session.
+            const env = try engine.detect.detect(wiz_arena.allocator(), io);
+            wiz.applyEnv(env);
             try out.writeAll("{\"ev\":\"env\",");
             try writeReq(out, req);
             try engine.detect.envFieldsJson(alloc, &env, out);
@@ -447,11 +471,140 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
             try out.writeAll("}\n");
             try out.flush();
             return;
+        } else if (std.mem.eql(u8, op, "page")) {
+            const pgname = jstr(jl, "page");
+            wiz.emitPage(out, req, pgname) catch |e| {
+                try writeErr(out, req, switch (e) {
+                    error.BadValue => "unknown page",
+                    else => "page failed",
+                });
+            };
+        } else if (std.mem.eql(u8, op, "next")) {
+            const nv = wizNvidia(&wiz);
+            const ok = wiz.next(req_alloc, nv) catch |e| blk: {
+                break :blk e != error.OutOfMemory;
+            };
+            if (ok) {
+                try wiz.emitPage(out, req, null);
+            } else {
+                const errs = wiz.pageErrors(req_alloc, nv, wiz.currentPage()) catch &.{};
+                try writeValidate(out, req, errs);
+            }
+        } else if (std.mem.eql(u8, op, "back")) {
+            wiz.back();
+            try wiz.emitPage(out, req, null);
+        } else if (std.mem.eql(u8, op, "goto")) {
+            const pgname = jstr(jl, "page") orelse {
+                try writeErr(out, req, "goto needs a page name");
+                try out.flush();
+                req_arena.deinit();
+                if (at_eof) break;
+                continue;
+            };
+            wiz.emitPage(out, req, pgname) catch |e| {
+                try writeErr(out, req, switch (e) {
+                    error.BadValue => "unknown page",
+                    else => "page failed",
+                });
+            };
+        } else if (std.mem.eql(u8, op, "set")) {
+            const field = jstr(jl, "field") orelse {
+                try writeErr(out, req, "set needs a field");
+                try out.flush();
+                req_arena.deinit();
+                if (at_eof) break;
+                continue;
+            };
+            const value = jfield(jl, "value") orelse {
+                try writeErr(out, req, "set needs a value");
+                try out.flush();
+                req_arena.deinit();
+                if (at_eof) break;
+                continue;
+            };
+            wiz.setField(field, value) catch |e| {
+                var aw: std.Io.Writer.Allocating = .init(req_alloc);
+                aw.writer.print("set {s}: {s}", .{ field, @errorName(e) }) catch {};
+                try writeErr(out, req, aw.written());
+                try out.flush();
+                req_arena.deinit();
+                if (at_eof) break;
+                continue;
+            };
+            try writeResult(out, req);
+            // validate delta — the whole-config errors (frontend maps
+            // them to the owning page by field prefix)
+            const errs = engine.config.validate(req_alloc, &wiz.cfg, wizNvidia(&wiz)) catch &.{};
+            try writeValidate(out, null, errs);
+        } else if (std.mem.eql(u8, op, "set_config")) {
+            // {config:{dotted.path:value,…}} — same as N `set` ops.
+            const cv = jfield(jl, "config");
+            if (cv != null and cv.? == .object) {
+                var it = cv.?.object.iterator();
+                while (it.next()) |kv| {
+                    wiz.setField(kv.key_ptr.*, kv.value_ptr.*) catch {};
+                }
+            }
+            try writeResult(out, req);
+            const errs = engine.config.validate(req_alloc, &wiz.cfg, wizNvidia(&wiz)) catch &.{};
+            try writeValidate(out, null, errs);
+        } else if (std.mem.eql(u8, op, "get_config")) {
+            try wiz.emitConfigJson(out, req);
+        } else if (std.mem.eql(u8, op, "validate")) {
+            const errs = engine.config.validate(req_alloc, &wiz.cfg, wizNvidia(&wiz)) catch &.{};
+            try writeValidate(out, req, errs);
+        } else if (std.mem.eql(u8, op, "plan")) {
+            const p = engine.plan.build(req_alloc, &wiz.cfg, if (wiz.env) |*e| e else null, .{}, null) catch |e| {
+                var aw: std.Io.Writer.Allocating = .init(req_alloc);
+                aw.writer.print("plan build failed: {s}", .{@errorName(e)}) catch {};
+                try writeErr(out, req, aw.written());
+                try out.flush();
+                req_arena.deinit();
+                if (at_eof) break;
+                continue;
+            };
+            var aw: std.Io.Writer.Allocating = .init(req_alloc);
+            try engine.runner.run(io, req_alloc, p, .{ .mode = .dry_run, .out = &aw.writer });
+            try out.writeAll("{\"ev\":\"plan\",");
+            try writeReq(out, req);
+            try out.writeAll("\"cmds\":[");
+            var lines = std.mem.splitScalar(u8, aw.written(), '\n');
+            var first = true;
+            while (lines.next()) |ln| {
+                if (ln.len == 0) continue;
+                if (!first) try out.writeAll(",");
+                first = false;
+                try out.writeAll("\"");
+                jsonEsc(out, ln);
+                try out.writeAll("\"");
+            }
+            try out.writeAll("]}\n");
+        } else if (std.mem.eql(u8, op, "export_answer")) {
+            const path = jstr(jl, "path") orelse {
+                try writeErr(out, req, "export_answer needs a path");
+                try out.flush();
+                req_arena.deinit();
+                if (at_eof) break;
+                continue;
+            };
+            wiz.exportAnswer(path) catch |e| {
+                var aw: std.Io.Writer.Allocating = .init(req_alloc);
+                aw.writer.print("export failed: {s}", .{@errorName(e)}) catch {};
+                try writeErr(out, req, aw.written());
+                try out.flush();
+                req_arena.deinit();
+                if (at_eof) break;
+                continue;
+            };
+            try writeResult(out, req);
+        } else if (std.mem.eql(u8, op, "install")) {
+            const dry = jbool(jl, "dry_run") orelse true;
+            try doInstall(io, req_alloc, &wiz, out, req, dry, jl);
         } else {
             var aw: std.Io.Writer.Allocating = .init(alloc);
             aw.writer.writeAll("unknown op '") catch return error.OutOfMemory;
             jsonEsc(&aw.writer, op);
-            aw.writer.writeAll("' (m1 supports hello/detect/quit)") catch return error.OutOfMemory;
+            aw.writer.writeAll("'") catch return error.OutOfMemory;
             try writeErr(out, req, aw.written());
         }
         try out.flush();
@@ -484,4 +637,148 @@ fn jsonEsc(w: *std.Io.Writer, str: []const u8) void {
             else => if (ch < 0x20) w.print("\\u{x:0>4}", .{ch}) catch return else w.writeByte(ch) catch return,
         }
     }
+}
+
+// ---------- headless helpers ----------
+
+fn wizNvidia(wiz: *engine.wizard.Wizard) ?engine.config.NvidiaTier {
+    const env = wiz.env orelse return null;
+    for (env.gpus) |g| {
+        if (std.mem.eql(u8, g.vendor, "nvidia"))
+            return if (engine.detect.nvidiaIsTuringPlus(g)) .open_capable else .legacy;
+    }
+    return null;
+}
+
+fn writeResult(out: *std.Io.Writer, req: ?u64) !void {
+    try out.writeAll("{\"ev\":\"result\",");
+    try writeReq(out, req);
+    try out.writeAll("\"ok\":true}\n");
+}
+
+fn writeValidate(out: *std.Io.Writer, req: ?u64, errs: []const []const u8) !void {
+    try out.writeAll("{\"ev\":\"validate\",");
+    try writeReq(out, req);
+    try out.writeAll("\"errors\":[");
+    for (errs, 0..) |e, i| {
+        if (i > 0) try out.writeAll(",");
+        try out.writeAll("{\"message\":\"");
+        jsonEsc(out, e);
+        try out.writeAll("\"}");
+    }
+    try out.writeAll("],\"warnings\":[]}\n");
+}
+
+const StepCtx = struct {
+    out: *std.Io.Writer,
+    dry: bool,
+};
+fn stepEventCb(ctx: ?*anyopaque, i: usize, of: usize, id: []const u8, state: []const u8) void {
+    const c: *StepCtx = @ptrCast(@alignCast(ctx orelse return));
+    c.out.writeAll("{\"ev\":\"step\",") catch return;
+    c.out.print("\"i\":{},\"of\":{},\"name\":\"", .{ i, of }) catch return;
+    jsonEsc(c.out, id);
+    c.out.writeAll("\",\"state\":\"") catch return;
+    jsonEsc(c.out, state);
+    c.out.writeAll("\"}\n") catch return;
+    c.out.flush() catch {};
+}
+
+/// `install` op — validates, mirrors the run path's exec gates
+/// (confirm token, exec-blocked combos, capacity), then runs the plan
+/// streaming `step` events, finished by a `done` or `error` event.
+fn doInstall(io: std.Io, alloc: std.mem.Allocator, wiz: *engine.wizard.Wizard, out: *std.Io.Writer, req: ?u64, dry: bool, jl: JsonLine) !void {
+    const cfg = &wiz.cfg;
+    const errs = engine.config.validate(alloc, cfg, wizNvidia(wiz)) catch &.{};
+    if (errs.len > 0) {
+        try writeValidate(out, req, errs);
+        return;
+    }
+    const env_opt = wiz.env;
+    if (!dry) {
+        if (env_opt == null) {
+            try writeErr(out, req, "install exec requires a prior detect op (no env)");
+            return;
+        }
+        if (cfg.system.kernel == .manual) {
+            try writeErr(out, req, "kernel=manual is a TUI flow — exec support lands in a later milestone");
+            return;
+        }
+        if (cfg.system.init == .runit or cfg.system.init == .s6 or cfg.system.init == .dinit) {
+            try writeErr(out, req, "run/svc-install for runit/s6/dinit lands in M6");
+            return;
+        }
+        if (cfg.security.secure_boot == .shim) {
+            try writeErr(out, req, "secure_boot=shim is not executable yet — M6");
+            return;
+        }
+        const destructive = cfg.disk.scheme == .@"efi-swap-root" or cfg.disk.scheme == .@"bios-boot-swap-root";
+        if (destructive) {
+            const confirm = jstr(jl, "confirm") orelse {
+                try writeErr(out, req, "destructive install needs confirm=<disk basename>");
+                return;
+            };
+            const base = std.fs.path.basename(cfg.disk.device);
+            if (!std.mem.eql(u8, confirm, base) and !std.mem.eql(u8, confirm, cfg.disk.device)) {
+                try writeErr(out, req, "confirm does not match disk.device");
+                return;
+            }
+            // capacity preflight — same floor as `run`
+            var need_mib: u64 = 4;
+            if (cfg.boot_mode == .uefi) need_mib += cfg.disk.esp_mib else need_mib += 2;
+            if (cfg.disk.swap == .partition) need_mib += cfg.disk.swap_mib;
+            if (cfg.disk.boot_part) need_mib += 1024;
+            if (cfg.disk.luks or cfg.disk.lvm) need_mib += 32;
+            need_mib += if (cfg.disk.lvm)
+                (if (cfg.system.snapshots == .auto) (8192 * 100 + 94) / 95 else (8192 * 10 + 6) / 7)
+            else
+                8192;
+            var size_mib: ?u64 = null;
+            const e = env_opt.?;
+            var rbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const rlen = std.Io.Dir.cwd().realPathFile(io, cfg.disk.device, &rbuf) catch null;
+            const resolved: ?[]const u8 = if (rlen) |n| rbuf[0..n] else null;
+            for (e.disks) |dk| {
+                if (std.mem.eql(u8, dk.path, cfg.disk.device) or
+                    (resolved != null and std.mem.eql(u8, dk.path, resolved.?)))
+                {
+                    size_mib = dk.size_bytes / (1 << 20);
+                    cfg.disk.device = dk.path;
+                }
+            }
+            if (size_mib == null) {
+                try writeErr(out, req, "disk.device not among detected disks — refusing to wipe an unverified target");
+                return;
+            }
+            if (size_mib.? < need_mib) {
+                var aw: std.Io.Writer.Allocating = .init(alloc);
+                aw.writer.print("{s} is {} MiB — layout needs {} MiB", .{ cfg.disk.device, size_mib.?, need_mib }) catch {};
+                try writeErr(out, req, aw.written());
+                return;
+            }
+        }
+    }
+    const p = engine.plan.build(alloc, cfg, if (env_opt) |*e| e else null, .{}, null) catch |e| {
+        var aw: std.Io.Writer.Allocating = .init(alloc);
+        aw.writer.print("plan build failed: {s}", .{@errorName(e)}) catch {};
+        try writeErr(out, req, aw.written());
+        return;
+    };
+    var sctx = StepCtx{ .out = out, .dry = dry };
+    var logw: std.Io.Writer.Allocating = .init(alloc);
+    engine.runner.run(io, alloc, p, .{
+        .mode = if (dry) .dry_run else .exec,
+        .journal_path = if (dry) null else "/tmp/gentoo-installer.journal",
+        .out = &logw.writer,
+        .on_step = stepEventCb,
+        .ctx = &sctx,
+    }) catch |e| {
+        var aw: std.Io.Writer.Allocating = .init(alloc);
+        aw.writer.print("install failed: {s}", .{@errorName(e)}) catch {};
+        try writeErr(out, req, aw.written());
+        return;
+    };
+    try out.writeAll("{\"ev\":\"done\",");
+    try writeReq(out, req);
+    try out.writeAll("\"ok\":true,\"reboot_ready\":true}\n");
 }
