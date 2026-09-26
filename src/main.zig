@@ -577,6 +577,16 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
             const errs = engine.config.validate(req_alloc, &wiz.cfg, wizNvidia(&wiz)) catch &.{};
             try writeValidate(out, req, errs);
         } else if (std.mem.eql(u8, op, "plan")) {
+            // A plan is executable shell — never emit one from an
+            // invalid config (e.g. an unsafe mirror a `set` accepted).
+            const perrs = engine.config.validate(req_alloc, &wiz.cfg, wizNvidia(&wiz)) catch &.{};
+            if (perrs.len > 0) {
+                try writeValidate(out, req, perrs);
+                try out.flush();
+                req_arena.deinit();
+                if (at_eof) break;
+                continue;
+            }
             const ps = wiz.pkgSets(req_alloc) catch |e| {
                 var aw2: std.Io.Writer.Allocating = .init(req_alloc);
                 aw2.writer.print("set resolution failed: {s}", .{@errorName(e)}) catch {};
@@ -686,12 +696,12 @@ fn jsonEsc(w: *std.Io.Writer, str: []const u8) void {
 // ---------- headless helpers ----------
 
 fn wizNvidia(wiz: *engine.wizard.Wizard) ?engine.config.NvidiaTier {
-    const env = wiz.env orelse return null;
+    const env = wiz.env orelse return null; // unknown, not absent
     for (env.gpus) |g| {
         if (std.mem.eql(u8, g.vendor, "nvidia"))
             return if (engine.detect.nvidiaIsTuringPlus(g)) .open_capable else .legacy;
     }
-    return null;
+    return .absent;
 }
 
 fn writeResult(out: *std.Io.Writer, req: ?u64) !void {

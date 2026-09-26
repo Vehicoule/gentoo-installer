@@ -179,6 +179,14 @@ fn writeFile(io: std.Io, path: []const u8, content: []const u8, mode: u32) !void
     });
 }
 
+/// stdout drain helper — runs on its own thread so a verbose child
+/// can't deadlock against an unwritten stdin payload.
+fn drainChildStdout(io: std.Io, file: std.Io.File, out: *std.Io.Writer.Allocating) void {
+    var rbuf: [8192]u8 = undefined;
+    var r = file.reader(io, &rbuf);
+    _ = r.interface.streamRemaining(&out.writer) catch {};
+}
+
 fn execCmd(io: std.Io, alloc: Allocator, e: plan.Exec) !void {
     var argv_buf: std.ArrayList([]const u8) = .empty;
     if (e.chroot) {
@@ -193,6 +201,13 @@ fn execCmd(io: std.Io, alloc: Allocator, e: plan.Exec) !void {
         // stderr so the console still shows tool output on `run`.
         .stdout = .pipe,
     });
+    // Drain stdout on a helper thread while stdin is written below —
+    // a child that fills its stdout pipe before reading stdin would
+    // deadlock a write-then-read order.
+    var drained: std.Io.Writer.Allocating = .init(alloc);
+    var drain_th: ?std.Thread = null;
+    if (child.stdout) |cs|
+        drain_th = std.Thread.spawn(.{}, drainChildStdout, .{ io, cs, &drained }) catch null;
     if (e.stdin) |data| {
         // Feed the payload, flush the buffered writer, then close so the
         // child sees EOF. Closing without flushing would discard bytes
@@ -210,23 +225,34 @@ fn execCmd(io: std.Io, alloc: Allocator, e: plan.Exec) !void {
         child.stdin = null;
         if (werr) |e2| {
             _ = child.wait(io) catch {};
+            if (drain_th) |th| th.join();
             return e2;
         }
     }
-    // Drain stdout BEFORE wait — a verbose child deadlocks on a full
-    // pipe otherwise. Forwarded to stderr: protocol-safe for headless,
-    // still visible on a console for `run`.
+    const term = try child.wait(io);
+    if (drain_th) |th| th.join() else {
+        // no helper thread — drain now (stdin is already closed)
+        if (child.stdout) |cs| drainChildStdout(io, cs, &drained);
+    }
     if (child.stdout) |cs| {
-        var rbuf: [8192]u8 = undefined;
-        var sr = cs.reader(io, &rbuf);
-        var sebuf: [8192]u8 = undefined;
-        var sew = std.Io.File.stderr().writer(io, &sebuf);
-        _ = sr.interface.streamRemaining(&sew.interface) catch {};
-        sew.interface.flush() catch {};
         cs.close(io);
         child.stdout = null;
     }
-    const term = try child.wait(io);
+    // Forward child output to stderr, redacting the stdin payload — a
+    // tool that echoes its input must not leak a passphrase into logs.
+    if (drained.written().len > 0) {
+        const body = if (e.stdin) |data|
+            (if (data.len > 0)
+                std.mem.replaceOwned(u8, alloc, drained.written(), data, "[redacted]") catch drained.written()
+            else
+                drained.written())
+        else
+            drained.written();
+        var sebuf: [8192]u8 = undefined;
+        var sew = std.Io.File.stderr().writer(io, &sebuf);
+        sew.interface.writeAll(body) catch {};
+        sew.interface.flush() catch {};
+    }
     switch (term) {
         .exited => |code| {
             if (code != 0) return error.CommandFailed;

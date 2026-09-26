@@ -125,6 +125,9 @@ pub const Tui = struct {
         }
         t.pv = pv;
         if (t.focus > pv.fields.len) t.focus = pv.fields.len;
+        // action_sel outlives the page it was chosen on — a stale index
+        // past the new actions list would crash Enter.
+        t.action_sel = if (pv.actions.len == 0) 0 else @min(t.action_sel, pv.actions.len - 1);
         t.ensureFocusVisible();
     }
 
@@ -368,12 +371,12 @@ pub const Tui = struct {
 };
 
 fn nvidiaTier(wiz: *wizard.Wizard) ?engine.config.NvidiaTier {
-    const env = wiz.env orelse return null;
+    const env = wiz.env orelse return null; // unknown, not absent
     for (env.gpus) |g| {
         if (std.mem.eql(u8, g.vendor, "nvidia"))
             return if (engine.detect.nvidiaIsTuringPlus(g)) .open_capable else .legacy;
     }
-    return null;
+    return .absent;
 }
 
 const fg_green: vaxis.Color = .{ .index = 10 };
@@ -388,6 +391,9 @@ const ok_style: vaxis.Style = .{ .fg = fg_green };
 
 fn draw(t: *Tui, win: vaxis.Window) !void {
     win.clear();
+    // transient draw strings live on the frame arena — the process
+    // allocator would grow by one redraw per keypress otherwise.
+    const fa = t.frame_arena.allocator();
     var row: u16 = 0;
     const w = win.width;
     const h = win.height;
@@ -397,7 +403,7 @@ fn draw(t: *Tui, win: vaxis.Window) !void {
     }
 
     // header
-    const title = try std.fmt.allocPrint(t.alloc, " gentoo-installer — {s}  ({d}/{d})  [{s}]", .{ t.pv.title, t.pv.index, t.pv.of, @tagName(t.wiz.flow) });
+    const title = try std.fmt.allocPrint(fa, " gentoo-installer — {s}  ({d}/{d})  [{s}]", .{ t.pv.title, t.pv.index, t.pv.of, @tagName(t.wiz.flow) });
     _ = win.print(&.{.{ .text = title, .style = .{ .reverse = true, .bold = true } }}, .{ .row_offset = row, .col_offset = 0 });
     row += 2;
 
@@ -458,10 +464,10 @@ fn draw(t: *Tui, win: vaxis.Window) !void {
         vi += 1;
         const is_focus = i == t.focus;
         const sty: vaxis.Style = if (is_focus) sel else .{};
-        const label = try std.fmt.allocPrint(t.alloc, " {s}", .{f.label});
+        const label = try std.fmt.allocPrint(fa, " {s}", .{f.label});
         _ = win.print(&.{.{ .text = label, .style = sty }}, .{ .row_offset = row, .col_offset = 0 });
         // value
-        var vbuf: std.Io.Writer.Allocating = .init(t.alloc);
+        var vbuf: std.Io.Writer.Allocating = .init(fa);
         try renderValue(&vbuf.writer, f, t, i);
         _ = win.print(&.{.{ .text = vbuf.written(), .style = sty }}, .{ .row_offset = row, .col_offset = @min(28, w / 3) });
         // help on focused field
@@ -481,7 +487,7 @@ fn draw(t: *Tui, win: vaxis.Window) !void {
             const is_focus = (t.focus == t.pv.fields.len) and t.action_sel == i;
             // the TUI's install is a dry-run preview — label it so.
             const shown = if (std.mem.eql(u8, a, "install")) "preview install (dry-run)" else a;
-            const label = try std.fmt.allocPrint(t.alloc, "[ {s} ]", .{shown});
+            const label = try std.fmt.allocPrint(fa, "[ {s} ]", .{shown});
             _ = win.print(&.{.{ .text = label, .style = if (is_focus) sel else accent }}, .{ .row_offset = act_row, .col_offset = col });
             col += @intCast(label.len + 1);
         }

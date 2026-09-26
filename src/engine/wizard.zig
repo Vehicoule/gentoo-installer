@@ -139,6 +139,11 @@ const welcome_fields = [_]Field{
 
 const disk_fields = [_]Field{
     .{ .name = "disk.device", .ftype = .@"enum", .label = "Target disk", .help = "the disk to install onto" },
+    .{ .name = "boot_mode", .ftype = .@"enum", .label = "Boot mode", .help = "auto = firmware-detected", .visible = isAdvanced, .options = &.{
+        .{ .v = "auto", .label = "auto (detected)" },
+        .{ .v = "bios", .label = "BIOS (legacy)" },
+        .{ .v = "uefi", .label = "UEFI" },
+    } },
     .{ .name = "disk.scheme", .ftype = .@"enum", .label = "Partitioning", .options = &.{
         .{ .v = "efi-swap-root", .label = "Normal — erase disk (UEFI layout)", .visible = isUefi },
         .{ .v = "bios-boot-swap-root", .label = "Normal — erase disk (BIOS layout)", .visible = isBios },
@@ -290,7 +295,7 @@ const packages_fields = [_]Field{
 
 pub const pages = [_]Page{
     .{ .id = "welcome", .title = "Welcome", .essential = true, .fields = &welcome_fields, .prefixes = &.{"system.keymap"} },
-    .{ .id = "disk", .title = "Disk & partitioning", .essential = true, .fields = &disk_fields, .prefixes = &.{"disk."} },
+    .{ .id = "disk", .title = "Disk & partitioning", .essential = true, .fields = &disk_fields, .prefixes = &.{ "disk.", "boot_mode" } },
     .{ .id = "variant", .title = "Variant", .essential = false, .fields = &variant_fields, .prefixes = &.{ "stage3.", "system.init", "system.binhost", "security.hardening" } },
     .{ .id = "region", .title = "Region & input", .essential = false, .fields = &region_fields, .prefixes = &.{ "system.timezone", "system.locale", "system.locales", "services.ntp" } },
     .{ .id = "accounts", .title = "Accounts", .essential = true, .fields = &accounts_fields, .prefixes = &.{ "root.", "users", "system.privilege", "login", "privilege" } },
@@ -547,6 +552,10 @@ pub const Wizard = struct {
             try out.writeAll("null");
             return;
         }
+        if (std.mem.eql(u8, f.name, "boot_mode")) {
+            try jstr(out, if (w.cfg.boot_mode_explicit) @tagName(w.cfg.boot_mode) else "auto");
+            return;
+        }
         try emitCfgValue(w, out, f.name, f.ftype);
     }
 
@@ -560,22 +569,22 @@ pub const Wizard = struct {
     /// CLI fills on run/plan (arch, boot_mode, BIOS scheme flip).
     pub fn applyEnv(w: *Wizard, env: Env) void {
         w.env = env;
+        w.detected_boot = env.boot_mode;
         if (w.cfg.arch == .detect) w.cfg.arch = env.arch;
-        if (!w.cfg.boot_mode_explicit) {
+        if (!w.cfg.boot_mode_explicit)
             w.cfg.boot_mode = env.boot_mode;
-            w.detected_boot = env.boot_mode;
-            // an unpinned scheme tracks the firmware either way — a
-            // bios→uefi re-detect must un-apply the bios scheme too.
-            if (!w.cfg.disk.scheme_explicit)
-                w.cfg.disk.scheme = switch (env.boot_mode) {
-                    .bios => .@"bios-boot-swap-root",
-                    .uefi => .@"efi-swap-root",
-                };
-        }
+        // an unpinned scheme tracks the EFFECTIVE firmware either way —
+        // an explicit boot_mode pick must flip an implicit scheme too,
+        // and a bios→uefi re-detect must un-apply the bios scheme.
+        if (!w.cfg.disk.scheme_explicit)
+            w.cfg.disk.scheme = switch (w.cfg.boot_mode) {
+                .bios => .@"bios-boot-swap-root",
+                .uefi => .@"efi-swap-root",
+            };
         // BIOS Express pins btrfs+limine, and limine can't read btrfs —
         // the /boot partition toggle is expert-only, so Express must set
         // it itself or the disk page can never validate on BIOS.
-        if (w.flow == .express and env.boot_mode == .bios)
+        if (w.flow == .express and w.cfg.boot_mode == .bios)
             w.cfg.disk.boot_part = true;
     }
 
@@ -688,6 +697,27 @@ pub const Wizard = struct {
             } else return error.BadValue;
             return;
         }
+        if (std.mem.eql(u8, name, "boot_mode")) {
+            // "auto" clears the explicit pick and re-tracks detection.
+            const s = try strOf(v);
+            if (std.mem.eql(u8, s, "auto")) {
+                w.cfg.boot_mode_explicit = false;
+                w.cfg.boot_mode = if (w.env) |env| env.boot_mode else (w.detected_boot orelse .uefi);
+            } else {
+                w.cfg.boot_mode = std.meta.stringToEnum(config.BootMode, s) orelse return error.BadValue;
+                w.cfg.boot_mode_explicit = true;
+            }
+            // the effective mode drives an implicit scheme (and the
+            // express /boot partition) — same rules as applyEnv.
+            if (!w.cfg.disk.scheme_explicit)
+                w.cfg.disk.scheme = switch (w.cfg.boot_mode) {
+                    .bios => .@"bios-boot-swap-root",
+                    .uefi => .@"efi-swap-root",
+                };
+            if (w.flow == .express and w.cfg.boot_mode == .bios)
+                w.cfg.disk.boot_part = true;
+            return;
+        }
         if (std.mem.eql(u8, name, "users")) {
             return w.setUsers(v);
         }
@@ -791,6 +821,7 @@ pub const Wizard = struct {
                 const pw = try strOf(pv);
                 if (pw.len > 0) u.password_hash = try w.hashPassword(pw);
             }
+            if (o.get("password_hash")) |hv| u.password_hash = try dstr(w, hv);
             if (o.get("ssh_authorized_keys")) |kv| {
                 const ka = switch (kv) {
                     .array => |a| a,
@@ -799,6 +830,16 @@ pub const Wizard = struct {
                 var keys: std.ArrayList([]const u8) = .empty;
                 for (ka.items) |k| try keys.append(w.alloc, try dstr(w, k));
                 u.ssh_authorized_keys = keys.items;
+            }
+            // An edit naming an existing account without credentials
+            // must not erase them — the wire/text form can't always
+            // carry the hash or keys.
+            for (w.cfg.users) |old| {
+                if (u.name.len > 0 and std.mem.eql(u8, old.name, u.name)) {
+                    if (u.password_hash == null) u.password_hash = old.password_hash;
+                    if (u.ssh_authorized_keys.len == 0) u.ssh_authorized_keys = old.ssh_authorized_keys;
+                    break;
+                }
             }
             try users.append(w.alloc, u);
         }
