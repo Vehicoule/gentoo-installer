@@ -107,9 +107,10 @@ sensible):
 2. **partition** — guided layouts: `efi+swap+root` (GPT, EF00/8200/8304
    DPS GUIDs) or `bios-boot+swap+root`; LUKS2 container option; LVM option;
    `alongside` mode for dual-boot (probe existing OSes via os-prober-style
-   detection + ESP inspection, offer shrink of ntfs/ext4/btrfs/xfs where
-   safe, reuse the existing ESP); manual passthrough.
-   `sgdisk`/`wipefs`/`cryptsetup`/`mkfs.*`/`ntfsresize`.
+   detection + ESP inspection, offer shrink of ntfs/ext4/btrfs —
+   xfs/f2fs cannot shrink, so there we require existing unallocated
+   space — then reuse the existing ESP); manual passthrough.
+   `sgdisk`/`wipefs`/`cryptsetup`/`mkfs.*`/`ntfsresize`/`resize2fs`.
 3. **mount** — root at `/mnt/gentoo`, ESP at `/efi` (or `/boot` for BIOS);
    bind-mounts for chroot.
 4. **stage3** — resolve `latest-stage3-<stem>.txt` pointer on the distfiles
@@ -164,12 +165,18 @@ boot_mode   = "uefi"             # detected; uefi | bios
 
 [disk]
 device      = "/dev/sda"
-wipe        = true
-scheme      = "efi-swap-root"    # | bios-boot-swap-root | manual
+wipe        = true               # must be false when scheme = "alongside"
+scheme      = "efi-swap-root"    # | bios-boot-swap-root | alongside | manual
 root_fs     = "xfs"              # xfs | ext4 | btrfs | f2fs
 swap_mib    = 4096               # 0 = none
 luks        = false              # LUKS2 on root
 lvm         = false              # LVM2 vg on the raw root part (or on LUKS)
+
+# alongside mode only:
+shrink_part = "/dev/sda3"         # partition to shrink (ntfs/ext4/btrfs)
+shrink_mib  = 61440               # space to free for the new install
+# unattended dual-boot = scheme "alongside" + shrink_* ; omitting them in
+# interactive mode lets the wizard pick the shrink candidate.
 
 [stage3]
 variant     = "desktop-systemd"  # see matrix below — glibc/musl,
