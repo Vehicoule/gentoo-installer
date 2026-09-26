@@ -239,6 +239,14 @@ pub fn main(init: std.process.Init) !void {
             else => {},
         }
     }
+    // shim needs the MOK-enroll + signed-grub chain — not built in M1.
+    // (sbctl's create/enroll/sign sequence is complete and fails loudly
+    // when the firmware isn't in Setup Mode.)
+    if (cmd == .run and !dry_run and cfg.security.secure_boot == .shim) {
+        try errw.print("secure_boot=shim is not executable yet — the shim/MOK flow lands in M6; use sbctl or --dry-run to preview\n", .{});
+        try errw.flush();
+        std.process.exit(2);
+    }
 
     // Destructive exec runs require --confirm <device> matching the
     // configured disk — an answer file alone must never wipe a disk.
@@ -251,6 +259,31 @@ pub fn main(init: std.process.Init) !void {
         };
         if (!std.mem.eql(u8, cd, cfg.disk.device)) {
             try errw.print("--confirm {s} does not match disk.device {s}\n", .{ cd, cfg.disk.device });
+            try errw.flush();
+            std.process.exit(2);
+        }
+
+        // Capacity preflight before the first destructive command — an
+        // undersized or unknown target must be refused, not wiped then
+        // failed by sgdisk. Root floor: 6 GiB usable + 4 MiB GPT slack.
+        var need_mib: u64 = 6144 + 4;
+        if (cfg.boot_mode == .uefi) need_mib += cfg.disk.esp_mib else need_mib += 2;
+        if (cfg.disk.swap == .partition) need_mib += cfg.disk.swap_mib;
+        if (cfg.disk.boot_part) need_mib += 1024;
+        var size_mib: ?u64 = null;
+        if (env_opt) |*e| {
+            for (e.disks) |dk| {
+                if (std.mem.eql(u8, dk.path, cfg.disk.device)) size_mib = dk.size_bytes / (1 << 20);
+            }
+        }
+        if (size_mib) |sz| {
+            if (sz < need_mib) {
+                try errw.print("{s} is {} MiB — layout needs {} MiB (esp+swap+boot+6GiB root)\n", .{ cfg.disk.device, sz, need_mib });
+                try errw.flush();
+                std.process.exit(2);
+            }
+        } else {
+            try errw.print("{s} not among detected disks — refusing to wipe an unverified target\n", .{cfg.disk.device});
             try errw.flush();
             std.process.exit(2);
         }

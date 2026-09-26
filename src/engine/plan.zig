@@ -235,8 +235,10 @@ fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) 
             // not a -V one. The pool size isn't known at plan time, so
             // measure it and give each thin LV the full pool as virtual
             // size (intentional overcommit; pool autoextend guards it).
-            const measure = "pm=$(lvs --noheadings --units m --nosuffix -o lv_size vg0/tank | tr -d ' .'); " ++
-                "[ -n \"$pm\" ] || exit 1; ";
+            // lvs reports decimal MiB ('10240.00') — strip spaces,
+            // truncate at the decimal point. Never delete the dot.
+            const measure = "pm=$(lvs --noheadings --units m --nosuffix -o lv_size vg0/tank | tr -d ' '); " ++
+                "pm=${pm%.*}; [ -n \"$pm\" ] || exit 1; ";
             try c.append(alloc, .{ .exec = .{
                 .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "{s}lvcreate -T vg0/tank -n root -V \"${{pm}}M\"", .{measure}) }),
                 .desc = "thin root LV (virtual size = pool)",
@@ -571,18 +573,16 @@ fn planChroot(alloc: Allocator) !Step {
 }
 
 fn planRepoSync(alloc: Allocator, cfg: *const Config) !Step {
+    _ = cfg;
     var c: std.ArrayList(Cmd) = .empty;
     try c.append(alloc, .{ .exec = .{
         .argv = try alloc.dupe([]const u8, &.{ "emerge-webrsync" }),
         .chroot = true,
         .desc = "sync gentoo repo (webrsync; firewall-friendly)",
     } });
-    if (cfg.system.binhost)
-        try c.append(alloc, .{ .exec = .{
-            .argv = try alloc.dupe([]const u8, &.{ "emerge", "--sync", "gentoobinhost" }),
-            .chroot = true,
-            .desc = "sync binhost index",
-        } });
+    // binrepos.conf entries are binary-package sources, not ebuild
+    // repos — there is no `emerge --sync gentoobinhost`; getbinpkg
+    // fetches the Packages index on demand.
     return step(alloc, "repo-sync", "Sync portage tree", c);
 }
 
@@ -984,7 +984,13 @@ fn planBootloader(alloc: Allocator, cfg: *const Config) !Step {
                     .desc = s(alloc, "limine EFI binary ({s})", .{efiBootFile(cfg)}),
                 } });
             } else {
-                try c.append(alloc, argv(alloc, &.{ "limine", "bios-install", cfg.disk.device }, "limine BIOS stages"));
+                // must run the TARGET's limine binary (host may lack it);
+                // /dev is rbind-mounted into the chroot at enter-chroot.
+                try c.append(alloc, .{ .exec = .{
+                    .argv = try alloc.dupe([]const u8, &.{ "limine", "bios-install", cfg.disk.device }),
+                    .chroot = true,
+                    .desc = "limine BIOS stages",
+                } });
             }
             // Limine's boot volume: the ESP under UEFI, /boot under BIOS
             // (a separate ext4 partition when disk.boot_part, else the
@@ -1145,7 +1151,8 @@ fn planBootloader(alloc: Allocator, cfg: *const Config) !Step {
                 .desc = "enroll keys into firmware (requires Setup Mode)",
             } });
             try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", "for f in /efi/EFI/BOOT/*.EFI /efi/vmlinuz /efi/initramfs.img /efi/EFI/Linux/*.efi; do [ -f \"$f\" ] && sbctl sign -s \"$f\"; done; true" }),
+                // missing globs skip silently; a FAILED sign propagates.
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", "rc=0; for f in /efi/EFI/BOOT/*.EFI /efi/vmlinuz /efi/initramfs.img /efi/EFI/Linux/*.efi; do [ -f \"$f\" ] || continue; sbctl sign -s \"$f\" || rc=1; done; exit $rc" }),
                 .chroot = true,
                 .desc = "sign bootloader + kernels (sbctl)",
             } });

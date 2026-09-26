@@ -1,7 +1,7 @@
 //! Executes a Plan, or prints it under --dry-run. Appends one complete
-//! JSONL journal record per command so a real run can resume — the
-//! journal lives on the live-env tmpfs and is consumed by
-//! `detect --repair`. stdin payloads are never journaled or printed.
+//! JSONL journal record per command to the live-env tmpfs — the records
+//! are diagnostics today; resume/repair consume them in a later
+//! milestone. stdin payloads are never journaled or printed.
 
 const std = @import("std");
 const plan = @import("plan.zig");
