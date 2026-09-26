@@ -136,10 +136,13 @@ GUI as dialogs; `--config` runs print and exit non-zero.
 require caps and degrade otherwise. Adding ops/events/fields is a minor
 bump — consumers ignore unknown keys; removing/renaming is a major bump.
 
-This document is the draft contract — no wire version is frozen until
-the first engine implementation ships; `version` starts at 1 then.
-Everything here is pre-implementation, so edits to this file may
-restructure fields freely; they are not breaking changes yet.
+Stability tiers: the **envelope** — stdin ops / stdout events, `op`/`ev`
+keys, `req` correlation, the op and event vocabulary above — is stable:
+frontends build against it now. **Payload fields** (per-field names
+inside `env`, `page`, `plan`…) are still draft and may churn until the
+first engine ships; at that point `version` becomes 1 and the semver
+rules above apply. A frontend written to this doc should still pin the
+doc revision it targets until then.
 
 ## Annotated session
 
