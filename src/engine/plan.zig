@@ -215,7 +215,7 @@ fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) 
     // LVM inside the (possibly encrypted) root container.
     var fs_dev = root_dev;
     if (d.lvm) {
-        try c.append(alloc, argv(alloc, &.{ "pvcreate", "--uuid", "<generated>", "--norestorefile", root_dev }, s(alloc, "PV on {s}", .{root_dev})));
+        try c.append(alloc, argv(alloc, &.{ "pvcreate", "--norestorefile", root_dev }, s(alloc, "PV on {s}", .{root_dev})));
         try c.append(alloc, argv(alloc, &.{ "vgcreate", "vg0", root_dev }, "volume group vg0"));
         if (cfg.system.snapshots == .auto) {
             try c.append(alloc, argv(alloc, &.{ "lvcreate", "-l", "95%VG", "-T", "vg0/tank" }, "thin pool tank (95% VG)"));

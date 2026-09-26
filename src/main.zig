@@ -183,6 +183,15 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // Exec-mode gates for scheme: alongside/manual don't create the
+    // root partition yet (partition-level detection + dual-boot logic
+    // are M6) — refuse real runs, dry-run still prints the plan.
+    if (cmd == .run and !dry_run and (cfg.disk.scheme == .alongside or cfg.disk.scheme == .manual)) {
+        try errw.print("scheme '{s}' is not executable yet (dual-boot lands in M6) — use --dry-run to preview\n", .{@tagName(cfg.disk.scheme)});
+        try errw.flush();
+        std.process.exit(2);
+    }
+
     // Destructive exec runs require --confirm <device> matching the
     // configured disk — an answer file alone must never wipe a disk.
     const destructive = cfg.disk.scheme == .@"efi-swap-root" or cfg.disk.scheme == .@"bios-boot-swap-root";
