@@ -404,7 +404,7 @@ src/engine/                     # zig library: steps, runner, wizard, model
 src/tui/                        # zig, libvaxis/vxfw
 src/main.zig                    # cli: tui|headless|--config|--dry-run
 gui/                            # rust crate, libcosmic; spawns headless engine
-presets/gentoo.toml             # the built-in stock preset
+presets/gentoo/                 # the built-in stock preset (preset.toml + assets)
 scripts/qemu-test.sh
 docs/                           # DESIGN.md, protocol.md, presets.md
 ```
