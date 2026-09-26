@@ -192,7 +192,8 @@ shrink_mib  = 61440               # space to free for the new install
 # axes-based selection; variant stem is resolved from these
 libc        = "glibc"            # glibc | musl (musl disables systemd)
 toolchain   = "gcc"              # gcc | llvm
-variant     = "desktop-systemd"  # resolved stem; see matrix below
+variant     = "hardened-selinux-systemd"  # resolved stem; per-arch
+                               # availability via the axes table
 mirror      = "https://distfiles.gentoo.org"
 
 [system]
@@ -200,18 +201,21 @@ init        = "systemd"          # openrc | systemd | runit | s6 | dinit
                                # all offered; alt inits install via
                                # post-stage3 swap — see "Init systems"
 hostname    = "gentoo"
-timezone    = "UTC"
-locale      = "en_US.UTF-8"
+timezone    = "UTC"              # autodetected via geoip when possible
+locales     = ["en_US.UTF-8"]    # locale.gen entries
+locale      = "en_US.UTF-8"      # default LANG (⊂ locales)
 keymap      = "us"
 kernel      = "dist-bin"         # dist-bin | dist | manual
 bootloader  = "auto"             # auto | grub | systemd-boot | efistub | limine | refind
 initramfs   = "dracut"           # dracut | ugrd | none
 uki         = false              # unified kernel image
 binhost     = true               # official gentoo binhost
+privilege   = "doas"             # doas | sudo | none (none ⇒ root unlocked)
 
 [makeconf]
 cflags      = "native"           # safe | native | custom "<flags>"
 jobs        = 0                  # 0 = auto (nproc, mem-capped)
+mem_cap_gib = 0                  # 0 = auto (~2 GiB/job heuristic)
 video_cards = "auto"
 accept_license = "@FREE"
 

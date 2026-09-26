@@ -9,8 +9,9 @@ Two flows, picked on P0:
 
 - **Express** — opinionated defaults are pre-selected for every choice;
   the wizard only asks for the disk, confirmation, and credentials.
-  Defaults: btrfs + zram, systemd, desktop-systemd stage3 (glibc/gcc),
-  hardened+selinux, dist-bin kernel, auto bootloader, NM, doas, minimal
+  Defaults: btrfs + zram, systemd, `hardened-selinux-systemd` stage3
+  (glibc/gcc — one resolved stem; desktop-profile bits are applied
+  post-stage3), dist-bin kernel, auto bootloader, NM, doas, minimal
   package set.
 - **Advanced** — every field on every page is editable; fields marked
   `expert` below appear only here.
@@ -62,8 +63,9 @@ alongside Windows** (only shown when Windows/another OS is detected),
 | lvm | bool | false | LVM2 vg on root part (or inside LUKS if set) |
 | home_part | bool (expert) | false | separate /home partition |
 | btrfs_subvols | list (expert) | `@,@home,@snapshots` | only when `root_fs=btrfs` |
-| shrink_part | enum (existing partitions) | — | alongside only; fs must be ntfs/ext4/btrfs (xfs/f2fs unshrinkable → need unallocated space) |
-| shrink_mib | int | — | alongside only; ≥ min install size (8 GiB) and ≤ fs free space |
+| space_src | enum `shrink\|free-space` | auto-detected | alongside only: `free-space` uses existing unallocated space — no partition is touched; `shrink` reveals the two fields below |
+| shrink_part | enum (existing partitions) | — | shrink only; fs must be ntfs/ext4/btrfs (xfs/f2fs unshrinkable → need unallocated space) |
+| shrink_mib | int | — | shrink only; ≥ min install size (8 GiB) and ≤ fs free space |
 | manual_plan | partition table editor (expert) | — | free-form: part/fs/mount table; validated like any scheme |
 
 Normal/alongside modes auto-default every field above — the user only
@@ -138,17 +140,17 @@ password on a surviving account, or `sshd=true` + authorized key.
 | initramfs | enum `dracut\|ugrd\|none` | `dracut` | `none` unsafe with LUKS/LVM/separate-/usr — VALIDATE warns/blocks |
 | uki | bool | false | implies dracut/ugrd + installkernel[uki] |
 | bootloader | enum `auto\|grub\|systemd-boot\|efistub\|limine\|refind` | `auto` | auto resolves **boot mode first**: BIOS ⇒ grub always; UEFI ⇒ systemd-boot on systemd, grub on openrc. Explicit `systemd-boot`/`efistub`/`uki`/`limine-efi`/`refind` on BIOS are hard-rejected by VALIDATE (limine BIOS mode exists — offered separately under `limine` with `bios` sub-option) |
+| secure_boot | enum `off\|sbctl\|shim` | `off` | UEFI-only — hidden and forced `off` on BIOS boots (VALIDATE rejects non-`off` there too); `sbctl` requires uki or signed grub; `shim` for grub only |
+| net_manager | enum `networkmanager\|dhcpcd\|netifrc\|systemd-networkd` | `networkmanager` | `systemd-networkd` needs init=systemd |
+| wifi_fw | bool | detected | `linux-firmware` + `sof-firmware` |
+| microcode | bool | detected (vendor) | intel-microcode / amd via linux-firmware |
+| services.sshd / .logger / .cron | bool | false/true/true | — |
 
 Seamless kernel upgrades (hard requirement): dist kernels +
 installkernel regenerate boot entries on every kernel emerge —
 systemd-boot/grub via existing installkernel plugins; **limine** gets a
 shipped kernel-install plugin writing `limine.conf` entries; **rEFInd**
 auto-discovers kernels/UKIs on the ESP (no config regen needed).
-| secure_boot | enum `off\|sbctl\|shim` | `off` | UEFI-only — hidden and forced `off` on BIOS boots (VALIDATE rejects non-`off` there too); `sbctl` requires uki or signed grub; `shim` for grub only |
-| net_manager | enum `networkmanager\|dhcpcd\|netifrc\|systemd-networkd` | `networkmanager` | `systemd-networkd` needs init=systemd |
-| wifi_fw | bool | detected | `linux-firmware` + `sof-firmware` |
-| microcode | bool | detected (vendor) | intel-microcode / amd via linux-firmware |
-| services.sshd / .logger / .cron | bool | false/true/true | — |
 
 ## P6 — Packages & USE (the Gentoo page)
 
