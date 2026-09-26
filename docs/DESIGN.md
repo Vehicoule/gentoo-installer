@@ -158,17 +158,28 @@ sensible):
     kernels+initramfs with live boot entries (never pruned unprompted);
     system snapshots come from a hook that snapshots root before each
     `world-update` or kernel install — btrfs `@snapshots` subvol on the
-    default layout, LVM-thin when `lvm=on` — and registers a boot entry
-    per snapshot (our limine/grub/systemd-boot hooks emit these
-    uniformly; rEFInd discovers them itself). CoW-less roots
-    (xfs/ext4/f2fs without LVM) get kernel rollback only — P1 surfaces
-    that trade-off at fs selection.
+    default layout, or an LVM-thin snapshot when `lvm=on` (the planner
+    then provisions a thin pool + thin root LV, not just a VG) — and
+    registers a boot entry per snapshot. Entry generation is per-
+    bootloader: limine/grub/systemd-boot emit menu entries from our
+    hooks; rEFInd gets generated `refind.conf` stanzas carrying
+    `options="rootflags=subvol=@snapshots/<n>"` (auto-discovery alone
+    only finds ESP kernels, never snapshot roots); efistub has no menu
+    at all — snapshots stay recoverable by adding `rootflags=subvol=`
+    to a manual UEFI entry or from live media (no per-snapshot NVRAM
+    churn). CoW-less roots (xfs/ext4/f2fs without LVM) get kernel
+    rollback only — P1 surfaces that trade-off at fs selection.
     **Secure Boot**: sign the boot path —
     sbctl-generated keys enrolled via firmware setup mode (or shim+MOK
     for GRUB), `sbctl sign` on UKIs/bootloader binaries, ukify hooks so
-    future kernel installs stay signed. **Dual-boot**: grub `os-prober`
-    output or systemd-boot's auto-discovered ESP entries get merged into
-    the menu; Windows Boot Manager entry preserved.
+    future kernel installs stay signed. **Dual-boot**: every detected OS
+    gets a menu entry on every menu-capable bootloader — grub merges
+    `os-prober` output, systemd-boot auto-discovers ESP entries, rEFInd
+    discovers them too, and our limine plugin emits `efi_chainload`
+    entries for ESP-resident loaders (e.g.
+    `EFI/Microsoft/Boot/bootmgfw.efi`). efistub needs nothing — the
+    firmware boot menu already lists the foreign entries. Windows Boot
+    Manager entry always preserved.
 16. **finish** — `passwd -l root` when `root.lock_root`, artifact cleanup
     (`/stage3-*`), preset post-install hook, summary + reboot prompt.
 
@@ -190,7 +201,9 @@ swap        = "zram"             # zram | partition | none
 swap_mib    = 4096               # only when swap=partition
 boot_part   = false              # separate /boot (expert crypto layouts)
 luks        = false              # LUKS2 on root (passphrase via stdin only)
-lvm         = false              # LVM2 vg on the raw root part (or inside LUKS)
+lvm         = false              # LVM2 vg on the raw root part (or inside
+                                # LUKS); with snapshots!=off provisions a thin
+                                # pool + thin root LV
 
 # alongside mode only:
 space_src   = "shrink"            # shrink | free-space — free-space reuses the
@@ -198,8 +211,8 @@ space_src   = "shrink"            # shrink | free-space — free-space reuses th
                                 # install size) and touches no partition
 shrink_part = "/dev/sda3"         # shrink only: partition to shrink (ntfs/ext4/btrfs)
 shrink_mib  = 61440               # shrink only: space to free for the new install
-# unattended dual-boot = scheme "alongside" + space_src; "free-space" needs
-# neither shrink_* field.
+# unattended dual-boot = scheme "alongside" + space_src: "shrink" requires
+# shrink_part + shrink_mib; "free-space" needs neither shrink_* field.
 
 [stage3]
 # axes-based selection; variant stem is resolved from these

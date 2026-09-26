@@ -60,7 +60,7 @@ alongside Windows** (only shown when Windows/another OS is detected),
 | boot_part | bool (expert) | false | separate /boot partition (needed for advanced crypto layouts; ESP stays separate) |
 | luks | bool | false | reveals passphrase + `cryptsetup` options (pbkdf argon2id) |
 | luks_passphrase | secret | — | required iff `luks`; min length 8; confirm field; supplied to `cryptsetup luksFormat` via stdin (no argv/env leak) |
-| lvm | bool | false | LVM2 vg on root part (or inside LUKS if set) |
+| lvm | bool | false | LVM2 vg on root part (or inside LUKS if set); with snapshots on, provisions a thin pool + thin root LV |
 | home_part | bool (expert) | false | separate /home partition |
 | btrfs_subvols | list (expert) | `@,@home,@snapshots` | only when `root_fs=btrfs` |
 | space_src | enum `shrink\|free-space` | auto-detected | alongside only: `free-space` uses existing unallocated space — no partition is touched; `shrink` reveals the two fields below |
@@ -142,6 +142,7 @@ password on a surviving account, or `sshd=true` + authorized key.
 | bootloader | enum `auto\|grub\|systemd-boot\|efistub\|limine\|refind` | `limine` in Express (pinned, uniform BIOS+UEFI); `auto` in Advanced | auto resolves **boot mode first**: BIOS ⇒ grub always; UEFI ⇒ systemd-boot on systemd, grub on openrc. Explicit `systemd-boot`/`efistub`/`uki`/`limine-efi`/`refind` on BIOS are hard-rejected by VALIDATE (limine BIOS mode exists — offered separately under `limine` with `bios` sub-option) |
 | secure_boot | enum `off\|sbctl\|shim` | `off` | UEFI-only — hidden and forced `off` on BIOS boots (VALIDATE rejects non-`off` there too); `sbctl` requires uki or signed bootloader; `shim` for grub only |
 | snapshots | enum `auto\|off` | `auto` | system snapshots before world-update/kernel installs; needs btrfs root or `lvm=on`, else kernel rollback only |
+| keep_kernels | int | 3 | kernel boot entries retained; 0 = never prune |
 | net_manager | enum `networkmanager\|dhcpcd\|netifrc\|systemd-networkd` | `networkmanager` | `systemd-networkd` needs init=systemd |
 | wifi_fw | bool | detected | `linux-firmware` + `sof-firmware` |
 | microcode | bool | detected (vendor) | intel-microcode / amd via linux-firmware |
@@ -158,8 +159,18 @@ auto-discovers kernels/UKIs on the ESP (no config regen needed).
 entries; (b) system snapshots — a hook snapshots root before each
 world-update/kernel install and registers a boot entry per snapshot
 (btrfs `@snapshots` on the default layout, LVM-thin when `lvm=on`).
-Shown as a `snapshots` toggle; on CoW-less roots it degrades to kernel
-rollback only, with a note.
+Entries are emitted per bootloader: limine/grub/systemd-boot via our
+hooks, rEFInd via generated `refind.conf` stanzas carrying
+`rootflags=subvol=@snapshots/<n>`; efistub has no menu — snapshots there
+recover via the same `rootflags` override or live media. Shown as a
+`snapshots` toggle; on CoW-less roots it degrades to kernel rollback
+only, with a note.
+
+Dual-boot menus: every detected OS gets an entry — grub merges
+os-prober output, systemd-boot/rEFInd auto-discover ESP loaders, and
+the limine plugin emits `efi_chainload` entries (e.g. Windows Boot
+Manager at `EFI/Microsoft/Boot/bootmgfw.efi`); efistub relies on the
+firmware menu, which already lists them.
 
 ## P6 — Packages & USE (the Gentoo page)
 
