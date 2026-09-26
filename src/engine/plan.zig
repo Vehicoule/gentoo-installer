@@ -1077,7 +1077,8 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
                     \\[ "$1" = add ] || exit 0
                     \\esp={s}
                     \\cp -f "$4" "$esp/vmlinuz" || exit 1
-                    \\initrd=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img /boot/initrd-* /boot/*/*/initrd* 2>/dev/null | head -n1)
+                    \\initrd=$(ls /boot/initramfs-"$2".img /boot/initrd-"$2".img /boot/*/"$2"/initrd* 2>/dev/null | head -n1)
+                    \\[ -n "$initrd" ] || initrd=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img /boot/initrd-* /boot/*/*/initrd* 2>/dev/null | head -n1)
                     \\[ -n "$initrd" ] && cp -f "$initrd" "$esp/initramfs.img"
                     \\exit 0
                 , .{stage_dir}),
@@ -1086,7 +1087,7 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
             // The hook only fires for FUTURE kernel installs — the kernel
             // emerged earlier this install was never staged. Stage it now.
             try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "k=$(ls -t /boot/vmlinuz-* /boot/kernel-* /boot/*/*/vmlinuz 2>/dev/null | head -n1); " ++
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "k=$(ls -t /boot/vmlinuz-* /boot/kernel-* /boot/*/*/vmlinuz /boot/*/*/linux 2>/dev/null | head -n1); " ++
                     "[ -n \"$k\" ] || {{ echo 'no kernel to stage' >&2; exit 1; }}; " ++
                     "cp -f \"$k\" {s}/vmlinuz || exit 1{s}", .{ stage_dir, initrdStage(alloc, cfg, stage_dir) }) }),
                 .chroot = true,
@@ -1125,7 +1126,7 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
             // bootctl only installs the manager — a Type-1 entry needs the
             // kernel + initramfs staged on the ESP and a loader entry.
             try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "k=$(ls -t /boot/vmlinuz-* /boot/kernel-* /boot/*/*/vmlinuz 2>/dev/null | head -n1); " ++
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "k=$(ls -t /boot/vmlinuz-* /boot/kernel-* /boot/*/*/vmlinuz /boot/*/*/linux 2>/dev/null | head -n1); " ++
                     "[ -n \"$k\" ] || {{ echo 'no kernel to stage' >&2; exit 1; }}; " ++
                     "mkdir -p /efi/loader/entries && cp -f \"$k\" /efi/vmlinuz || exit 1{s}", .{initrdStage(alloc, cfg, "/efi")}) }),
                 .chroot = true,
@@ -1142,7 +1143,8 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
                 \\# onto the ESP at the fixed paths the loader entry uses.
                 \\[ "$1" = add ] || exit 0
                 \\cp -f "$4" /efi/vmlinuz || exit 1
-                \\initrd=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img /boot/*/*/initrd* 2>/dev/null | head -n1)
+                \\initrd=$(ls /boot/initramfs-"$2".img /boot/initrd-"$2".img /boot/*/"$2"/initrd* 2>/dev/null | head -n1)
+                \\[ -n "$initrd" ] || initrd=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img /boot/*/*/initrd* 2>/dev/null | head -n1)
                 \\[ -n "$initrd" ] && cp -f "$initrd" /efi/initramfs.img
                 \\exit 0
                 ,
@@ -1159,7 +1161,7 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
                 .desc = "efibootmgr",
             } });
             try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "k=$(ls -t /boot/vmlinuz-* /boot/kernel-* /boot/*/*/vmlinuz 2>/dev/null | head -n1); " ++
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "k=$(ls -t /boot/vmlinuz-* /boot/kernel-* /boot/*/*/vmlinuz /boot/*/*/linux 2>/dev/null | head -n1); " ++
                     "[ -n \"$k\" ] || {{ echo 'no kernel to stage' >&2; exit 1; }}; " ++
                     "cp -f \"$k\" /efi/vmlinuz || exit 1{s}", .{initrdStage(alloc, cfg, "/efi")}) }),
                 .chroot = true,
