@@ -85,9 +85,7 @@ pub fn checkLocks(alloc: Allocator, preset: *const Preset, user_doc: *const toml
         const got = lookup(user_doc.root, path);
         if (got == null) continue; // unset → default wins, fine
         if (!valueEq(got.?, want))
-            try errs.append(alloc, std.fmt.allocPrint(alloc,
-                "preset lock: '{s}' is fixed by preset '{s}' — remove it or match the preset default",
-                .{ path, preset.id }) catch @panic("oom"));
+            try errs.append(alloc, std.fmt.allocPrint(alloc, "preset lock: '{s}' is fixed by preset '{s}' — remove it or match the preset default", .{ path, preset.id }) catch @panic("oom"));
     }
     return errs.items;
 }
@@ -215,7 +213,7 @@ fn findSet(sets: ?[]toml.Value, id: []const u8) ?toml.Value.Table {
     return null;
 }
 
-fn lookup(root: toml.Value.Table, dotted: []const u8) ?toml.Value {
+pub fn lookup(root: toml.Value.Table, dotted: []const u8) ?toml.Value {
     var cur = root;
     var it = std.mem.splitScalar(u8, dotted, '.');
     while (it.next()) |seg| {
@@ -229,7 +227,7 @@ fn lookup(root: toml.Value.Table, dotted: []const u8) ?toml.Value {
     return null;
 }
 
-fn valueEq(a: toml.Value, b: toml.Value) bool {
+pub fn valueEq(a: toml.Value, b: toml.Value) bool {
     return switch (a) {
         .string => |as| b == .string and std.mem.eql(u8, as, b.string),
         .integer => |ai| b == .integer and ai == b.integer,

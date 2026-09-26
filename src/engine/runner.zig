@@ -17,6 +17,10 @@ pub const Options = struct {
     /// so callers can express it).
     skip_steps: []const []const u8 = &.{},
     out: *std.Io.Writer,
+    /// Per-step observer for structured consumers (headless `step`
+    /// events, TUI progress page). state: started/done/failed/skipped.
+    on_step: ?*const fn (ctx: ?*anyopaque, i: usize, of: usize, id: []const u8, state: []const u8) void = null,
+    ctx: ?*anyopaque = null,
 };
 
 pub const Journal = struct {
@@ -113,8 +117,10 @@ pub fn run(io: std.Io, alloc: Allocator, p: plan.Plan, opts: Options) !void {
     for (p.steps, 0..) |step, i| {
         if (skipped(step.id, opts.skip_steps)) {
             journal.stepDone(step.id, true);
+            if (opts.on_step) |cb| cb(opts.ctx, i + 1, p.steps.len, step.id, "skipped");
             continue;
         }
+        if (opts.on_step) |cb| cb(opts.ctx, i + 1, p.steps.len, step.id, "started");
         try out.print("[{d:0>2}] {s}  ({s})\n", .{ i + 1, step.title, step.id });
         for (step.cmds) |cmd| {
             switch (cmd) {
@@ -126,6 +132,7 @@ pub fn run(io: std.Io, alloc: Allocator, p: plan.Plan, opts: Options) !void {
                             journal.cmdWriteFile(step.id, w, "ok");
                         } else |err| {
                             journal.cmdWriteFile(step.id, w, "fail");
+                            if (opts.on_step) |cb| cb(opts.ctx, i + 1, p.steps.len, step.id, "failed");
                             return err;
                         }
                     }
@@ -142,6 +149,7 @@ pub fn run(io: std.Io, alloc: Allocator, p: plan.Plan, opts: Options) !void {
                             return error.MissingStdinData;
                         execCmd(io, alloc, e) catch |err| {
                             journal.cmdExec(step.id, e, "fail");
+                            if (opts.on_step) |cb| cb(opts.ctx, i + 1, p.steps.len, step.id, "failed");
                             return err;
                         };
                         journal.cmdExec(step.id, e, "ok");
@@ -150,6 +158,7 @@ pub fn run(io: std.Io, alloc: Allocator, p: plan.Plan, opts: Options) !void {
             }
         }
         journal.stepDone(step.id, false);
+        if (opts.on_step) |cb| cb(opts.ctx, i + 1, p.steps.len, step.id, "done");
     }
     try out.flush();
 }
@@ -170,6 +179,62 @@ fn writeFile(io: std.Io, path: []const u8, content: []const u8, mode: u32) !void
     });
 }
 
+/// Child output drain — runs on its own thread so a verbose child
+/// can't deadlock against an unwritten stdin payload or a full stderr
+/// pipe. `collect` buffers instead of streaming: stdin-bearing
+/// commands need post-hoc redaction before anything reaches stderr.
+const DrainArgs = struct { io: std.Io, file: std.Io.File, collect: ?*std.Io.Writer.Allocating };
+
+/// Strip bytes that could drive terminal control sequences — child
+/// output can carry attacker-controlled content (mirror metadata,
+/// package logs). C0/DEL controls are dropped; \n/\t/\r and ≥0x80
+/// (UTF-8 text) are kept — except the C1 range: U+0080–U+009F encode
+/// as 0xC2 0x80–0x9F and real terminals honor them (U+009B is CSI),
+/// so the pair is dropped as well.
+fn termSanitize(dst: []u8, src: []const u8) []const u8 {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < src.len) {
+        const b = src[i];
+        if (b == 0xC2 and i + 1 < src.len and src[i + 1] >= 0x80 and src[i + 1] <= 0x9F) {
+            i += 2;
+            continue;
+        }
+        const ok = switch (b) {
+            '\n', '\t', '\r' => true,
+            0x7f => false,
+            else => b >= 0x20,
+        };
+        if (ok) {
+            dst[n] = b;
+            n += 1;
+        }
+        i += 1;
+    }
+    return dst[0..n];
+}
+
+fn drainChild(da: DrainArgs) void {
+    var rbuf: [8192]u8 = undefined;
+    var r = da.file.reader(da.io, &rbuf);
+    if (da.collect) |out| {
+        _ = r.interface.streamRemaining(&out.writer) catch {};
+    } else {
+        var sbuf: [8192]u8 = undefined;
+        var sw = std.Io.File.stderr().writer(da.io, &sbuf);
+        var fbuf: [8192]u8 = undefined;
+        // peekGreedy(1) = one underlying read — forward each chunk
+        // sanitized instead of waiting to fill a large buffer.
+        while (true) {
+            const chunk = r.interface.peekGreedy(1) catch break;
+            if (chunk.len == 0) break;
+            r.interface.toss(chunk.len);
+            sw.interface.writeAll(termSanitize(&fbuf, chunk)) catch break;
+        }
+        sw.interface.flush() catch {};
+    }
+}
+
 fn execCmd(io: std.Io, alloc: Allocator, e: plan.Exec) !void {
     var argv_buf: std.ArrayList([]const u8) = .empty;
     if (e.chroot) {
@@ -179,7 +244,33 @@ fn execCmd(io: std.Io, alloc: Allocator, e: plan.Exec) !void {
     var child = try std.process.spawn(io, .{
         .argv = argv_buf.items,
         .stdin = if (e.stdin != null) .pipe else .inherit,
+        // The headless wire is stdout-only — child output must never
+        // reach it. Both streams are piped: a secret-bearing stdin
+        // means collect+redact before forwarding, otherwise stream
+        // straight to stderr (bounded memory over a long install).
+        .stdout = .pipe,
+        .stderr = .pipe,
     });
+    var out_buf: std.Io.Writer.Allocating = .init(alloc);
+    var err_buf: std.Io.Writer.Allocating = .init(alloc);
+    const collect = e.stdin != null;
+    var out_th: ?std.Thread = null;
+    var err_th: ?std.Thread = null;
+    // Both pipes need a live reader before stdin is written; if a
+    // drain thread can't start, kill+reap — never wait on an
+    // undrained child.
+    const drain_failed = blk: {
+        if (child.stdout) |cs|
+            out_th = std.Thread.spawn(.{}, drainChild, .{DrainArgs{ .io = io, .file = cs, .collect = if (collect) &out_buf else null }}) catch break :blk true;
+        if (child.stderr) |cs|
+            err_th = std.Thread.spawn(.{}, drainChild, .{DrainArgs{ .io = io, .file = cs, .collect = if (collect) &err_buf else null }}) catch break :blk true;
+        break :blk false;
+    };
+    if (drain_failed) {
+        child.kill(io);
+        _ = child.wait(io) catch {};
+        return error.DrainFailed;
+    }
     if (e.stdin) |data| {
         // Feed the payload, flush the buffered writer, then close so the
         // child sees EOF. Closing without flushing would discard bytes
@@ -187,20 +278,71 @@ fn execCmd(io: std.Io, alloc: Allocator, e: plan.Exec) !void {
         var wbuf: [4096]u8 = undefined;
         var fw = child.stdin.?.writer(io, &wbuf);
         var werr: ?anyerror = null;
-        fw.interface.writeAll(data) catch |e2| { werr = e2; };
-        if (werr == null) fw.interface.flush() catch |e2| { werr = e2; };
+        fw.interface.writeAll(data) catch |e2| {
+            werr = e2;
+        };
+        if (werr == null) fw.interface.flush() catch |e2| {
+            werr = e2;
+        };
         child.stdin.?.close(io);
         child.stdin = null;
         if (werr) |e2| {
             _ = child.wait(io) catch {};
+            if (out_th) |th| th.join();
+            if (err_th) |th| th.join();
             return e2;
         }
     }
     const term = try child.wait(io);
+    if (out_th) |th| th.join();
+    if (err_th) |th| th.join();
+    if (child.stdout) |cs| {
+        cs.close(io);
+        child.stdout = null;
+    }
+    if (child.stderr) |cs| {
+        cs.close(io);
+        child.stderr = null;
+    }
+    // Buffered output of a secret-bearing command: forward to stderr
+    // with the stdin payload (and each of its lines) redacted — a tool
+    // echoing its input must not leak a passphrase into logs.
+    if (collect) {
+        const data = e.stdin.?;
+        var sebuf: [8192]u8 = undefined;
+        var sew = std.Io.File.stderr().writer(io, &sebuf);
+        var fbuf: [8192]u8 = undefined;
+        for ([_][]const u8{ out_buf.written(), err_buf.written() }) |raw| {
+            var body = raw;
+            if (body.len == 0) continue;
+            if (data.len > 0)
+                body = std.mem.replaceOwned(u8, alloc, body, data, "[redacted]") catch body;
+            var lit = std.mem.splitScalar(u8, data, '\n');
+            while (lit.next()) |ln| {
+                const t = std.mem.trim(u8, ln, " \t\r");
+                if (t.len == 0) continue;
+                body = std.mem.replaceOwned(u8, alloc, body, t, "[redacted]") catch body;
+            }
+            // same terminal-escape filter as the streaming drain
+            var off: usize = 0;
+            while (off < body.len) {
+                const n = @min(body.len - off, fbuf.len);
+                sew.interface.writeAll(termSanitize(&fbuf, body[off..][0..n])) catch break;
+                off += n;
+            }
+        }
+        sew.interface.flush() catch {};
+    }
     switch (term) {
         .exited => |code| {
             if (code != 0) return error.CommandFailed;
         },
         else => return error.CommandFailed,
     }
+}
+
+test "termSanitize drops C0/C1/DEL, keeps text and utf8" {
+    var buf: [256]u8 = undefined;
+    const out = termSanitize(&buf, "a\x1b[2kb\xc2\x9bPAYLOAD\xc2\xa0ok\x7f\x08\t\n");
+    try std.testing.expectEqualStrings("a[2kbPAYLOAD\xc2\xa0ok\t\n", out);
 }

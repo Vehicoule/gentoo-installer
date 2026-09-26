@@ -4,6 +4,7 @@ pub const detect = @import("detect.zig");
 pub const plan = @import("plan.zig");
 pub const runner = @import("runner.zig");
 pub const preset = @import("preset.zig");
+pub const wizard = @import("wizard.zig");
 
 pub const Config = config.Config;
 pub const Env = detect.Env;
@@ -16,4 +17,5 @@ test {
     _ = plan;
     _ = runner;
     _ = preset;
+    _ = wizard;
 }

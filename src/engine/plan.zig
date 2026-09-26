@@ -310,8 +310,7 @@ fn rootMountArgs(alloc: Allocator, cfg: *const Config) struct { dev: []const u8,
 /// fails the step (`|| exit 1`); nothing after it may mask the status.
 fn initrdStage(alloc: Allocator, cfg: *const Config, dir: []const u8) []const u8 {
     if (cfg.system.initramfs == .none) return "";
-    return s(alloc,
-        "; i=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img 2>/dev/null | head -n1); " ++
+    return s(alloc, "; i=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img 2>/dev/null | head -n1); " ++
         "[ -n \"$i\" ] || {{ echo 'no initramfs to stage' >&2; exit 1; }}; " ++
         "cp -f \"$i\" {s}/initramfs.img || exit 1", .{dir});
 }
@@ -443,22 +442,19 @@ fn planStage3(alloc: Allocator, cfg: *const Config) !Step {
     // latest.txt entries may carry a dated subdir (2026…/stage3-….tar.xz):
     // use the full path in the URL but save locally under the basename.
     try c.append(alloc, .{ .exec = .{
-        .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc,
-            "f=$(grep -oE '[^ ]*stage3-[^ ]*\\.tar\\.xz' /tmp/latest.txt | head -n1); " ++
+        .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "f=$(grep -oE '[^ ]*stage3-[^ ]*\\.tar\\.xz' /tmp/latest.txt | head -n1); " ++
             "test -n \"$f\" || exit 1; b=${{f##*/}}; " ++
             "curl -fsSL -o \"/tmp/$b\" '{s}/'$f && " ++
             "curl -fsSL -o \"/tmp/$b.asc\" '{s}/'$f.asc && " ++
             "curl -fsSL -o /tmp/stage3.DIGESTS '{s}/'$f.DIGESTS && " ++
-            "ln -sf \"$b\" /tmp/stage3.tar.xz && ln -sf \"$b.asc\" /tmp/stage3.tar.xz.asc",
-            .{ base, base, base }) }),
+            "ln -sf \"$b\" /tmp/stage3.tar.xz && ln -sf \"$b.asc\" /tmp/stage3.tar.xz.asc", .{ base, base, base }) }),
         .desc = "download stage3 tarball + .asc + .DIGESTS (resolved from latest.txt)",
     } });
     // --verify needs the Gentoo release key in the keyring — live media
     // ship it under openpgp-keys; fall back to keyserver fetch of the
     // pinned Release Engineering fingerprint.
     try c.append(alloc, .{ .exec = .{
-        .argv = try alloc.dupe([]const u8, &.{ "sh", "-c",
-            "gpg --import /usr/share/openpgp-keys/gentoo-release.asc 2>/dev/null || " ++
+        .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", "gpg --import /usr/share/openpgp-keys/gentoo-release.asc 2>/dev/null || " ++
             "gpg --keyserver hkps://keys.gentoo.org --recv-keys 13EBBDBEDE7A12775DFDB1BABB572E0E2D182910" }),
         .desc = "import Gentoo release signing key (pinned fingerprint fallback)",
     } });
@@ -466,8 +462,7 @@ fn planStage3(alloc: Allocator, cfg: *const Config) !Step {
     // DIGESTS mixes SHA256/SHA512/WHIRLPOOL lines — extract our tarball's
     // SHA256 entry and refuse vacuous success when it is absent.
     try c.append(alloc, .{ .exec = .{
-        .argv = try alloc.dupe([]const u8, &.{ "sh", "-c",
-            "b=$(basename \"$(readlink -f /tmp/stage3.tar.xz)\"); " ++
+        .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", "b=$(basename \"$(readlink -f /tmp/stage3.tar.xz)\"); " ++
             "awk -v f=\"$b\" '$2 == f && length($1) == 64' /tmp/stage3.DIGESTS > /tmp/stage3.sha256; " ++
             "test -s /tmp/stage3.sha256 || { echo 'no SHA256 digest entry for stage3' >&2; exit 1; }; " ++
             "(cd /tmp && sha256sum -c /tmp/stage3.sha256)" }),
@@ -591,12 +586,12 @@ fn planPortage(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !S
         if (cfg.arch == .detect) {
             try c.append(alloc, .{ .note = "binhost sync-uri resolved after hardware detection" });
         } else {
-        const abi_dir = switch (cfg.arch) {
-            .amd64 => "x86-64",
-            .arm64 => "arm64",
-            .riscv64, .detect => unreachable, // validate() rejects binhost on riscv64
-        };
-        try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/binrepos.conf/gentoobinhost.conf", s(alloc, "[gentoobinhost]\npriority = 9999\nsync-uri = https://distfiles.gentoo.org/releases/{s}/binpackages/23.0/{s}/\n", .{ @tagName(cfg.arch), abi_dir })));
+            const abi_dir = switch (cfg.arch) {
+                .amd64 => "x86-64",
+                .arm64 => "arm64",
+                .riscv64, .detect => unreachable, // validate() rejects binhost on riscv64
+            };
+            try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/binrepos.conf/gentoobinhost.conf", s(alloc, "[gentoobinhost]\npriority = 9999\nsync-uri = https://distfiles.gentoo.org/releases/{s}/binpackages/23.0/{s}/\n", .{ @tagName(cfg.arch), abi_dir })));
         }
     }
     // LUKS root: crypttab names the GPT partlabel (-cN:root). Written here
@@ -620,7 +615,7 @@ fn planRepoSync(alloc: Allocator, cfg: *const Config) !Step {
     _ = cfg;
     var c: std.ArrayList(Cmd) = .empty;
     try c.append(alloc, .{ .exec = .{
-        .argv = try alloc.dupe([]const u8, &.{ "emerge-webrsync" }),
+        .argv = try alloc.dupe([]const u8, &.{"emerge-webrsync"}),
         .chroot = true,
         .desc = "sync gentoo repo (webrsync; firewall-friendly)",
     } });
@@ -667,7 +662,7 @@ fn planBaseConfig(alloc: Allocator, cfg: *const Config) !Step {
     for (cfg.system.locales) |l|
         try gw.print("{s} UTF-8\n", .{l});
     try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/locale.gen", gen.written()));
-    try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "locale-gen" }), .chroot = true, .desc = "generate locales" } });
+    try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{"locale-gen"}), .chroot = true, .desc = "generate locales" } });
     try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "eselect", "locale", "set", cfg.system.locale }), .chroot = true, .desc = "default locale" } });
     // localectl needs a running systemd — write the config files directly.
     if (cfg.system.init == .systemd)
@@ -1061,20 +1056,19 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
                     \\initrd=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img /boot/initrd-* 2>/dev/null | head -n1)
                     \\[ -n "$initrd" ] && cp -f "$initrd" "$esp/initramfs.img"
                     \\exit 0
-                    , .{stage_dir}),
+                , .{stage_dir}),
                 .mode = 0o755,
             } });
             // The hook only fires for FUTURE kernel installs — the kernel
             // emerged earlier this install was never staged. Stage it now.
             try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc,
-                    "k=$(ls -t /boot/vmlinuz-* 2>/dev/null | head -n1); " ++
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "k=$(ls -t /boot/vmlinuz-* 2>/dev/null | head -n1); " ++
                     "[ -n \"$k\" ] || {{ echo 'no kernel to stage' >&2; exit 1; }}; " ++
                     "cp -f \"$k\" {s}/vmlinuz || exit 1{s}", .{ stage_dir, initrdStage(alloc, cfg, stage_dir) }) }),
                 .chroot = true,
                 .desc = "stage current kernel + initramfs for limine",
             } });
-        }, 
+        },
         .grub => {
             var grub_args: std.ArrayList([]const u8) = .empty;
             try grub_args.appendSlice(alloc, &.{ "emerge", "sys-boot/grub" });
@@ -1107,16 +1101,14 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
             // bootctl only installs the manager — a Type-1 entry needs the
             // kernel + initramfs staged on the ESP and a loader entry.
             try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc,
-                    "k=$(ls -t /boot/vmlinuz-* 2>/dev/null | head -n1); " ++
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "k=$(ls -t /boot/vmlinuz-* 2>/dev/null | head -n1); " ++
                     "[ -n \"$k\" ] || {{ echo 'no kernel to stage' >&2; exit 1; }}; " ++
                     "mkdir -p /efi/loader/entries && cp -f \"$k\" /efi/vmlinuz || exit 1{s}", .{initrdStage(alloc, cfg, "/efi")}) }),
                 .chroot = true,
                 .desc = "stage kernel + initramfs on the ESP",
             } });
             try c.append(alloc, wf(alloc, "/mnt/gentoo/efi/loader/loader.conf", "default gentoo.conf\ntimeout 4\n"));
-            try c.append(alloc, wf(alloc, "/mnt/gentoo/efi/loader/entries/gentoo.conf",
-                s(alloc, "title   Gentoo Linux\nlinux   /vmlinuz\n{s}options {s}\n", .{ if (cfg.system.initramfs == .none) "" else "initrd  /initramfs.img\n", kernelArgs(alloc, cfg, seed) })));
+            try c.append(alloc, wf(alloc, "/mnt/gentoo/efi/loader/entries/gentoo.conf", s(alloc, "title   Gentoo Linux\nlinux   /vmlinuz\n{s}options {s}\n", .{ if (cfg.system.initramfs == .none) "" else "initrd  /initramfs.img\n", kernelArgs(alloc, cfg, seed) })));
             // kernel-install hook keeps the entry current on upgrades.
             try c.append(alloc, .{ .write_file = .{
                 .path = "/mnt/gentoo/etc/kernel/install.d/91-sd-boot.install",
@@ -1143,16 +1135,14 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
                 .desc = "efibootmgr",
             } });
             try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc,
-                    "k=$(ls -t /boot/vmlinuz-* 2>/dev/null | head -n1); " ++
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "k=$(ls -t /boot/vmlinuz-* 2>/dev/null | head -n1); " ++
                     "[ -n \"$k\" ] || {{ echo 'no kernel to stage' >&2; exit 1; }}; " ++
                     "cp -f \"$k\" /efi/vmlinuz || exit 1{s}", .{initrdStage(alloc, cfg, "/efi")}) }),
                 .chroot = true,
                 .desc = "stage kernel + initramfs on the ESP",
             } });
             try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc,
-                    "esp=$(findmnt -no SOURCE /efi) || exit 1; " ++
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "esp=$(findmnt -no SOURCE /efi) || exit 1; " ++
                     "d=$(lsblk -no PKNAME \"$esp\"); p=$(lsblk -no PARTN \"$esp\"); " ++
                     "[ -n \"$d\" ] && [ -n \"$p\" ] || exit 1; " ++
                     "efibootmgr -c -d /dev/$d -p $p -L Gentoo -l '\\vmlinuz' " ++
@@ -1198,12 +1188,14 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
                 .chroot = true,
                 .desc = "enroll keys into firmware (requires Setup Mode)",
             } });
-            try c.append(alloc, .{ .exec = .{
-                // missing globs skip silently; a FAILED sign propagates.
-                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", "rc=0; for f in /efi/EFI/BOOT/*.EFI /efi/vmlinuz /efi/EFI/Linux/*.efi; do [ -f \"$f\" ] || continue; sbctl sign -s \"$f\" || rc=1; done; exit $rc" }),
-                .chroot = true,
-                .desc = "sign bootloader + kernels (sbctl)",
-            } });
+            try c.append(alloc, .{
+                .exec = .{
+                    // missing globs skip silently; a FAILED sign propagates.
+                    .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", "rc=0; for f in /efi/EFI/BOOT/*.EFI /efi/vmlinuz /efi/EFI/Linux/*.efi; do [ -f \"$f\" ] || continue; sbctl sign -s \"$f\" || rc=1; done; exit $rc" }),
+                    .chroot = true,
+                    .desc = "sign bootloader + kernels (sbctl)",
+                },
+            });
         },
         .shim => try c.append(alloc, .{ .exec = .{
             .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-boot/shim", "app-crypt/sbsigntools" }),
@@ -1328,10 +1320,10 @@ test "golden plan: uefi + luks + lvm + btrfs + limine" {
     const plan = try build(alloc, &cfg, null, .{}, 0x0123456789abcdef0123456789abcdef);
 
     const expected_ids = [_][]const u8{
-        "detect",       "partition",      "mount",          "stage3",
-        "portage-config", "enter-chroot", "repo-sync",      "profile",
-        "world-update", "base-config",    "firmware-kernel", "fstab",
-        "system-config", "services",      "packages",       "bootloader",
+        "detect",         "partition",    "mount",           "stage3",
+        "portage-config", "enter-chroot", "repo-sync",       "profile",
+        "world-update",   "base-config",  "firmware-kernel", "fstab",
+        "system-config",  "services",     "packages",        "bootloader",
         "finish",
     };
     try std.testing.expectEqual(expected_ids.len, plan.steps.len);
@@ -1432,10 +1424,10 @@ test "persistent ids: fstab + kernel args use PARTUUID, exec paths use /dev" {
             else => {},
         }
     };
-    try std.testing.expect(sgdisk_u);      // sgdisk assigned root's PARTUUID
-    try std.testing.expect(saw_root);      // fstab / line uses root PARTUUID
-    try std.testing.expect(saw_esp);       // fstab /efi line uses esp PARTUUID
-    try std.testing.expect(saw_swap);      // fstab swap line uses swap PARTUUID
-    try std.testing.expect(saw_rootarg);   // a written file carries root=PARTUUID
+    try std.testing.expect(sgdisk_u); // sgdisk assigned root's PARTUUID
+    try std.testing.expect(saw_root); // fstab / line uses root PARTUUID
+    try std.testing.expect(saw_esp); // fstab /efi line uses esp PARTUUID
+    try std.testing.expect(saw_swap); // fstab swap line uses swap PARTUUID
+    try std.testing.expect(saw_rootarg); // a written file carries root=PARTUUID
     try std.testing.expect(!saw_dev_root); // no /dev/vdb persisted
 }
