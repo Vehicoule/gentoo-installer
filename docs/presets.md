@@ -17,7 +17,7 @@ preset id lands in the journal and the exported answer file, so a
 | overlay default `InstallConfig` values | weaken VALIDATE or safety gates |
 | lock fields (distro-fixed choices) | change the protocol or page schema |
 | define package sets + post-install hook | touch the live env / host — hooks run in the target chroot only |
-| insert script steps at named anchors | run before `mount` (target doesn't exist) or after `finish` |
+| insert script steps at named anchors | run before `enter-chroot` (stage3 not yet extracted — no userland in the target) or after `finish` |
 
 A preset is **trusted code**: its scripts run as root inside the target
 chroot. Presets ship with the distro image or are passed explicitly —
@@ -86,7 +86,9 @@ default     = false
 
 [[extra_steps]]                  # journaled pipeline extensions
 name        = "distro-tools"
-after       = "system-config"    # anchor: a pipeline step name
+after       = "system-config"    # anchor: a pipeline step name;
+                                  # earliest allowed is `enter-chroot`
+                                  # (target must have a stage3 userland)
 script      = "scripts/distro-tools.sh"   # runs in target chroot
 description = "Install distro tooling"
 skippable   = true               # retry/skip allowed on failure
