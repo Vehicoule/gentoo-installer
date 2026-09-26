@@ -252,14 +252,16 @@ jobs        = 0                  # 0 = auto (nproc, mem-capped)
 mem_cap_gib = 0                  # 0 = auto (~2 GiB/job heuristic)
 video_cards = "auto"             # auto ⇒ detected from gpus[]
 accept_license = "@FREE"
+mirrors     = "auto"             # auto ⇒ geoip → nearest distfiles mirror;
+                               # or explicit GENTOO_MIRRORS value
 
 [gpu]
 driver      = "auto"             # auto | nouveau | nvidia-open | nvidia-drivers
-                               # auto ⇒ in-kernel/mesa everywhere except NVIDIA,
-                               # which lands nouveau; the nvidia-* picks appear
-                               # only when an NVIDIA GPU is detected — they imply
-                               # ACCEPT_LICENSE=+NVIDIA and module signing under
-                               # secure_boot
+                               # auto ⇒ in-kernel/mesa everywhere; NVIDIA ⇒
+                               # nvidia-open (opinionated default). nvidia-*
+                               # picks appear only when an NVIDIA GPU is
+                               # detected — they imply ACCEPT_LICENSE=+NVIDIA
+                               # and module signing under secure_boot
 
 [network]
 manager     = "networkmanager"   # networkmanager | dhcpcd | netifrc | systemd-networkd

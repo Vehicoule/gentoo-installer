@@ -27,6 +27,7 @@ interaction mode.
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | locale | enum (preset list) | `en_US.UTF-8` | display language for the wizard itself |
+| keymap | enum (console keymaps) | `us` | applies to the *live env* immediately (`loadkeys`/`localectl`); prefills P3's installed-system keymap — needed before P1's LUKS passphrase, not after |
 | mode | enum `express\|advanced` | `express` | sets the flow: express skips all non-essential pages; advanced exposes every field |
 | answer_file | path (optional) | — | loads a saved config and jumps to P7 Review |
 
@@ -145,8 +146,8 @@ password on a surviving account, or `sshd=true` + authorized key.
 | keep_kernels | int | 3 | kernel boot entries retained; 0 = never prune |
 | net_manager | enum `networkmanager\|dhcpcd\|netifrc\|systemd-networkd` | `networkmanager` | `systemd-networkd` needs init=systemd |
 | wifi_fw | bool | detected | `linux-firmware` + `sof-firmware` |
-| gpu_driver | enum `auto\|nouveau\|nvidia-open\|nvidia-drivers` | `auto` | `auto` = in-kernel/mesa; NVIDIA ⇒ `nouveau`. The `nvidia-*` options appear only when `env.gpus[]` reports an NVIDIA device — they imply `ACCEPT_LICENSE=+NVIDIA` and kernel-module signing when secure_boot is on |
-| microcode | bool | detected (vendor) | intel-microcode / amd via linux-firmware |
+| gpu_driver | enum `auto\|nouveau\|nvidia-open\|nvidia-drivers` | `auto` | `auto` = in-kernel/mesa; on NVIDIA `auto` ⇒ **`nvidia-open`** (Express's opinionated pick — nouveau stays an Advanced pick). `nvidia-*` options appear only when `env.gpus[]` reports an NVIDIA device — they imply `ACCEPT_LICENSE=+NVIDIA` and kernel-module signing when secure_boot is on |
+| microcode | bool | detected (vendor) | intel-microcode / amd via linux-firmware; loaded early via the initramfs (dracut `early_microcode`) |
 | services.sshd / .logger / .cron | bool | false/true/true | — |
 
 Seamless kernel upgrades (hard requirement): dist kernels +
@@ -227,5 +228,6 @@ shell into the installed system — archinstall-style escape hatch),
 unmount + reboot, install-media removal note.
 
 Failure/abort path: resume instructions (`gentoo-installer --resume`
-same-boot; `detect --repair` after reboot) + copyable log bundle for a
-bug report.
+same-boot; `detect --repair` after reboot) + **export logs** — writes
+the journal + event log as a tarball to a picked disk/ESP partition or
+USB for bug reports and mass-install debugging.
