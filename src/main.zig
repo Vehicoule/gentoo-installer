@@ -220,6 +220,26 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
+    // Exec-mode gates for choices with no complete M1 backend: a manual
+    // kernel produces no /boot/vmlinuz-* for the loader to stage, and
+    // alt inits install packages but can't yet take over PID 1 or enable
+    // services (service migration lands with the init backends in M6).
+    if (cmd == .run and !dry_run and cfg.system.kernel == .manual) {
+        try errw.print("kernel=manual is not executable unattended — use dist|dist-bin, or --dry-run to preview\n", .{});
+        try errw.flush();
+        std.process.exit(2);
+    }
+    if (cmd == .run and !dry_run) {
+        switch (cfg.system.init) {
+            .runit, .s6, .dinit => {
+                try errw.print("init={s} is not executable yet — its boot+service backends land in M6; use openrc|systemd or --dry-run to preview\n", .{@tagName(cfg.system.init)});
+                try errw.flush();
+                std.process.exit(2);
+            },
+            else => {},
+        }
+    }
+
     // Destructive exec runs require --confirm <device> matching the
     // configured disk — an answer file alone must never wipe a disk.
     const destructive = cfg.disk.scheme == .@"efi-swap-root" or cfg.disk.scheme == .@"bios-boot-swap-root";

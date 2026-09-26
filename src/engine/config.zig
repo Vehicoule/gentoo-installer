@@ -414,24 +414,33 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
 
     // Control chars / newlines in values interpolated into generated
     // files or argv would inject extra directives — reject them all.
-    const injectable = [_]?[]const u8{
-        cfg.disk.device,
-        cfg.disk.shrink_part,
-        cfg.stage3.mirror,
-        cfg.system.hostname,
-        cfg.system.timezone,
-        cfg.system.locale,
-        cfg.system.keymap,
-        cfg.makeconf.mirrors,
-        cfg.makeconf.accept_license,
-        cfg.makeconf.video_cards,
-        cfg.root.password_hash,
-        cfg.disk.luks_passphrase,
+    // Errors name the FIELD, never the value: luks_passphrase and other
+    // secrets must not leak into stderr.
+    const injectable = [_]struct { name: []const u8, v: ?[]const u8 }{
+        .{ .name = "disk.device", .v = cfg.disk.device },
+        .{ .name = "disk.shrink_part", .v = cfg.disk.shrink_part },
+        .{ .name = "stage3.mirror", .v = cfg.stage3.mirror },
+        .{ .name = "system.hostname", .v = cfg.system.hostname },
+        .{ .name = "system.timezone", .v = cfg.system.timezone },
+        .{ .name = "system.locale", .v = cfg.system.locale },
+        .{ .name = "system.keymap", .v = cfg.system.keymap },
+        .{ .name = "makeconf.mirrors", .v = cfg.makeconf.mirrors },
+        .{ .name = "makeconf.accept_license", .v = cfg.makeconf.accept_license },
+        .{ .name = "makeconf.video_cards", .v = cfg.makeconf.video_cards },
+        .{ .name = "root.password_hash", .v = cfg.root.password_hash },
+        .{ .name = "disk.luks_passphrase", .v = cfg.disk.luks_passphrase },
     };
-    for (injectable) |ms| {
-        const v = ms orelse continue;
-        if (hasCtl(v)) try errs.append(alloc, fmt(alloc, "value contains control characters: '{s}'", .{v}));
+    for (injectable) |e| {
+        const v = e.v orelse continue;
+        if (hasCtl(v)) try errs.append(alloc, fmt(alloc, "{s} contains control characters", .{e.name}));
     }
+    // Device paths are also embedded inside single-quoted sh -c scripts
+    // (efistub/efibootmgr) — lock them to a charset with no quotes or
+    // metacharacters at all.
+    if (cfg.disk.device.len > 0 and !devPathOk(cfg.disk.device))
+        try errs.append(alloc, "disk.device must look like /dev/<path> (letters/digits /._+:- only) — it is interpolated into shell commands");
+    if (cfg.disk.shrink_part.len > 0 and !devPathOk(cfg.disk.shrink_part))
+        try errs.append(alloc, "disk.shrink_part must look like /dev/<path> (letters/digits /._+:- only)");
     if (cfg.makeconf.cflags == .custom) {
         const v = cfg.makeconf.cflags.custom;
         if (hasCtl(v) or hasShellMeta(v))
@@ -524,9 +533,14 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
     while (pit.next()) |kv| {
         if (!atomOk(kv.key_ptr.*))
             try errs.append(alloc, fmt(alloc, "use.pkg key '{s}' is not a valid atom", .{kv.key_ptr.*}));
+        // a use.pkg value must be a flags string — anything else is
+        // silently dropped by packageUse(), so reject it here.
         const flags_str = switch (kv.value_ptr.*) {
             .string => |fl| fl,
-            else => continue,
+            else => {
+                try errs.append(alloc, fmt(alloc, "use.pkg['{s}'] must be a string of USE flags", .{kv.key_ptr.*}));
+                continue;
+            },
         };
         var ft = std.mem.tokenizeScalar(u8, flags_str, ' ');
         while (ft.next()) |f| {
@@ -538,6 +552,12 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
     var uit = cfg.use.global.iterator();
     while (uit.next()) |kv| {
         if (!useFlagOk(kv.key_ptr.*)) try errs.append(alloc, fmt(alloc, "USE flag '{s}' has characters outside the USE charset", .{kv.key_ptr.*}));
+        // use.global values must be booleans — other types are silently
+        // dropped by makeConf(), so reject them here.
+        switch (kv.value_ptr.*) {
+            .boolean => {},
+            else => try errs.append(alloc, fmt(alloc, "use.global['{s}'] must be true or false", .{kv.key_ptr.*})),
+        }
     }
 
     if (cfg.disk.scheme == .alongside) {
@@ -577,13 +597,24 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
     // Login-path proof: some credential must survive to the finished
     // system, or sshd must be reachable with keys.
     var login_path = false;
+    // A wheel member with credentials is also the admin path once root
+    // is locked — doas/sudo policies grant only wheel.
+    var wheel_login = false;
     if (cfg.root.password_hash != null and !cfg.root.lock_root) login_path = true;
     for (cfg.users) |u| {
+        const has_cred = u.password_hash != null or (cfg.services.sshd and u.ssh_authorized_keys.len > 0);
         if (u.password_hash != null) login_path = true;
         if (cfg.services.sshd and u.ssh_authorized_keys.len > 0) login_path = true;
+        var in_wheel = false;
+        for (u.groups) |g| {
+            if (std.mem.eql(u8, g, "wheel")) in_wheel = true;
+        }
+        if (in_wheel and has_cred) wheel_login = true;
     }
     if (!login_path)
         try errs.append(alloc, "no surviving login path: set a password_hash, or sshd=true plus ssh_authorized_keys");
+    if (cfg.root.lock_root and cfg.system.privilege != .none and !wheel_login)
+        try errs.append(alloc, "root.lock_root leaves no admin path: give a wheel member a password or SSH key (doas/sudo grant wheel only)");
 
     if (cfg.gpu.driver == .@"nvidia-open") {
         if (nvidia) |t| switch (t) {
@@ -608,6 +639,20 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
     if (!found) try errs.append(alloc, "system.locale must be one of system.locales");
 
     return errs.items;
+}
+
+// Device paths the config may legitimately name: /dev/<node> or
+// /dev/disk/by-* — the charset excludes quotes/metacharacters so the
+// value is safe inside single-quoted shell fragments.
+fn devPathOk(v: []const u8) bool {
+    if (!std.mem.startsWith(u8, v, "/dev/") or v.len > 96) return false;
+    for (v[5..]) |ch| {
+        const ok = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+            (ch >= '0' and ch <= '9') or ch == '/' or ch == '.' or ch == '_' or
+            ch == '+' or ch == '-' or ch == ':';
+        if (!ok) return false;
+    }
+    return true;
 }
 
 fn hasCtl(v: []const u8) bool {

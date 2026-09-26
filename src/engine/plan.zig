@@ -229,15 +229,23 @@ fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) 
         try c.append(alloc, argv(alloc, &.{ "pvcreate", "--norestorefile", root_dev }, s(alloc, "PV on {s}", .{root_dev})));
         try c.append(alloc, argv(alloc, &.{ "vgcreate", "vg0", root_dev }, "volume group vg0"));
         if (cfg.system.snapshots == .auto) {
+            // -l %VG is valid on the POOL (a normal LV underneath).
             try c.append(alloc, argv(alloc, &.{ "lvcreate", "-l", "95%VG", "-T", "vg0/tank" }, "thin pool tank (95% VG)"));
-            // Thin LVs take -V (virtual size); for a thin LV, %FREE means
-            // a share of the thin POOL's free space — give root 70% when
-            // a home LV follows, else the whole pool (overcommit is
-            // intended: caps are soft, the pool is 95% of the VG).
-            const root_pct = if (d.home_part and d.root_fs != .btrfs) "70%FREE" else "100%FREE";
-            try c.append(alloc, argv(alloc, &.{ "lvcreate", "-V", root_pct, "-T", "vg0/tank", "-n", "root" }, "thin root LV"));
+            // Thin LVs take -V <absolute size>; %FREE is a -l/-L suffix,
+            // not a -V one. The pool size isn't known at plan time, so
+            // measure it and give each thin LV the full pool as virtual
+            // size (intentional overcommit; pool autoextend guards it).
+            const measure = "pm=$(lvs --noheadings --units m --nosuffix -o lv_size vg0/tank | tr -d ' .'); " ++
+                "[ -n \"$pm\" ] || exit 1; ";
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "{s}lvcreate -T vg0/tank -n root -V \"${{pm}}M\"", .{measure}) }),
+                .desc = "thin root LV (virtual size = pool)",
+            } });
             if (d.home_part and d.root_fs != .btrfs) {
-                try c.append(alloc, argv(alloc, &.{ "lvcreate", "-V", "100%FREE", "-T", "vg0/tank", "-n", "home" }, "thin home LV (remaining pool)"));
+                try c.append(alloc, .{ .exec = .{
+                    .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "{s}lvcreate -T vg0/tank -n home -V \"${{pm}}M\"", .{measure}) }),
+                    .desc = "thin home LV (virtual size = pool, overcommit)",
+                } });
                 try c.append(alloc, argv(alloc, &.{ s(alloc, "mkfs.{s}", .{@tagName(d.root_fs)}), "/dev/vg0/home" }, "format home LV"));
             }
         } else {
@@ -284,15 +292,15 @@ fn rootMountArgs(alloc: Allocator, cfg: *const Config) struct { dev: []const u8,
 /// The device node that carries the root filesystem (through LUKS/LVM).
 /// Kernel command line shared by every bootloader backend.
 ///
-/// Shell fragment staging the newest initramfs onto the boot volume —
-/// empty when initramfs=none so a validated no-initramfs config doesn't
-/// fail the step.
+/// Shell fragment staging the newest initramfs onto the boot volume,
+/// INCLUDING the leading ';' — empty when initramfs=none. The copy
+/// fails the step (`|| exit 1`); nothing after it may mask the status.
 fn initrdStage(alloc: Allocator, cfg: *const Config, dir: []const u8) []const u8 {
     if (cfg.system.initramfs == .none) return "";
     return s(alloc,
-        "i=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img 2>/dev/null | head -n1); " ++
+        "; i=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img 2>/dev/null | head -n1); " ++
         "[ -n \"$i\" ] || {{ echo 'no initramfs to stage' >&2; exit 1; }}; " ++
-        "cp -f \"$i\" {s}/initramfs.img", .{dir});
+        "cp -f \"$i\" {s}/initramfs.img || exit 1", .{dir});
 }
 fn kernelArgs(alloc: Allocator, cfg: *const Config) []const u8 {
     var r = s(alloc, "root={s}", .{fsDevice(alloc, cfg)});
@@ -363,12 +371,28 @@ fn planMount(alloc: Allocator, cfg: *const Config) !Step {
     return step(alloc, "mount", "Mount target", c);
 }
 
+/// Gentoo naming differs per arch: the releases dir token vs the stage3
+/// filename token (riscv: releases/riscv/… but stage3-rv64_lp64d-*).
+/// Returns null for arch=detect — resolved once detection runs.
+fn archTokens(cfg: *const Config) ?struct { dir: []const u8, file: []const u8 } {
+    return switch (cfg.arch) {
+        .amd64 => .{ .dir = "amd64", .file = "amd64" },
+        .arm64 => .{ .dir = "arm64", .file = "arm64" },
+        .riscv64 => .{ .dir = "riscv", .file = "rv64_lp64d" },
+        .detect => null,
+    };
+}
+
 fn planStage3(alloc: Allocator, cfg: *const Config) !Step {
     var c: std.ArrayList(Cmd) = .empty;
     const stem = try config.stage3Stem(alloc, cfg);
-    const arch = @tagName(cfg.arch);
-    const base = s(alloc, "{s}/releases/{s}/autobuilds", .{ cfg.stage3.mirror, arch });
-    try c.append(alloc, argv(alloc, &.{ "curl", "-fsSL", "-o", "/tmp/latest.txt", s(alloc, "{s}/latest-stage3-{s}.txt", .{ base, stem }) }, "resolve stage3 pointer"));
+    const toks = archTokens(cfg) orelse {
+        try c.append(alloc, .{ .note = "stage3 URL resolved after hardware detection (arch=detect)" });
+        return step(alloc, "stage3", "Stage3 download + extract", c);
+    };
+    const base = s(alloc, "{s}/releases/{s}/autobuilds", .{ cfg.stage3.mirror, toks.dir });
+    // pointer files are latest-stage3-<arch-token>-<stem>.txt
+    try c.append(alloc, argv(alloc, &.{ "curl", "-fsSL", "-o", "/tmp/latest.txt", s(alloc, "{s}/latest-stage3-{s}-{s}.txt", .{ base, toks.file, stem }) }, "resolve stage3 pointer"));
     // Resolve filename from the pointer, fetch tarball+signature+digests.
     // latest.txt entries may carry a dated subdir (2026…/stage3-….tar.xz):
     // use the full path in the URL but save locally under the basename.
@@ -569,7 +593,10 @@ fn planProfile(alloc: Allocator, cfg: *const Config) !Step {
         .chroot = true,
         .desc = "list profiles (resolve stem → profile name)",
     } });
-    const prof = try profilePath(alloc, cfg);
+    const prof = try profilePath(alloc, cfg) orelse {
+        try c.append(alloc, .{ .note = "profile path resolved after hardware detection (arch=detect)" });
+        return step(alloc, "profile", "Select portage profile", c);
+    };
     try c.append(alloc, .{ .exec = .{
         .argv = try alloc.dupe([]const u8, &.{ "eselect", "profile", "set", prof }),
         .chroot = true,
@@ -989,7 +1016,7 @@ fn planBootloader(alloc: Allocator, cfg: *const Config) !Step {
                 .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc,
                     "k=$(ls -t /boot/vmlinuz-* 2>/dev/null | head -n1); " ++
                     "[ -n \"$k\" ] || {{ echo 'no kernel to stage' >&2; exit 1; }}; " ++
-                    "cp -f \"$k\" {s}/vmlinuz || exit 1; {s}; true", .{ stage_dir, initrdStage(alloc, cfg, stage_dir) }) }),
+                    "cp -f \"$k\" {s}/vmlinuz || exit 1{s}", .{ stage_dir, initrdStage(alloc, cfg, stage_dir) }) }),
                 .chroot = true,
                 .desc = "stage current kernel + initramfs for limine",
             } });
@@ -1029,8 +1056,7 @@ fn planBootloader(alloc: Allocator, cfg: *const Config) !Step {
                 .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc,
                     "k=$(ls -t /boot/vmlinuz-* 2>/dev/null | head -n1); " ++
                     "[ -n \"$k\" ] || {{ echo 'no kernel to stage' >&2; exit 1; }}; " ++
-                    "mkdir -p /efi/loader/entries && cp -f \"$k\" /efi/vmlinuz || exit 1; " ++
-                    "{s}; true", .{initrdStage(alloc, cfg, "/efi")}) }),
+                    "mkdir -p /efi/loader/entries && cp -f \"$k\" /efi/vmlinuz || exit 1{s}", .{initrdStage(alloc, cfg, "/efi")}) }),
                 .chroot = true,
                 .desc = "stage kernel + initramfs on the ESP",
             } });
@@ -1066,7 +1092,7 @@ fn planBootloader(alloc: Allocator, cfg: *const Config) !Step {
                 .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc,
                     "k=$(ls -t /boot/vmlinuz-* 2>/dev/null | head -n1); " ++
                     "[ -n \"$k\" ] || {{ echo 'no kernel to stage' >&2; exit 1; }}; " ++
-                    "cp -f \"$k\" /efi/vmlinuz || exit 1; {s}; true", .{initrdStage(alloc, cfg, "/efi")}) }),
+                    "cp -f \"$k\" /efi/vmlinuz || exit 1{s}", .{initrdStage(alloc, cfg, "/efi")}) }),
                 .chroot = true,
                 .desc = "stage kernel + initramfs on the ESP",
             } });
@@ -1081,11 +1107,22 @@ fn planBootloader(alloc: Allocator, cfg: *const Config) !Step {
                 .desc = "efibootmgr: create Gentoo NVRAM entry",
             } });
         },
-        .refind => try c.append(alloc, .{ .exec = .{
-            .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-boot/refind" }),
-            .chroot = true,
-            .desc = "rEFInd (UEFI)",
-        } }),
+        .refind => {
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-boot/refind" }),
+                .chroot = true,
+                .desc = "rEFInd package",
+            } });
+            // refind-install copies the manager + filesystem drivers onto
+            // the mounted ESP and creates the NVRAM entry; --alldrivers
+            // lets it read kernels off /boot (btrfs/ext4/xfs).
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "refind-install", "--alldrivers", "--usedefault", s(alloc, "{s}", .{partPath(alloc, cfg.disk.device, 1)}) }),
+                .chroot = true,
+                .desc = "install rEFInd to ESP + NVRAM entry",
+            } });
+            try c.append(alloc, .{ .note = "rEFInd auto-discovers kernels+initramfs on /boot via its fs drivers — no staging needed" });
+        },
         .auto => unreachable,
     }
 
@@ -1125,8 +1162,9 @@ fn planBootloader(alloc: Allocator, cfg: *const Config) !Step {
 
 /// stem → eselect profile path: `default/linux/{arch}/23.0/` + stem
 /// segments joined with `/` (nomultilib → no-multilib).
-fn profilePath(alloc: Allocator, cfg: *const Config) ![]const u8 {
+fn profilePath(alloc: Allocator, cfg: *const Config) !?[]const u8 {
     const stem = try config.stage3Stem(alloc, cfg);
+    const toks = archTokens(cfg) orelse return null;
     var out: std.ArrayList([]const u8) = .empty;
     var it = std.mem.splitScalar(u8, stem, '-');
     while (it.next()) |seg| {
@@ -1139,7 +1177,7 @@ fn profilePath(alloc: Allocator, cfg: *const Config) ![]const u8 {
         }
     }
     const joined = try std.mem.join(alloc, "/", out.items);
-    return s(alloc, "default/linux/{s}/23.0/{s}", .{ @tagName(cfg.arch), joined });
+    return s(alloc, "default/linux/{s}/23.0/{s}", .{ toks.dir, joined });
 }
 
 /// Fallback-loader EFI filename for the target arch (matches what
