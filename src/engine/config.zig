@@ -410,9 +410,10 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
     if (cfg.disk.device.len == 0)
         try errs.append(alloc, "disk.device is required (e.g. /dev/vda)");
     if (cfg.disk.luks) {
-        if (cfg.disk.luks_passphrase == null)
-            try errs.append(alloc, "disk.luks requires disk.luks_passphrase in exec mode (wizard collects it interactively)")
-        else if (cfg.disk.luks_passphrase.?.len < 8)
+        // Presence is an exec gate (execPrechecks) — plan/preview and
+        // answer files never carry the passphrase. A weak-but-set one
+        // is still flagged here.
+        if (cfg.disk.luks_passphrase != null and cfg.disk.luks_passphrase.?.len < 8)
             try errs.append(alloc, "disk.luks_passphrase needs ≥8 characters");
     }
 
@@ -849,6 +850,14 @@ test "validate rejects a short luks passphrase from a file" {
         if (std.mem.indexOf(u8, e, "luks_passphrase") != null) seen = true;
     }
     try std.testing.expect(seen);
+}
+
+/// Exec-only requirements — plan/preview and answer files legitimately
+/// lack secrets, a real install cannot proceed without them.
+pub fn execPrechecks(cfg: *const Config) ?[]const u8 {
+    if (cfg.disk.luks and cfg.disk.luks_passphrase == null)
+        return "disk.luks requires disk.luks_passphrase before exec";
+    return null;
 }
 
 test "validate login-path proof" {

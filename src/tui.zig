@@ -133,12 +133,26 @@ pub const Tui = struct {
 
     /// Keep the focused row inside the visible window — short terminals
     /// must scroll as focus moves, or the user edits invisible fields.
+    /// On the review page (no fields) the arrows drive summary scroll
+    /// instead, so this must not touch t.scroll.
     fn ensureFocusVisible(t: *Tui) void {
         const max_rows: usize = t.last_h -| 8;
         if (max_rows == 0) return;
+        if (t.pv.fields.len == 0) {
+            // review page — clamp the summary offset to its content
+            const total = summaryLines(t.pv.summary);
+            t.scroll = @min(t.scroll, total -| max_rows);
+            return;
+        }
         const target = @min(t.focus, t.pv.fields.len); // actions row counts
         if (target < t.scroll) t.scroll = target;
         if (target >= t.scroll + max_rows) t.scroll = target - max_rows + 1;
+    }
+
+    fn summaryLines(summary: []SumGroup) usize {
+        var n: usize = 0;
+        for (summary) |g| n += 1 + g.lines.len;
+        return n;
     }
 
     /// Mirror of engine set — translates a text buffer into the json
@@ -436,18 +450,23 @@ fn draw(t: *Tui, win: vaxis.Window) !void {
         return;
     }
 
-    // review page: grouped config summary instead of fields
+    // review page: grouped config summary — scrollable slice, arrows
+    // adjust t.scroll on this page (fields.len == 0).
     if (t.pv.summary.len > 0) {
+        var li: usize = 0;
         for (t.pv.summary) |g| {
-            if (row >= h -| 6) break;
-            _ = win.print(&.{.{ .text = g.title, .style = accent }}, .{ .row_offset = row, .col_offset = 1 });
-            row += 1;
-            for (g.lines) |ln| {
-                if (row >= h -| 6) break;
-                _ = win.print(&.{.{ .text = ln, .style = .{} }}, .{ .row_offset = row, .col_offset = 3 });
+            if (li >= t.scroll and row < h -| 6) {
+                _ = win.print(&.{.{ .text = g.title, .style = accent }}, .{ .row_offset = row, .col_offset = 1 });
                 row += 1;
             }
-            row += 1;
+            li += 1;
+            for (g.lines) |ln| {
+                if (li >= t.scroll and row < h -| 6) {
+                    _ = win.print(&.{.{ .text = ln, .style = .{} }}, .{ .row_offset = row, .col_offset = 3 });
+                    row += 1;
+                }
+                li += 1;
+            }
         }
     }
 
@@ -655,15 +674,27 @@ pub fn runTui(init: std.process.Init, alloc: Allocator, io: std.Io, preset: ?*co
                     }
                 } else if (t.mode == .form) {
                     if (key.matches('q', .{})) break;
+                    // review page (no fields): ↑/↓ scroll the summary
+                    const review_scroll = t.pv.fields.len == 0 and t.pv.summary.len > 0;
                     if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
-                        if (t.focus > 0) t.focus -= 1 else {
-                            // wrap to action row
-                            t.focus = t.pv.fields.len;
+                        if (review_scroll) {
+                            t.scroll = t.scroll -| 1;
+                        } else {
+                            if (t.focus > 0) t.focus -= 1 else {
+                                // wrap to action row
+                                t.focus = t.pv.fields.len;
+                            }
+                            t.ensureFocusVisible();
                         }
-                        t.ensureFocusVisible();
                     } else if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
-                        t.focus = @min(t.focus + 1, t.pv.fields.len);
-                        t.ensureFocusVisible();
+                        if (review_scroll) {
+                            const total = Tui.summaryLines(t.pv.summary);
+                            const max_rows: usize = t.last_h -| 8;
+                            t.scroll = @min(t.scroll + 1, total -| max_rows);
+                        } else {
+                            t.focus = @min(t.focus + 1, t.pv.fields.len);
+                            t.ensureFocusVisible();
+                        }
                     } else if (key.matches(vaxis.Key.left, .{}) or key.matches('h', .{})) {
                         if (t.focus == t.pv.fields.len) {
                             if (t.action_sel > 0) t.action_sel -= 1;

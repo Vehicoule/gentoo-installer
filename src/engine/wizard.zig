@@ -631,6 +631,61 @@ pub const Wizard = struct {
     /// — plaintext never survives in cfg beyond the luks passphrase,
     /// which is protocol-defined as in-memory only.
     pub fn setField(w: *Wizard, name: []const u8, v: std.json.Value) WizardError!void {
+        // Snapshot before mutation — cfg fields are replaced, never
+        // edited in place, so restoring the struct is a full rollback.
+        const prev = w.cfg;
+        try w.setFieldInner(name, v);
+        // Derived changes (libc→init, hardening→selinux, init→netmanager)
+        // skip the per-field lock check — verify every locked path on the
+        // final cfg and roll the whole set back on violation.
+        w.checkLocksPost() catch |e| {
+            w.cfg = prev;
+            return e;
+        };
+    }
+
+    /// Every locked path on the CURRENT cfg must equal the preset
+    /// default — catches lock violations a single-field pre-check can't
+    /// see (a `set stage3.libc=musl` that coerces a locked system.init).
+    pub fn checkLocksPost(w: *Wizard) WizardError!void {
+        const p = w.preset orelse return;
+        if (p.locks.len == 0) return;
+        var aw: std.Io.Writer.Allocating = .init(w.alloc);
+        defer aw.deinit();
+        w.emitConfigJson(&aw.writer, null) catch return error.OutOfMemory;
+        const parsed = std.json.parseFromSlice(std.json.Value, w.alloc, aw.written(), .{}) catch return error.OutOfMemory;
+        defer parsed.deinit();
+        const cj = parsed.value.object.get("config") orelse return;
+        const defs = presetDefaults(p) orelse return;
+        for (p.locks) |lp| {
+            var cur = cj;
+            var ok = true;
+            var it = std.mem.splitScalar(u8, lp, '.');
+            while (it.next()) |seg| {
+                cur = switch (cur) {
+                    .object => |o| o.get(seg) orelse {
+                        ok = false;
+                        break;
+                    },
+                    else => {
+                        ok = false;
+                        break;
+                    },
+                };
+            }
+            if (!ok) continue;
+            // masked secret emissions can't be compared — a lock on one
+            // is meaningless anyway.
+            if (cur == .object) if (cur.object.get("secret")) |sv| {
+                if (sv == .bool and sv.bool) continue;
+            };
+            const want = preset_mod.lookup(defs, lp) orelse continue;
+            const got = jsonToToml(w.alloc, cur) orelse continue;
+            if (!preset_mod.valueEq(got, want)) return error.Locked;
+        }
+    }
+
+    fn setFieldInner(w: *Wizard, name: []const u8, v: std.json.Value) WizardError!void {
         try w.presetLocks(name, v);
         if (std.mem.eql(u8, name, "flow.mode")) {
             const s = try strOf(v);
@@ -861,15 +916,23 @@ pub const Wizard = struct {
             const lerrs = preset_mod.checkLocks(w.alloc, p, &doc) catch return error.OutOfMemory;
             if (lerrs.len > 0) return error.Locked;
         }
+        // Record what the user document actually named BEFORE preset
+        // defaults merge in — a merged-in value is not a user pin.
+        const user_set_boot = doc.root.get("boot_mode") != null;
+        const user_set_scheme = docHas(&doc, "disk", "scheme");
+        // Preset defaults merge UNDER the file, same as the CLI path —
+        // an answer file that omits a preset field inherits the preset's
+        // default, not the engine's.
+        if (w.preset) |p| try preset_mod.mergeDefaults(p, &doc);
         // The file replaces the config wholesale — including secrets.
         // Keeping a previous session's passphrase/hash across a load
         // would silently stamp it onto an unrelated install.
         w.cfg = config.decode(w.alloc, doc) catch return error.BadConfig;
-        // decode() already set boot_mode_explicit when the doc carries a
-        // root-level boot_mode. Scheme pins the same way, plus the CLI's
-        // preserve-scheme promotion (main.zig): an answer file that asks
-        // for alongside/manual must keep it when detection re-syncs.
-        w.cfg.disk.scheme_explicit = docHas(&doc, "disk", "scheme") or
+        w.cfg.boot_mode_explicit = user_set_boot;
+        // Scheme pins the same way, plus the CLI's preserve-scheme
+        // promotion (main.zig): an answer file that asks for
+        // alongside/manual must keep it when detection re-syncs.
+        w.cfg.disk.scheme_explicit = user_set_scheme or
             w.cfg.disk.scheme == .alongside or w.cfg.disk.scheme == .manual;
         // Re-apply the probed env: implicit boot_mode/scheme follow the
         // live firmware exactly like they did before the file loaded.
@@ -1429,7 +1492,14 @@ fn confinedWrite(w: *Wizard, path: []const u8) WizardError![]const u8 {
     var fbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     if (std.Io.Dir.cwd().realPathFile(w.io, real, &fbuf)) |flen| {
         if (!std.mem.eql(u8, fbuf[0..flen], real)) return error.PathEscape;
-    } else |_| {}
+    } else |_| {
+        // Unresolvable leaf — safe only when nothing exists there. A
+        // dangling symlink stats fine without following but writeFile
+        // would chase it outside cwd, so refuse any existing leaf.
+        if (std.Io.Dir.cwd().statFile(w.io, real, .{ .follow_symlinks = false })) |_|
+            return error.PathEscape
+        else |_| {}
+    }
     return real;
 }
 

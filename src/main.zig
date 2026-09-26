@@ -109,7 +109,7 @@ pub fn main(init: std.process.Init) !void {
 
     switch (cmd) {
         .tui => return @import("tui.zig").runTui(init, alloc, io, if (preset) |*pp| pp else null),
-        .headless => return headless(init, alloc, io, out, errw, if (preset) |*pp| pp else null),
+        .headless => return headless(init, alloc, io, out, errw, if (preset) |*pp| pp else null, config_path),
         else => {},
     }
 
@@ -119,60 +119,8 @@ pub fn main(init: std.process.Init) !void {
         try errw.flush();
         std.process.exit(2);
     };
-    const text = std.Io.Dir.cwd().readFileAlloc(io, cp, alloc, .limited(4 << 20)) catch |e| {
-        try errw.print("cannot read {s}: {s}\n", .{ cp, @errorName(e) });
-        try errw.flush();
-        std.process.exit(2);
-    };
-    var perr: engine.toml.ParseError = undefined;
-    var doc = engine.toml.parse(alloc, text, &perr) catch |e| {
-        if (e == error.InvalidToml) {
-            try errw.print("{s}:{}: invalid toml: {s}\n", .{ cp, perr.line, perr.msg });
-        } else {
-            try errw.print("{s}: {s}\n", .{ cp, @errorName(e) });
-        }
-        try errw.flush();
-        std.process.exit(2);
-    };
-    defer doc.deinit();
-
-    // Record which detection-relevant keys the USER's document carried
-    // before preset defaults merge in — a preset-supplied boot_mode or
-    // scheme must not mark the value user-pinned.
-    const user_set_boot = doc.root.get("boot_mode") != null;
-    const user_set_scheme = blk: {
-        const d = doc.root.get("disk") orelse break :blk false;
-        break :blk d == .table and d.table.get("scheme") != null;
-    };
-
-    if (preset) |*pp| {
-        try engine.preset.mergeDefaults(pp, &doc);
-        const lock_errs = try engine.preset.checkLocks(alloc, pp, &doc);
-        for (lock_errs) |e| try errw.print("preset: {s}\n", .{e});
-        if (lock_errs.len > 0) {
-            try errw.flush();
-            std.process.exit(2);
-        }
-    }
-
-    var cfg = engine.config.decode(alloc, doc) catch {
-        try errw.writeAll("config decode failed (see log)\n");
-        try errw.flush();
-        std.process.exit(2);
-    };
-    // Only user-supplied keys are "explicit" — except preservation
-    // schemes (alongside/manual), where a preset default is
-    // data-preservation policy and must not be overwritten by
-    // detection. A preset's erase scheme still yields to firmware
-    // (efi-swap-root ↔ bios-boot-swap-root).
-    cfg.boot_mode_explicit = user_set_boot;
-    cfg.disk.scheme_explicit = user_set_scheme or blk: {
-        const d = doc.root.get("disk") orelse break :blk false;
-        if (d != .table) break :blk false;
-        const sv = d.table.get("scheme") orelse break :blk false;
-        if (sv != .string) break :blk false;
-        break :blk std.mem.eql(u8, sv.string, "alongside") or std.mem.eql(u8, sv.string, "manual");
-    };
+    var cfg = loadCliConfig(io, alloc, errw, cp, if (preset) |*pp| pp else null);
+    _ = &cfg;
 
     // Always probe the live env for run/plan/validate — it fills the
     // boot_mode/scheme defaults and feeds jobs/NICs/VIDEO_CARDS into the
@@ -263,6 +211,13 @@ pub fn main(init: std.process.Init) !void {
         try errw.flush();
         std.process.exit(2);
     }
+    // Secrets are exec gates, not plan gates — an exported answer file
+    // previews fine but can't run until the passphrase is provided.
+    if (cmd == .run and !dry_run) if (engine.config.execPrechecks(&cfg)) |e| {
+        try errw.print("{s}\n", .{e});
+        try errw.flush();
+        std.process.exit(2);
+    };
 
     // Destructive exec runs require --confirm <device> matching the
     // configured disk — an answer file alone must never wipe a disk.
@@ -402,12 +357,77 @@ fn fatal(w: *std.Io.Writer, msg: []const u8) noreturn {
     std.process.exit(2);
 }
 
+/// Shared config-file pipeline for run/plan/validate and a prefilled
+/// headless session (`--config` with `headless`, per protocol.md):
+/// read → parse → preset defaults+locks → decode → explicit flags.
+fn loadCliConfig(io: std.Io, alloc: std.mem.Allocator, errw: *std.Io.Writer, cp: []const u8, preset: ?*const engine.preset.Preset) engine.config.Config {
+    const text = std.Io.Dir.cwd().readFileAlloc(io, cp, alloc, .limited(4 << 20)) catch |e| {
+        errw.print("cannot read {s}: {s}\n", .{ cp, @errorName(e) }) catch {};
+        errw.flush() catch {};
+        std.process.exit(2);
+    };
+    var perr: engine.toml.ParseError = undefined;
+    var doc = engine.toml.parse(alloc, text, &perr) catch |e| {
+        if (e == error.InvalidToml) {
+            errw.print("{s}:{}: invalid toml: {s}\n", .{ cp, perr.line, perr.msg }) catch {};
+        } else {
+            errw.print("{s}: {s}\n", .{ cp, @errorName(e) }) catch {};
+        }
+        errw.flush() catch {};
+        std.process.exit(2);
+    };
+
+    // Record which detection-relevant keys the USER's document carried
+    // before preset defaults merge in — a preset-supplied boot_mode or
+    // scheme must not mark the value user-pinned.
+    const user_set_boot = doc.root.get("boot_mode") != null;
+    const user_set_scheme = blk: {
+        const d = doc.root.get("disk") orelse break :blk false;
+        break :blk d == .table and d.table.get("scheme") != null;
+    };
+
+    if (preset) |pp| {
+        engine.preset.mergeDefaults(pp, &doc) catch return oom(errw);
+        const lock_errs = engine.preset.checkLocks(alloc, pp, &doc) catch return oom(errw);
+        for (lock_errs) |e| errw.print("preset: {s}\n", .{e}) catch {};
+        if (lock_errs.len > 0) {
+            errw.flush() catch {};
+            std.process.exit(2);
+        }
+    }
+
+    var cfg = engine.config.decode(alloc, doc) catch {
+        errw.writeAll("config decode failed (see log)\n") catch {};
+        errw.flush() catch {};
+        std.process.exit(2);
+    };
+    // Only user-supplied keys are "explicit" — except preservation
+    // schemes (alongside/manual), where a preset default is
+    // data-preservation policy and must not be overwritten by
+    // detection. A preset's erase scheme still yields to firmware
+    // (efi-swap-root ↔ bios-boot-swap-root).
+    cfg.boot_mode_explicit = user_set_boot;
+    cfg.disk.scheme_explicit = user_set_scheme or blk: {
+        const d = doc.root.get("disk") orelse break :blk false;
+        if (d != .table) break :blk false;
+        const sv = d.table.get("scheme") orelse break :blk false;
+        if (sv != .string) break :blk false;
+        break :blk std.mem.eql(u8, sv.string, "alongside") or std.mem.eql(u8, sv.string, "manual");
+    };
+    return cfg;
+}
+
+fn oom(errw: *std.Io.Writer) noreturn {
+    errw.writeAll("out of memory\n") catch {};
+    errw.flush() catch {};
+    std.process.exit(2);
+}
+
 /// NDJSON protocol surface: hello/detect + the wizard ops (page, set,
 /// next, back, goto, get_config, set_config, validate, plan,
 /// export_answer, install) + quit. See docs/protocol.md.
-fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, errw: *std.Io.Writer, preset: ?*const engine.preset.Preset) !void {
+fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, errw: *std.Io.Writer, preset: ?*const engine.preset.Preset, cfg_path: ?[]const u8) !void {
     _ = init;
-    _ = errw;
     var stdin_buf: [8192]u8 = undefined;
     var fr = std.Io.File.stdin().reader(io, &stdin_buf);
     const r = &fr.interface;
@@ -415,6 +435,10 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
     var wiz = engine.wizard.Wizard.init(alloc, io, .{});
     wiz.preset = preset;
     wiz.applyPresetDefaults() catch {};
+    // `--config` prefills the session per protocol.md — same
+    // file pipeline (defaults merge, lock check, explicit flags) as
+    // the CLI commands, then the wire drives from there.
+    if (cfg_path) |cp| wiz.cfg = loadCliConfig(io, alloc, errw, cp, preset);
     var wiz_arena = std.heap.ArenaAllocator.init(alloc);
     defer wiz_arena.deinit();
 
@@ -553,17 +577,24 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
             // {config:{dotted.path:value,…}} — same as N `set` ops; a
             // field that fails is reported, not silently dropped.
             const cv = jfield(jl, "config");
+            // A missing/wrongly-typed payload is a client error, not a
+            // no-op: replying ok would silently keep the old config.
+            if (cv == null or cv.? != .object) {
+                try writeErr(out, req, "set_config needs a config object");
+                try out.flush();
+                req_arena.deinit();
+                if (at_eof) break;
+                continue;
+            }
             var set_errs: std.Io.Writer.Allocating = .init(req_alloc);
             var nerr: usize = 0;
-            if (cv != null and cv.? == .object) {
-                var it = cv.?.object.iterator();
-                while (it.next()) |kv| {
-                    wiz.setField(kv.key_ptr.*, kv.value_ptr.*) catch |e| {
-                        if (nerr > 0) set_errs.writer.writeAll("; ") catch {};
-                        set_errs.writer.print("{s}: {s}", .{ kv.key_ptr.*, @errorName(e) }) catch {};
-                        nerr += 1;
-                    };
-                }
+            var it = cv.?.object.iterator();
+            while (it.next()) |kv| {
+                wiz.setField(kv.key_ptr.*, kv.value_ptr.*) catch |e| {
+                    if (nerr > 0) set_errs.writer.writeAll("; ") catch {};
+                    set_errs.writer.print("{s}: {s}", .{ kv.key_ptr.*, @errorName(e) }) catch {};
+                    nerr += 1;
+                };
             }
             if (nerr > 0)
                 try writeErr(out, req, set_errs.written())
@@ -791,6 +822,10 @@ fn doInstall(io: std.Io, alloc: std.mem.Allocator, wiz: *engine.wizard.Wizard, o
         }
         if (cfg.security.secure_boot == .shim) {
             try writeErr(out, req, "secure_boot=shim is not executable yet — M6");
+            return;
+        }
+        if (engine.config.execPrechecks(cfg)) |e| {
+            try writeErr(out, req, e);
             return;
         }
         const destructive = cfg.disk.scheme == .@"efi-swap-root" or cfg.disk.scheme == .@"bios-boot-swap-root";
