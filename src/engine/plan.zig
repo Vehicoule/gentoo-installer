@@ -197,10 +197,9 @@ fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) 
     const root_part = partPath(alloc, dev, n);
     // 8304 = Linux root DPS GUID (auto-discovery on systemd)
     try c.append(alloc, argv(alloc, &.{ "sgdisk", s(alloc, "-n{}:0:0", .{n}), s(alloc, "-t{}:8304", .{n}), s(alloc, "-c{}:root", .{n}), dev }, s(alloc, "root partition {} (rest of disk)", .{n})));
-    if (d.home_part) {
-        n += 1;
-        try c.append(alloc, .{ .note = "separate /home part requires an explicit size — TUI asks" });
-    }
+    // Separate /home is an LVM thin LV (or a btrfs @home subvol), never a
+    // standalone partition — validation enforces that pairing.
+    _ = d.home_part;
 
     // ESP filesystem (never reformatted in alongside mode — not reached here).
     if (esp_part) |esp|
@@ -231,11 +230,21 @@ fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) 
         try c.append(alloc, argv(alloc, &.{ "vgcreate", "vg0", root_dev }, "volume group vg0"));
         if (cfg.system.snapshots == .auto) {
             try c.append(alloc, argv(alloc, &.{ "lvcreate", "-l", "95%VG", "-T", "vg0/tank" }, "thin pool tank (95% VG)"));
-            try c.append(alloc, argv(alloc, &.{ "lvcreate", "-V", "100%FREE", "-T", "vg0/tank", "-n", "root" }, "thin root LV"));
-            if (d.home_part)
-                try c.append(alloc, argv(alloc, &.{ "lvcreate", "-V", "50%FREE", "-T", "vg0/tank", "-n", "home" }, "thin home LV"));
+            // -V %FREE is a share of the thin POOL, not the VG: give root
+            // 70% when a home LV follows, else the whole pool. Thin
+            // overcommit makes both caps soft.
+            const root_pct = if (d.home_part and d.root_fs != .btrfs) "70%FREE" else "100%FREE";
+            try c.append(alloc, argv(alloc, &.{ "lvcreate", "-V", root_pct, "-T", "vg0/tank", "-n", "root" }, "thin root LV"));
+            if (d.home_part and d.root_fs != .btrfs) {
+                try c.append(alloc, argv(alloc, &.{ "lvcreate", "-V", "100%FREE", "-T", "vg0/tank", "-n", "home" }, "thin home LV (remaining pool)"));
+                try c.append(alloc, argv(alloc, &.{ s(alloc, "mkfs.{s}", .{@tagName(d.root_fs)}), "/dev/vg0/home" }, "format home LV"));
+            }
         } else {
-            try c.append(alloc, argv(alloc, &.{ "lvcreate", "-l", "100%FREE", "-n", "root", "vg0" }, "linear root LV"));
+            try c.append(alloc, argv(alloc, &.{ "lvcreate", "-l", "70%VG", "-n", "root", "vg0" }, "linear root LV (70% VG)"));
+            if (d.home_part and d.root_fs != .btrfs) {
+                try c.append(alloc, argv(alloc, &.{ "lvcreate", "-l", "100%FREE", "-n", "home", "vg0" }, "linear home LV (rest of VG)"));
+                try c.append(alloc, argv(alloc, &.{ s(alloc, "mkfs.{s}", .{@tagName(d.root_fs)}), "/dev/vg0/home" }, "format home LV"));
+            }
         }
         fs_dev = "/dev/vg0/root";
     }
@@ -314,6 +323,11 @@ fn planMount(alloc: Allocator, cfg: *const Config) !Step {
         const swap_n: u32 = if (cfg.boot_mode == .uefi) 2 else 2;
         try c.append(alloc, argv(alloc, &.{ "swapon", partPath(alloc, cfg.disk.device, swap_n) }, "enable swap"));
     }
+    // LVM thin home LV (non-btrfs roots only).
+    if (cfg.disk.lvm and cfg.disk.home_part and cfg.disk.root_fs != .btrfs) {
+        try c.append(alloc, argv(alloc, &.{ "mkdir", "-p", "/mnt/gentoo/home" }, "/home mountpoint"));
+        try c.append(alloc, argv(alloc, &.{ "mount", "/dev/vg0/home", "/mnt/gentoo/home" }, "mount home LV"));
+    }
     // btrfs: mount the home + snapshots subvolumes created earlier.
     if (cfg.disk.root_fs == .btrfs) {
         const dev = root.dev;
@@ -346,10 +360,15 @@ fn planStage3(alloc: Allocator, cfg: *const Config) !Step {
         .desc = "download stage3 tarball + .asc + .DIGESTS (resolved from latest.txt)",
     } });
     try c.append(alloc, argv(alloc, &.{ "gpg", "--keyserver", "hkps://keys.gentoo.org", "--verify", "/tmp/stage3.tar.xz.asc", "/tmp/stage3.tar.xz" }, "GPG-verify stage3"));
-    // DIGESTS mixes SHA256/SHA512/WHIRLPOOL lines — feed sha256sum only the 64-hex lines.
+    // DIGESTS mixes SHA256/SHA512/WHIRLPOOL lines — extract our tarball's
+    // SHA256 entry and refuse vacuous success when it is absent.
     try c.append(alloc, .{ .exec = .{
-        .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", "grep -E '^[0-9a-f]{64}  ' /tmp/stage3.DIGESTS | (cd /tmp && sha256sum -c --ignore-missing -)" }),
-        .desc = "digest-verify stage3 (SHA256 lines only)",
+        .argv = try alloc.dupe([]const u8, &.{ "sh", "-c",
+            "b=$(basename \"$(readlink -f /tmp/stage3.tar.xz)\"); " ++
+            "awk -v f=\"$b\" '$2 == f && length($1) == 64' /tmp/stage3.DIGESTS > /tmp/stage3.sha256; " ++
+            "test -s /tmp/stage3.sha256 || { echo 'no SHA256 digest entry for stage3' >&2; exit 1; }; " ++
+            "(cd /tmp && sha256sum -c /tmp/stage3.sha256)" }),
+        .desc = "digest-verify stage3 (SHA256 entry for the tarball)",
     } });
     try c.append(alloc, argv(alloc, &.{ "tar", "--xattrs-include=*.*", "--numeric-owner", "-xpf", "/tmp/stage3.tar.xz", "-C", "/mnt/gentoo" }, "extract stage3"));
     return step(alloc, "stage3", "Stage3 download + extract", c);
@@ -543,19 +562,8 @@ fn planKernel(alloc: Allocator, cfg: *const Config) !Step {
         .chroot = true,
         .desc = "firmware + CPU microcode",
     } });
-    switch (cfg.system.kernel) {
-        .@"dist-bin" => try c.append(alloc, .{ .exec = .{
-            .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-kernel/gentoo-kernel-bin" }),
-            .chroot = true,
-            .desc = "prebuilt dist kernel",
-        } }),
-        .dist => try c.append(alloc, .{ .exec = .{
-            .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-kernel/gentoo-kernel" }),
-            .chroot = true,
-            .desc = "dist kernel (compiled)",
-        } }),
-        .manual => try c.append(alloc, .{ .note = "manual kernel: emerge gentoo-sources + user config (expert flow)" }),
-    }
+    // The initramfs generator must exist before the kernel emerges —
+    // the kernel package's installkernel hooks call it.
     switch (cfg.system.initramfs) {
         .dracut => try c.append(alloc, .{ .exec = .{
             .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-kernel/dracut" }),
@@ -568,6 +576,19 @@ fn planKernel(alloc: Allocator, cfg: *const Config) !Step {
             .desc = "ugrd initramfs",
         } }),
         .none => {},
+    }
+    switch (cfg.system.kernel) {
+        .@"dist-bin" => try c.append(alloc, .{ .exec = .{
+            .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-kernel/gentoo-kernel-bin" }),
+            .chroot = true,
+            .desc = "prebuilt dist kernel",
+        } }),
+        .dist => try c.append(alloc, .{ .exec = .{
+            .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-kernel/gentoo-kernel" }),
+            .chroot = true,
+            .desc = "dist kernel (compiled)",
+        } }),
+        .manual => try c.append(alloc, .{ .note = "manual kernel: emerge gentoo-sources + user config (expert flow)" }),
     }
     // GPU driver packages
     switch (cfg.gpu.driver) {
@@ -611,6 +632,8 @@ fn planFstab(alloc: Allocator, cfg: *const Config) !Step {
         try w.print("{s}\tnone\tswap\tsw\t0 0\n", .{partPath(alloc, cfg.disk.device, 2)});
     if (cfg.disk.boot_part)
         try w.print("{s}\t/boot\text4\tdefaults\t0 2\n", .{partPath(alloc, cfg.disk.device, bootPartIdx(cfg))});
+    if (cfg.disk.lvm and cfg.disk.home_part and cfg.disk.root_fs != .btrfs)
+        try w.print("/dev/vg0/home\t/home\t{s}\tdefaults\t0 2\n", .{@tagName(cfg.disk.root_fs)});
     if (cfg.disk.root_fs == .btrfs) {
         try w.print("{s}\t/home\tbtrfs\tsubvol=@home,compress=zstd:1,noatime\t0 2\n", .{root.dev});
         try w.print("{s}\t/.snapshots\tbtrfs\tsubvol=@snapshots,compress=zstd:1,noatime\t0 2\n", .{root.dev});

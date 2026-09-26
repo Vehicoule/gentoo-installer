@@ -150,7 +150,13 @@ pub fn main(init: std.process.Init) !void {
     if (cfg.arch == .detect or cmd == .run) {
         env_opt = engine.detect.detect(alloc, io) catch null;
         if (env_opt) |*e| {
-            if (cfg.arch == .detect) cfg.arch = e.arch;
+            if (cfg.arch == .detect) {
+                cfg.arch = e.arch;
+            } else if (cfg.arch != e.arch and cmd == .run and !dry_run) {
+                try errw.print("config arch {s} does not match detected {s} — refusing to exec a foreign-arch install\n", .{ @tagName(cfg.arch), @tagName(e.arch) });
+                try errw.flush();
+                std.process.exit(2);
+            }
             // boot_mode: detection fills the default; an explicit config
             // value wins, and a mismatch is a hard stop.
             if (!cfg.boot_mode_explicit) {
@@ -160,6 +166,9 @@ pub fn main(init: std.process.Init) !void {
                 try errw.flush();
                 std.process.exit(2);
             }
+            // scheme follows boot_mode unless the config pinned one.
+            if (!cfg.disk.scheme_explicit and cfg.boot_mode == .bios)
+                cfg.disk.scheme = .@"bios-boot-swap-root";
         }
     }
 
@@ -229,16 +238,24 @@ pub fn main(init: std.process.Init) !void {
     });
 }
 
-/// Extract the string value of a top-level `"op"` key from an NDJSON
-/// line. Minimal extractor — full JSON parse arrives with the M2 op set.
-fn opField(line: []const u8) ?[]const u8 {
-    const k = std.mem.indexOf(u8, line, "\"op\"") orelse return null;
-    var i = k + 4;
-    while (i < line.len and (line[i] == ' ' or line[i] == ':')) i += 1;
-    if (i >= line.len or line[i] != '"') return null;
-    const start = i + 1;
-    const end = std.mem.indexOfScalarPos(u8, line, start, '"') orelse return null;
-    return line[start..end];
+const JsonLine = struct { op: ?[]const u8, req: ?u64, malformed: bool };
+
+/// Parse one NDJSON request line; op must be a string, req a non-negative
+/// integer. Non-object or invalid JSON reports `malformed`.
+fn parseLine(alloc: std.mem.Allocator, line: []const u8) JsonLine {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch
+        return .{ .op = null, .req = null, .malformed = true };
+    if (parsed.value != .object) return .{ .op = null, .req = null, .malformed = true };
+    const obj = parsed.value.object;
+    var op: ?[]const u8 = null;
+    var req: ?u64 = null;
+    if (obj.get("op")) |ov| {
+        if (ov == .string) op = ov.string;
+    }
+    if (obj.get("req")) |rv| {
+        if (rv == .integer and rv.integer >= 0) req = @intCast(rv.integer);
+    }
+    return .{ .op = op, .req = req, .malformed = false };
 }
 
 fn fatal(w: *std.Io.Writer, msg: []const u8) noreturn {
@@ -261,30 +278,37 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
     defer line_buf.deinit();
     while (true) {
         line_buf.clearRetainingCapacity();
-        // streamDelimiter leaves the delimiter buffered; consume it and
-        // treat a peek failure as EOF.
-        _ = r.streamDelimiter(&line_buf.writer, '\n') catch |e| switch (e) {
-            error.EndOfStream => break,
-            else => return e,
-        };
-        const line = std.mem.trim(u8, line_buf.written(), " \r\n\t");
-        // Consume the newline streamDelimiter left buffered — on EVERY
-        // path — so a bad line can't be re-read forever. Peek failure
-        // = EOF: process this last line, then the loop breaks.
+        // streamDelimiter leaves the delimiter buffered; consume it. An
+        // EndOfStream with bytes still processes the unterminated final
+        // line before breaking.
         var at_eof = false;
-        if (r.peekGreedy(1)) |avail| {
-            if (avail.len > 0 and avail[0] == '\n') r.toss(1);
-        } else |_| at_eof = true;
+        if (r.streamDelimiter(&line_buf.writer, '\n')) |_| {
+            if (r.peekGreedy(1)) |avail| {
+                if (avail.len > 0 and avail[0] == '\n') r.toss(1);
+            } else |_| at_eof = true;
+        } else |e| switch (e) {
+            error.EndOfStream => at_eof = true,
+            else => return e,
+        }
+        const line = std.mem.trim(u8, line_buf.written(), " \r\n\t");
         if (line.len == 0) {
             if (at_eof) break;
             continue;
         }
-        const op = opField(line) orelse {
-            try writeErr(out, reqField(line), "missing op");
+        const jl = parseLine(alloc, line);
+        if (jl.malformed) {
+            try writeErr(out, null, "invalid json");
             try out.flush();
+            if (at_eof) break;
+            continue;
+        }
+        const req = jl.req;
+        const op = jl.op orelse {
+            try writeErr(out, req, "missing op");
+            try out.flush();
+            if (at_eof) break;
             continue;
         };
-        const req = reqField(line);
         if (std.mem.eql(u8, op, "hello")) {
             // the hello reply doubles as ready, per docs/protocol.md
             try out.writeAll("{\"ev\":\"hello\",");
@@ -310,6 +334,7 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
             try writeErr(out, req, aw.written());
         }
         try out.flush();
+        if (at_eof) break;
     }
 }
 
@@ -337,15 +362,4 @@ fn jsonEsc(w: *std.Io.Writer, str: []const u8) void {
             else => if (ch < 0x20) w.print("\\u{x:0>4}", .{ch}) catch return else w.writeByte(ch) catch return,
         }
     }
-}
-
-/// Extract a top-level integer `"req"` token (echo correlation).
-fn reqField(line: []const u8) ?u64 {
-    const k = std.mem.indexOf(u8, line, "\"req\"") orelse return null;
-    var i = k + 5;
-    while (i < line.len and (line[i] == ' ' or line[i] == ':')) i += 1;
-    var end = i;
-    while (end < line.len and line[end] >= '0' and line[end] <= '9') end += 1;
-    if (end == i) return null;
-    return std.fmt.parseInt(u64, line[i..end], 10) catch null;
 }

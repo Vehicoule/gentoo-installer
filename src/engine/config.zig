@@ -49,6 +49,9 @@ pub const Config = struct {
         swap: Swap = .zram,
         swap_mib: u32 = 4096,
         boot_part: bool = false,
+        /// whether `scheme` appeared in the document (detection may pick
+        /// the matching default scheme)
+        scheme_explicit: bool = false,
         luks: bool = false,
         lvm: bool = false,
         /// Exec-mode LUKS passphrase (fed to cryptsetup on stdin; never
@@ -219,7 +222,10 @@ pub fn decode(alloc: Allocator, doc: toml.Document) DecodeError!Config {
         const t = try tableOf(v, "disk");
         if (field(t, "device")) |x| cfg.disk.device = try strOr(x, "disk.device");
         if (field(t, "wipe")) |x| cfg.disk.wipe = try boolOr(x, "disk.wipe");
-        if (field(t, "scheme")) |x| cfg.disk.scheme = try enumOr(Scheme, x, "disk.scheme");
+        if (field(t, "scheme")) |x| {
+            cfg.disk.scheme = try enumOr(Scheme, x, "disk.scheme");
+            cfg.disk.scheme_explicit = true;
+        }
         if (field(t, "root_fs")) |x| cfg.disk.root_fs = try enumOr(RootFs, x, "disk.root_fs");
         if (field(t, "swap")) |x| cfg.disk.swap = try enumOr(Swap, x, "disk.swap");
         if (field(t, "swap_mib")) |x| cfg.disk.swap_mib = try intOr(x, "disk.swap_mib");
@@ -427,6 +433,11 @@ pub fn validate(alloc: Allocator, cfg: *const Config, has_nvidia: ?bool) ![][]co
         if (hasCtl(v) or hasShellMeta(v))
             try errs.append(alloc, "makeconf.cflags contains shell metacharacters — portage sources make.conf");
     }
+    // make.conf is SOURCED by portage — every interpolated string needs a
+    // shell-metacharacter deny-set, not just control chars.
+    for ([_][]const u8{ cfg.makeconf.video_cards, cfg.makeconf.accept_license }) |v| {
+        if (hasShellMeta(v)) try errs.append(alloc, fmt(alloc, "'{s}' contains shell metacharacters — portage sources make.conf", .{v}));
+    }
     // URLs interpolated into sh -c strings must be plain URL charset.
     if (!urlSafe(cfg.stage3.mirror))
         try errs.append(alloc, "stage3.mirror contains characters outside URL charset");
@@ -454,6 +465,10 @@ pub fn validate(alloc: Allocator, cfg: *const Config, has_nvidia: ?bool) ![][]co
         try errs.append(alloc, "network.manager=netifrc requires init=openrc");
     if (cfg.network.manager == .@"systemd-networkd" and cfg.system.init != .systemd)
         try errs.append(alloc, "network.manager=systemd-networkd requires init=systemd");
+    // A standalone /home partition is not provisioned — separate home is
+    // an LVM LV or the btrfs @home subvol.
+    if (cfg.disk.home_part and !cfg.disk.lvm and cfg.disk.root_fs != .btrfs)
+        try errs.append(alloc, "disk.home_part requires lvm=true (thin home LV) — btrfs roots already get @home");
     // usernames become filesystem paths (/home/<name>) and useradd args.
     for (cfg.users) |u| {
         if (!posixName(u.name))
@@ -476,7 +491,7 @@ pub fn validate(alloc: Allocator, cfg: *const Config, has_nvidia: ?bool) ![][]co
     }
     var uit = cfg.use.global.iterator();
     while (uit.next()) |kv| {
-        if (hasCtl(kv.key_ptr.*)) try errs.append(alloc, "USE flag name has control characters");
+        if (!useFlagOk(kv.key_ptr.*)) try errs.append(alloc, fmt(alloc, "USE flag '{s}' has characters outside the USE charset", .{kv.key_ptr.*}));
     }
 
     if (cfg.disk.scheme == .alongside) {
@@ -558,6 +573,17 @@ fn hasShellMeta(v: []const u8) bool {
 }
 
 // URL allowlist: scheme://host/path chars only.
+// USE flag names: letters, digits, _ - + @ (e.g. wayland, l10n_de)
+fn useFlagOk(v: []const u8) bool {
+    if (v.len == 0) return false;
+    for (v) |ch| {
+        const ok = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+            (ch >= '0' and ch <= '9') or ch == '_' or ch == '-' or ch == '+' or ch == '@';
+        if (!ok) return false;
+    }
+    return true;
+}
+
 fn urlSafe(v: []const u8) bool {
     if (v.len == 0) return false;
     for (v) |ch| {
