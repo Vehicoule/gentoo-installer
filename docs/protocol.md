@@ -71,7 +71,7 @@ journal. (`repair` in-protocol is the same engine path as the
 | ev | fields | when |
 |---|---|---|
 | `hello` | `engine`, `version`, `caps[]` | handshake reply — doubles as `ready` |
-| `result` | `req`, `ok:true`, `data?` | ack for mutation ops (`set`, `answer`, `retry`…) |
+| `result` | `req?`, `ok:true`, `data?` | ack for mutation ops (`set`, `answer`, `retry`…); `req` omitted when the op didn't send one |
 | `env` | `boot`, `arch`, `ram_mib`, `net`, `disks[]`, `oses[]`, `esps[]`, `live_media` | after `detect`; also pushed when hotplug changes disks |
 | `config` | `config` (secrets masked) | `get_config` reply |
 | `page` | `page` (name), `index`, `of`, `title`, `fields[]`, `actions[]` | navigation replies |
@@ -136,6 +136,11 @@ GUI as dialogs; `--config` runs print and exit non-zero.
 require caps and degrade otherwise. Adding ops/events/fields is a minor
 bump — consumers ignore unknown keys; removing/renaming is a major bump.
 
+This document is the draft contract — no wire version is frozen until
+the first engine implementation ships; `version` starts at 1 then.
+Everything here is pre-implementation, so edits to this file may
+restructure fields freely; they are not breaking changes yet.
+
 ## Annotated session
 
 ```jsonl
@@ -155,8 +160,8 @@ bump — consumers ignore unknown keys; removing/renaming is a major bump.
 ← {"ev":"step","i":1,"of":16,"name":"detect","state":"done","secs":0.8}
 ← {"ev":"step","i":2,"of":16,"name":"partition","state":"started"}
 ← {"ev":"ask","ask":"a1","kind":"confirm","prompt":"Wipe /dev/nvme0n1? type nvme0n1"}
-→ {"op":"answer","ask":"a1","value":"nvme0n1"}
-← {"ev":"result","ok":true}
+→ {"op":"answer","ask":"a1","value":"nvme0n1","req":5}
+← {"ev":"result","req":5,"ok":true}
 ← {"ev":"log","step":2,"stream":"out","line":"Created new GPT entries"}
 ← {"ev":"step","i":2,"state":"done","secs":3.1}
 ← {"ev":"done","ok":true,"summary":{"hostname":"gentoo","users":["larry"]}}
