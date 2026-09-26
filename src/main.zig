@@ -288,8 +288,13 @@ pub fn main(init: std.process.Init) !void {
             const resolved: ?[]const u8 = if (rlen) |n| rbuf[0..n] else null;
             for (e.disks) |dk| {
                 if (std.mem.eql(u8, dk.path, cfg.disk.device) or
-                    (resolved != null and std.mem.eql(u8, dk.path, resolved.?)))
+                    (resolved != null and std.mem.eql(u8, dk.path, resolved.?))) {
                     size_mib = dk.size_bytes / (1 << 20);
+                    // Canonicalize to the kernel path: partPath appends
+                    // 1/pN while udev names by-id partitions <id>-partN —
+                    // planning must target the resolved device.
+                    cfg.disk.device = dk.path;
+                }
             }
         }
         if (size_mib) |sz| {
