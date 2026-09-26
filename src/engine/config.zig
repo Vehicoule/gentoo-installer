@@ -22,6 +22,10 @@ pub const Privilege = enum { doas, sudo, none };
 pub const Snapshots = enum { auto, off };
 pub const Cflags = union(enum) { safe, native, custom: []const u8 };
 pub const GpuDriver = enum { auto, nouveau, @"nvidia-open", @"nvidia-drivers" };
+
+/// What detection knows about NVIDIA hardware: absent, present but
+/// pre-Turing (open modules unsupported), or open-module capable.
+pub const NvidiaTier = enum { absent, legacy, open_capable };
 pub const NetManager = enum { networkmanager, dhcpcd, netifrc, @"systemd-networkd" };
 pub const SecureBoot = enum { off, sbctl, shim };
 pub const Hardening = enum { standard, hardened, @"hardened-selinux" };
@@ -400,7 +404,7 @@ pub fn stage3Stem(alloc: Allocator, cfg: *const Config) ![]const u8 {
 /// VALIDATE: returns a list of violations (empty = valid). `env` may be
 /// null when hardware detection hasn't run (unattended dry-run still
 /// checks what it can).
-pub fn validate(alloc: Allocator, cfg: *const Config, has_nvidia: ?bool) ![][]const u8 {
+pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]const u8 {
     var errs: std.ArrayList([]const u8) = .empty;
 
     if (cfg.disk.device.len == 0)
@@ -582,10 +586,19 @@ pub fn validate(alloc: Allocator, cfg: *const Config, has_nvidia: ?bool) ![][]co
         try errs.append(alloc, "no surviving login path: set a password_hash, or sshd=true plus ssh_authorized_keys");
 
     if (cfg.gpu.driver == .@"nvidia-open") {
-        if (has_nvidia) |nv| {
-            if (!nv) try errs.append(alloc, "gpu.driver=nvidia-open but no NVIDIA GPU detected");
-        }
+        if (nvidia) |t| switch (t) {
+            .absent => try errs.append(alloc, "gpu.driver=nvidia-open but no NVIDIA GPU detected"),
+            .legacy => try errs.append(alloc, "gpu.driver=nvidia-open requires a Turing-or-newer NVIDIA GPU — use nvidia-drivers or nouveau on this card"),
+            .open_capable => {},
+        };
     }
+    // security.selinux and hardening are one decision: the SELinux
+    // toolchain/policy ships in the hardened-selinux stage3, so the two
+    // fields must agree or the tarball contradicts the setting.
+    if (cfg.security.selinux and cfg.security.hardening != .@"hardened-selinux")
+        try errs.append(alloc, "security.selinux=true requires hardening=hardened-selinux (policy + toolchain live in that stage3)");
+    if (!cfg.security.selinux and cfg.security.hardening == .@"hardened-selinux")
+        try errs.append(alloc, "security.selinux=false contradicts hardening=hardened-selinux — use hardening=hardened");
 
     // locale must be a member of locales
     var found = false;
@@ -690,12 +703,19 @@ fn tzOk(v: []const u8) bool {
     return true;
 }
 
-// A portage atom passed as emerge argv: no leading '-' (would be a
-// portage option), no whitespace or control chars (would split lines in
-// generated files / extra argv).
+// A portage atom passed as emerge argv and written into package.use:
+// the atom grammar charset only (cat/pkg[-ver][:slot][use] + repo), no
+// leading '-', no whitespace. Anything else can't be a valid atom.
 fn atomOk(v: []const u8) bool {
     if (v.len == 0 or v.len > 128 or v[0] == '-') return false;
-    for (v) |ch| if (ch <= ' ' or ch == 0x7f) return false;
+    for (v) |ch| {
+        const ok = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+            (ch >= '0' and ch <= '9') or ch == '_' or ch == '+' or ch == '.' or
+            ch == '/' or ch == '-' or ch == ':' or ch == '@' or ch == '~' or
+            ch == '<' or ch == '>' or ch == '=' or ch == '!' or ch == '*' or
+            ch == '[' or ch == ']' or ch == '?';
+        if (!ok) return false;
+    }
     return true;
 }
 

@@ -25,6 +25,7 @@ pub const Env = struct {
     arch: config.Arch,
     ram_mib: u64,
     cpu_count: u32,
+    cpu_vendor: []const u8,
     cpu_flags: []const []const u8,
     /// non-loopback network interface names (/sys/class/net)
     nics: []const []const u8,
@@ -45,6 +46,14 @@ fn trim(s: []const u8) []const u8 {
     return std.mem.trim(u8, s, " \t\r\n");
 }
 
+// readFile with a 1 MiB heap buffer — for procfs files too big for
+// readSmall's stack buffer (cpuinfo on multicore hosts).
+fn readBig(alloc: Allocator, io: std.Io, path: []const u8) ?[]const u8 {
+    const buf = alloc.alloc(u8, 1 << 20) catch return null;
+    const data = std.Io.Dir.cwd().readFile(io, path, buf) catch return null;
+    return data;
+}
+
 pub fn detect(alloc: Allocator, io: std.Io) !Env {
     var env: Env = .{
         .boot_mode = .bios,
@@ -56,6 +65,7 @@ pub fn detect(alloc: Allocator, io: std.Io) !Env {
         },
         .ram_mib = 0,
         .cpu_count = 1,
+        .cpu_vendor = "",
         .cpu_flags = &.{},
         .nics = &.{},
         .gpus = &.{},
@@ -84,12 +94,18 @@ pub fn detect(alloc: Allocator, io: std.Io) !Env {
 
     // CPU flags: the `flags` line of /proc/cpuinfo (x86); other arches
     // expose different names — we just record whatever is there.
-    if (readSmall(alloc, io, "/proc/cpuinfo")) |cpuinfo| {
+    // cpuinfo grows ~1-2 KiB per core — read it into a large heap
+    // buffer, not the 4 KiB readSmall one (truncated counts → -j1).
+    if (readBig(alloc, io, "/proc/cpuinfo")) |cpuinfo| {
         var lines = std.mem.splitScalar(u8, cpuinfo, '\n');
         var ncpu: u32 = 0;
         var got_flags = false;
         while (lines.next()) |line| {
             if (std.mem.startsWith(u8, line, "processor")) ncpu += 1;
+            if (std.mem.startsWith(u8, line, "vendor_id")) {
+                if (std.mem.indexOfScalar(u8, line, ':')) |colon|
+                    env.cpu_vendor = trim(line[colon + 1 ..]);
+            }
             // flags/Features repeats per-processor — take the first only,
             // but keep scanning so cpu_count sees every processor stanza.
             if (!got_flags and (std.mem.startsWith(u8, line, "flags") or std.mem.startsWith(u8, line, "Features"))) {
@@ -244,7 +260,7 @@ pub fn envToJson(alloc: Allocator, env: *const Env, w: *std.Io.Writer) !void {
 pub fn envFieldsJson(alloc: Allocator, env: *const Env, w: *std.Io.Writer) !void {
     try w.writeAll("\"boot\":\"");
     try w.writeAll(@tagName(env.boot_mode));
-    try w.print("\",\"arch\":\"{s}\",\"ram_mib\":{},\"cpus\":{},\"net\":{},", .{ @tagName(env.arch), env.ram_mib, env.cpu_count, env.net_reachable });
+    try w.print("\",\"arch\":\"{s}\",\"ram_mib\":{},\"cpus\":{},\"cpu_vendor\":\"{s}\",\"net\":{},", .{ @tagName(env.arch), env.ram_mib, env.cpu_count, env.cpu_vendor, env.net_reachable });
     try w.writeAll("\"nics\":[");
     for (env.nics, 0..) |nic, i| {
         if (i > 0) try w.writeAll(",");

@@ -187,12 +187,16 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    const nvidia = if (env_opt) |*e| blk: {
-        var has = false;
+    const nvidia: ?engine.config.NvidiaTier = if (env_opt) |*e| blk: {
+        var any = false;
+        var turing = false;
         for (e.gpus) |g| {
-            if (std.mem.eql(u8, g.vendor, "nvidia")) has = true;
+            if (std.mem.eql(u8, g.vendor, "nvidia")) {
+                any = true;
+                if (engine.detect.nvidiaIsTuringPlus(g)) turing = true;
+            }
         }
-        break :blk has;
+        break :blk if (!any) .absent else if (turing) .open_capable else .legacy;
     } else null;
 
     const errs = try engine.config.validate(alloc, &cfg, nvidia);

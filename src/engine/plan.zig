@@ -126,7 +126,7 @@ pub fn build(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, pkg_
     if (cfg.extra.update_world)
         try steps.append(alloc, try planWorldUpdate(alloc, cfg));
     try steps.append(alloc, try planBaseConfig(alloc, cfg));
-    try steps.append(alloc, try planKernel(alloc, cfg));
+    try steps.append(alloc, try planKernel(alloc, cfg, env));
     try steps.append(alloc, try planFstab(alloc, cfg));
     try steps.append(alloc, try planSystemConfig(alloc, cfg));
     try steps.append(alloc, try planServices(alloc, cfg, env));
@@ -230,16 +230,14 @@ fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) 
         try c.append(alloc, argv(alloc, &.{ "vgcreate", "vg0", root_dev }, "volume group vg0"));
         if (cfg.system.snapshots == .auto) {
             try c.append(alloc, argv(alloc, &.{ "lvcreate", "-l", "95%VG", "-T", "vg0/tank" }, "thin pool tank (95% VG)"));
-            // -V %FREE is a share of the thin POOL, not the VG: give root
-            // 70% when a home LV follows, else the whole pool. Thin
-            // overcommit makes both caps soft.
-            // -l %FREE on a thin LV is a share of the thin POOL's free
-            // space — the unambiguous spelling (a %-sized -V is not
-            // accepted by all lvm versions).
+            // Thin LVs take -V (virtual size); for a thin LV, %FREE means
+            // a share of the thin POOL's free space — give root 70% when
+            // a home LV follows, else the whole pool (overcommit is
+            // intended: caps are soft, the pool is 95% of the VG).
             const root_pct = if (d.home_part and d.root_fs != .btrfs) "70%FREE" else "100%FREE";
-            try c.append(alloc, argv(alloc, &.{ "lvcreate", "-l", root_pct, "-T", "vg0/tank", "-n", "root" }, "thin root LV"));
+            try c.append(alloc, argv(alloc, &.{ "lvcreate", "-V", root_pct, "-T", "vg0/tank", "-n", "root" }, "thin root LV"));
             if (d.home_part and d.root_fs != .btrfs) {
-                try c.append(alloc, argv(alloc, &.{ "lvcreate", "-l", "100%FREE", "-T", "vg0/tank", "-n", "home" }, "thin home LV (remaining pool)"));
+                try c.append(alloc, argv(alloc, &.{ "lvcreate", "-V", "100%FREE", "-T", "vg0/tank", "-n", "home" }, "thin home LV (remaining pool)"));
                 try c.append(alloc, argv(alloc, &.{ s(alloc, "mkfs.{s}", .{@tagName(d.root_fs)}), "/dev/vg0/home" }, "format home LV"));
             }
         } else {
@@ -285,6 +283,17 @@ fn rootMountArgs(alloc: Allocator, cfg: *const Config) struct { dev: []const u8,
 
 /// The device node that carries the root filesystem (through LUKS/LVM).
 /// Kernel command line shared by every bootloader backend.
+///
+/// Shell fragment staging the newest initramfs onto the boot volume —
+/// empty when initramfs=none so a validated no-initramfs config doesn't
+/// fail the step.
+fn initrdStage(alloc: Allocator, cfg: *const Config, dir: []const u8) []const u8 {
+    if (cfg.system.initramfs == .none) return "";
+    return s(alloc,
+        "i=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img 2>/dev/null | head -n1); " ++
+        "[ -n \"$i\" ] || {{ echo 'no initramfs to stage' >&2; exit 1; }}; " ++
+        "cp -f \"$i\" {s}/initramfs.img", .{dir});
+}
 fn kernelArgs(alloc: Allocator, cfg: *const Config) []const u8 {
     var r = s(alloc, "root={s}", .{fsDevice(alloc, cfg)});
     // btrfs: install mounted subvol=@root — boot must select it too.
@@ -440,8 +449,8 @@ fn makeConf(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) ![]co
 
     var accept = cfg.makeconf.accept_license;
     var nv_buf: [64]u8 = undefined;
-    const wants_nvidia = cfg.gpu.driver == .@"nvidia-open" or cfg.gpu.driver == .@"nvidia-drivers" or
-        (cfg.gpu.driver == .auto and env != null and hasTuringNvidia(env.?));
+    const drv = resolveGpuDriver(cfg, env);
+    const wants_nvidia = drv == .@"nvidia-open" or drv == .@"nvidia-drivers";
     if (wants_nvidia) {
         accept = std.fmt.bufPrint(&nv_buf, "{s} NVIDIA", .{cfg.makeconf.accept_license}) catch cfg.makeconf.accept_license;
     }
@@ -507,12 +516,18 @@ fn planPortage(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !S
     try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/repos.conf/gentoo.conf", "[gentoo]\nlocation = /var/db/repos/gentoo\nsync-type = webrsync\n"));
     if (cfg.system.binhost) {
         // Gentoo ships binhosts per arch+ABI dir; riscv64 has none.
+        // arch==detect is unreachable in real flows (main resolves it
+        // from detection) but reachable from tests with env=null.
+        if (cfg.arch == .detect) {
+            try c.append(alloc, .{ .note = "binhost sync-uri resolved after hardware detection" });
+        } else {
         const abi_dir = switch (cfg.arch) {
             .amd64 => "x86-64",
             .arm64 => "arm64",
-            else => unreachable, // validate() rejects binhost off amd64/arm64
+            .riscv64, .detect => unreachable, // validate() rejects binhost on riscv64
         };
         try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/binrepos.conf/gentoobinhost.conf", s(alloc, "[gentoobinhost]\npriority = 9999\nsync-uri = https://distfiles.gentoo.org/releases/{s}/binpackages/23.0/{s}/\n", .{ @tagName(cfg.arch), abi_dir })));
+        }
     }
     // LUKS root: crypttab names the GPT partlabel (-cN:root). Written here
     // — before the kernel emerge — so installkernel's initramfs generation
@@ -591,13 +606,13 @@ fn planBaseConfig(alloc: Allocator, cfg: *const Config) !Step {
     return step(alloc, "base-config", "Base system config", c);
 }
 
-fn planKernel(alloc: Allocator, cfg: *const Config) !Step {
+fn planKernel(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !Step {
     var c: std.ArrayList(Cmd) = .empty;
     // firmware + microcode
     var fw_atoms: std.ArrayList([]const u8) = .empty;
     try fw_atoms.append(alloc, "sys-kernel/linux-firmware");
     try fw_atoms.append(alloc, "media-sound/sof-firmware");
-    if (envNeedsIntelUcode(cfg)) try fw_atoms.append(alloc, "sys-firmware/intel-microcode");
+    if (ucodeAtom(cfg, env)) |atom| try fw_atoms.append(alloc, atom);
     try c.append(alloc, .{ .exec = .{
         .argv = try prepend(alloc, "emerge", fw_atoms.items),
         .chroot = true,
@@ -631,8 +646,9 @@ fn planKernel(alloc: Allocator, cfg: *const Config) !Step {
         } }),
         .manual => try c.append(alloc, .{ .note = "manual kernel: emerge gentoo-sources + user config (expert flow)" }),
     }
-    // GPU driver packages
-    switch (cfg.gpu.driver) {
+    // GPU driver packages — resolve `auto` the same way make.conf's
+    // VIDEO_CARDS / ACCEPT_LICENSE do (Turing+ → nvidia-open).
+    switch (resolveGpuDriver(cfg, env)) {
         .@"nvidia-open" => try c.append(alloc, .{ .exec = .{
             .argv = try alloc.dupe([]const u8, &.{ "emerge", "x11-drivers/nvidia-drivers[kernel-open]" }),
             .chroot = true,
@@ -648,9 +664,24 @@ fn planKernel(alloc: Allocator, cfg: *const Config) !Step {
     return step(alloc, "firmware-kernel", "Firmware + kernel", c);
 }
 
-fn envNeedsIntelUcode(cfg: *const Config) bool {
-    _ = cfg;
-    return true; // detection refines at runtime; x86 hosts overwhelmingly intel/amd
+/// gpu.driver=auto resolves once against detected hardware: a
+/// Turing-or-newer NVIDIA GPU gets the open kernel modules, anything
+/// else falls back to nouveau (in-kernel; nothing to emerge).
+pub fn resolveGpuDriver(cfg: *const Config, env: ?*const detect.Env) config.GpuDriver {
+    if (cfg.gpu.driver != .auto) return cfg.gpu.driver;
+    if (env) |e| if (hasTuringNvidia(e)) return .@"nvidia-open";
+    return .nouveau;
+}
+
+// Microcode emerges only on amd64 — arm64/riscv64 get it via
+// linux-firmware; on AMD hosts linux-firmware already carries amd-ucode,
+// so a separate package is needed only for Intel.
+fn ucodeAtom(cfg: *const Config, env: ?*const detect.Env) ?[]const u8 {
+    if (cfg.arch != .amd64) return null;
+    if (env) |e| {
+        if (std.mem.eql(u8, e.cpu_vendor, "AuthenticAMD")) return null;
+    }
+    return "sys-firmware/intel-microcode";
 }
 
 fn prepend(alloc: Allocator, head: []const u8, tail: []const []const u8) ![]const []const u8 {
@@ -958,10 +989,7 @@ fn planBootloader(alloc: Allocator, cfg: *const Config) !Step {
                 .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc,
                     "k=$(ls -t /boot/vmlinuz-* 2>/dev/null | head -n1); " ++
                     "[ -n \"$k\" ] || {{ echo 'no kernel to stage' >&2; exit 1; }}; " ++
-                    "cp -f \"$k\" {s}/vmlinuz || exit 1; " ++
-                    "i=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img 2>/dev/null | head -n1); " ++
-                    "[ -n \"$i\" ] || {{ echo 'no initramfs to stage' >&2; exit 1; }}; " ++
-                    "cp -f \"$i\" {s}/initramfs.img; true", .{ stage_dir, stage_dir }) }),
+                    "cp -f \"$k\" {s}/vmlinuz || exit 1; {s}; true", .{ stage_dir, initrdStage(alloc, cfg, stage_dir) }) }),
                 .chroot = true,
                 .desc = "stage current kernel + initramfs for limine",
             } });
@@ -998,19 +1026,17 @@ fn planBootloader(alloc: Allocator, cfg: *const Config) !Step {
             // bootctl only installs the manager — a Type-1 entry needs the
             // kernel + initramfs staged on the ESP and a loader entry.
             try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c",
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc,
                     "k=$(ls -t /boot/vmlinuz-* 2>/dev/null | head -n1); " ++
-                    "[ -n \"$k\" ] || { echo 'no kernel to stage' >&2; exit 1; }; " ++
+                    "[ -n \"$k\" ] || {{ echo 'no kernel to stage' >&2; exit 1; }}; " ++
                     "mkdir -p /efi/loader/entries && cp -f \"$k\" /efi/vmlinuz || exit 1; " ++
-                    "i=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img 2>/dev/null | head -n1); " ++
-                    "[ -n \"$i\" ] || { echo 'no initramfs to stage' >&2; exit 1; }; " ++
-                    "cp -f \"$i\" /efi/initramfs.img; true" }),
+                    "{s}; true", .{initrdStage(alloc, cfg, "/efi")}) }),
                 .chroot = true,
                 .desc = "stage kernel + initramfs on the ESP",
             } });
             try c.append(alloc, wf(alloc, "/mnt/gentoo/efi/loader/loader.conf", "default gentoo.conf\ntimeout 4\n"));
             try c.append(alloc, wf(alloc, "/mnt/gentoo/efi/loader/entries/gentoo.conf",
-                s(alloc, "title   Gentoo Linux\nlinux   /vmlinuz\ninitrd  /initramfs.img\noptions {s}\n", .{kernelArgs(alloc, cfg)})));
+                s(alloc, "title   Gentoo Linux\nlinux   /vmlinuz\n{s}options {s}\n", .{ if (cfg.system.initramfs == .none) "" else "initrd  /initramfs.img\n", kernelArgs(alloc, cfg) })));
             // kernel-install hook keeps the entry current on upgrades.
             try c.append(alloc, .{ .write_file = .{
                 .path = "/mnt/gentoo/etc/kernel/install.d/91-sd-boot.install",
@@ -1037,13 +1063,10 @@ fn planBootloader(alloc: Allocator, cfg: *const Config) !Step {
                 .desc = "efibootmgr",
             } });
             try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c",
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc,
                     "k=$(ls -t /boot/vmlinuz-* 2>/dev/null | head -n1); " ++
-                    "[ -n \"$k\" ] || { echo 'no kernel to stage' >&2; exit 1; }; " ++
-                    "cp -f \"$k\" /efi/vmlinuz || exit 1; " ++
-                    "i=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img 2>/dev/null | head -n1); " ++
-                    "[ -n \"$i\" ] || { echo 'no initramfs to stage' >&2; exit 1; }; " ++
-                    "cp -f \"$i\" /efi/initramfs.img; true" }),
+                    "[ -n \"$k\" ] || {{ echo 'no kernel to stage' >&2; exit 1; }}; " ++
+                    "cp -f \"$k\" /efi/vmlinuz || exit 1; {s}; true", .{initrdStage(alloc, cfg, "/efi")}) }),
                 .chroot = true,
                 .desc = "stage kernel + initramfs on the ESP",
             } });
@@ -1053,7 +1076,7 @@ fn planBootloader(alloc: Allocator, cfg: *const Config) !Step {
                     "d=$(lsblk -no PKNAME \"$esp\"); p=$(lsblk -no PARTN \"$esp\"); " ++
                     "[ -n \"$d\" ] && [ -n \"$p\" ] || exit 1; " ++
                     "efibootmgr -c -d /dev/$d -p $p -L Gentoo -l '\\vmlinuz' " ++
-                    "-u '{s} initrd=\\initramfs.img'", .{kernelArgs(alloc, cfg)}) }),
+                    "-u '{s}{s}'", .{ kernelArgs(alloc, cfg), if (cfg.system.initramfs == .none) "" else " initrd=\\initramfs.img" }) }),
                 .chroot = true,
                 .desc = "efibootmgr: create Gentoo NVRAM entry",
             } });
@@ -1154,7 +1177,9 @@ fn limineConf(alloc: Allocator, cfg: *const Config) []const u8 {
     w.print("/Gentoo\n", .{}) catch {};
     w.writeAll("    protocol: linux\n") catch {};
     w.print("    kernel_path: boot:///{s}\n", .{kpath}) catch {};
-    w.print("    module_path: boot:///{s}\n", .{ipath}) catch {};
+    // no initramfs → no module line (and nothing for the hook to stage)
+    if (cfg.system.initramfs != .none)
+        w.print("    module_path: boot:///{s}\n", .{ipath}) catch {};
     w.print("    cmdline: {s} rootfstype={s}\n", .{ root_args, @tagName(cfg.disk.root_fs) }) catch {};
     w.writeAll("\n# snapshot entries are appended by the kernel-install hook\n") catch {};
     return aw.written();
