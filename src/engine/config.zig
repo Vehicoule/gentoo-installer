@@ -473,6 +473,16 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
         if (cfg.disk.root_fs != .ext4 and !cfg.disk.boot_part)
             try errs.append(alloc, fmt(alloc, "BIOS limine cannot read {s} roots — set disk.boot_part=true (ext4 /boot)", .{@tagName(cfg.disk.root_fs)}));
     }
+    // GRUB reads kernels before the initramfs can unlock LUKS, and we
+    // emit no cryptodisk setup — it needs an unencrypted /boot.
+    if (resolveBootloader(cfg) == .grub and cfg.disk.luks and !cfg.disk.boot_part)
+        try errs.append(alloc, "GRUB + LUKS requires disk.boot_part=true — grub cannot read kernels inside the encrypted root");
+    // Zero-sized partitions produce sgdisk failures AFTER --zap-all has
+    // already wiped the table — catch them in validation.
+    if (cfg.boot_mode == .uefi and cfg.disk.esp_mib == 0)
+        try errs.append(alloc, "disk.esp_mib must be > 0 on UEFI — the ESP is required");
+    if (cfg.disk.swap == .partition and cfg.disk.swap_mib == 0)
+        try errs.append(alloc, "disk.swap_mib must be > 0 when disk.swap=\"partition\"");
     // Keymaps land in shell-sourced conf.d files under OpenRC — pin to
     // the keymap-name charset.
     if (!keymapOk(cfg.system.keymap))
@@ -768,7 +778,9 @@ fn atomOk(v: []const u8) bool {
 // string is joined into `name:hash` lines for chpasswd -e, so ':' and
 // whitespace are forbidden.
 fn pwHashOk(v: []const u8) bool {
-    if (v.len == 0 or v.len > 256) return false;
+    // Usable crypt hashes start with $id$ — '!'/'*' are locked-account
+    // markers that must not count as login credentials.
+    if (v.len == 0 or v.len > 256 or v[0] != '$') return false;
     for (v) |ch| {
         const ok = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
             (ch >= '0' and ch <= '9') or ch == '$' or ch == '.' or ch == '/' or

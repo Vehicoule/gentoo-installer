@@ -313,6 +313,10 @@ pub fn parse(gpa: Allocator, src: []const u8, err_out: ?*ParseError) Error!Docum
     var p: Parser = .{ .src = src, .alloc = alloc, .err_out = err_out };
     var root: Value.Table = .empty;
     var current: *Value.Table = &root;
+    // TOML forbids redeclaring an explicit table header ([a] twice is
+    // invalid); implicitly-created parents may still be declared later.
+    // NUL-joined paths are unambiguous — NUL can't appear in a key.
+    var declared: std.StringHashMap(void) = .init(alloc);
 
     while (true) {
         p.skipWhitespaceAndComments();
@@ -346,6 +350,9 @@ pub fn parse(gpa: Allocator, src: []const u8, err_out: ?*ParseError) Error!Docum
                     else => return p.fail("key conflicts with non-array value"),
                 }
             } else {
+                const dotted = try std.mem.join(alloc, "\x00", path.items);
+                if ((try declared.getOrPut(dotted)).found_existing)
+                    return p.fail("duplicate table header");
                 const gop = try leaf.table.getOrPut(alloc, leaf.key);
                 if (gop.found_existing and gop.value_ptr.* != .table)
                     return p.fail("key conflicts with non-table value");

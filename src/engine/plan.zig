@@ -1200,7 +1200,7 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
             } });
             try c.append(alloc, .{ .exec = .{
                 // missing globs skip silently; a FAILED sign propagates.
-                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", "rc=0; for f in /efi/EFI/BOOT/*.EFI /efi/vmlinuz /efi/initramfs.img /efi/EFI/Linux/*.efi; do [ -f \"$f\" ] || continue; sbctl sign -s \"$f\" || rc=1; done; exit $rc" }),
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", "rc=0; for f in /efi/EFI/BOOT/*.EFI /efi/vmlinuz /efi/EFI/Linux/*.efi; do [ -f \"$f\" ] || continue; sbctl sign -s \"$f\" || rc=1; done; exit $rc" }),
                 .chroot = true,
                 .desc = "sign bootloader + kernels (sbctl)",
             } });
@@ -1287,9 +1287,9 @@ fn planFinish(alloc: Allocator, cfg: *const Config) !Step {
             .desc = "lock root password login",
         } });
     if (cfg.system.snapshots == .auto and cfg.disk.root_fs == .btrfs)
-        try c.append(alloc, .{ .note = "btrfs @snapshots subvol is ready for pre-emerge hooks" });
+        try c.append(alloc, .{ .note = "btrfs @snapshots subvol provisioned — snapshot+entry creation is the distro pre-emerge hook's job (M5+)" });
     if (cfg.system.snapshots == .auto and cfg.disk.lvm)
-        try c.append(alloc, .{ .note = "LVM thin pool 'tank' provisioned for snapshots" });
+        try c.append(alloc, .{ .note = "LVM thin pool 'tank' provisioned — snapshot+entry creation is the distro pre-emerge hook's job (M5+)" });
     try c.append(alloc, argv(alloc, &.{ "rm", "-f", "/mnt/gentoo/stage3-*.tar.xz" }, "cleanup stage3 artifacts"));
     try c.append(alloc, .{ .note = "unmount + reboot prompt" });
     return step(alloc, "finish", "Finish", c);

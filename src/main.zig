@@ -153,10 +153,14 @@ pub fn main(init: std.process.Init) !void {
         try errw.flush();
         std.process.exit(2);
     };
-    // Only user-supplied keys are "explicit"; preset defaults yield to
-    // live-environment detection.
+    // Only user-supplied keys are "explicit" — except scheme, where a
+    // preset default is data-preservation policy (alongside/manual) and
+    // must not be overwritten by detection.
     cfg.boot_mode_explicit = user_set_boot;
-    cfg.disk.scheme_explicit = user_set_scheme;
+    cfg.disk.scheme_explicit = user_set_scheme or blk: {
+        const d = doc.root.get("disk") orelse break :blk false;
+        break :blk d == .table and d.table.get("scheme") != null;
+    };
 
     // Always probe the live env for run/plan/validate — it fills the
     // boot_mode/scheme defaults and feeds jobs/NICs/VIDEO_CARDS into the
@@ -331,24 +335,28 @@ pub fn main(init: std.process.Init) !void {
     });
 }
 
-const JsonLine = struct { op: ?[]const u8, req: ?u64, malformed: bool };
+const JsonLine = struct { op: ?[]const u8, req: ?u64, version: ?u64, malformed: bool };
 
 /// Parse one NDJSON request line; op must be a string, req a non-negative
 /// integer. Non-object or invalid JSON reports `malformed`.
 fn parseLine(alloc: std.mem.Allocator, line: []const u8) JsonLine {
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch
-        return .{ .op = null, .req = null, .malformed = true };
-    if (parsed.value != .object) return .{ .op = null, .req = null, .malformed = true };
+        return .{ .op = null, .req = null, .version = null, .malformed = true };
+    if (parsed.value != .object) return .{ .op = null, .req = null, .version = null, .malformed = true };
     const obj = parsed.value.object;
     var op: ?[]const u8 = null;
     var req: ?u64 = null;
+    var version: ?u64 = null;
     if (obj.get("op")) |ov| {
         if (ov == .string) op = ov.string;
     }
     if (obj.get("req")) |rv| {
         if (rv == .integer and rv.integer >= 0) req = @intCast(rv.integer);
     }
-    return .{ .op = op, .req = req, .malformed = false };
+    if (obj.get("version")) |vv| {
+        if (vv == .integer and vv.integer >= 0) version = @intCast(vv.integer);
+    }
+    return .{ .op = op, .req = req, .version = version, .malformed = false };
 }
 
 fn fatal(w: *std.Io.Writer, msg: []const u8) noreturn {
@@ -409,9 +417,13 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
         };
         if (std.mem.eql(u8, op, "hello")) {
             // the hello reply doubles as ready, per docs/protocol.md
-            try out.writeAll("{\"ev\":\"hello\",");
-            try writeReq(out, req);
-            try out.writeAll("\"engine\":\"0.1.0\",\"version\":1,\"caps\":[\"hello\",\"detect\",\"quit\"]}\n");
+            if (jl.version != null and jl.version.? != 1) {
+                try writeErr(out, req, "unsupported protocol version (server speaks 1)");
+            } else {
+                try out.writeAll("{\"ev\":\"hello\",");
+                try writeReq(out, req);
+                try out.writeAll("\"engine\":\"0.1.0\",\"version\":1,\"caps\":[\"hello\",\"detect\",\"quit\"]}\n");
+            }
         } else if (std.mem.eql(u8, op, "detect")) {
             const env = try engine.detect.detect(req_alloc, io);
             try out.writeAll("{\"ev\":\"env\",");

@@ -164,6 +164,10 @@ pub fn resolveSets(alloc: Allocator, preset: ?*const Preset, names: ?[]const []c
                 if (a == .array)
                     for (a.array) |item| {
                         if (item == .string and !atoms_seen.contains(item.string)) {
+                            if (!pkgTokenOk(item.string)) {
+                                try errs.append(alloc, std.fmt.allocPrint(alloc, "packages.sets '{s}': atom '{s}' must not start with '-' or contain whitespace", .{ cur, item.string }) catch @panic("oom"));
+                                continue;
+                            }
                             try atoms_seen.put(item.string, {});
                             try atoms.append(alloc, item.string);
                         }
@@ -173,6 +177,10 @@ pub fn resolveSets(alloc: Allocator, preset: ?*const Preset, names: ?[]const []c
                 if (a == .array)
                     for (a.array) |item| {
                         if (item == .string and !repos_seen.contains(item.string)) {
+                            if (!pkgTokenOk(item.string)) {
+                                try errs.append(alloc, std.fmt.allocPrint(alloc, "packages.sets '{s}': repo '{s}' must not start with '-' or contain whitespace", .{ cur, item.string }) catch @panic("oom"));
+                                continue;
+                            }
                             try repos_seen.put(item.string, {});
                             try repos.append(alloc, item.string);
                         }
@@ -184,6 +192,16 @@ pub fn resolveSets(alloc: Allocator, preset: ?*const Preset, names: ?[]const []c
         }
     }
     return .{ .resolved = .{ .atoms = atoms.items, .repos = repos.items }, .errs = errs.items };
+}
+
+// Set entries land on emerge/eselect argv — a leading '-' would be a
+// flag and whitespace would split into extra args.
+fn pkgTokenOk(v: []const u8) bool {
+    if (v.len == 0 or v.len > 128 or v[0] == '-') return false;
+    for (v) |ch| {
+        if (ch <= ' ' or ch == 0x7f) return false;
+    }
+    return true;
 }
 
 fn findSet(sets: ?[]toml.Value, id: []const u8) ?toml.Value.Table {

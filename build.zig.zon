@@ -9,6 +9,7 @@
         "build.zig.zon",
         "src",
         "presets",
+        "docs",
         "LICENSE",
         "README.md",
     },
