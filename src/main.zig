@@ -265,20 +265,36 @@ pub fn main(init: std.process.Init) !void {
 
         // Capacity preflight before the first destructive command — an
         // undersized or unknown target must be refused, not wiped then
-        // failed by sgdisk. Root floor: 6 GiB usable + 4 MiB GPT slack.
-        var need_mib: u64 = 6144 + 4;
+        // failed by sgdisk. The floor is the DOCUMENTED 8 GiB usable
+        // root, expressed through the layout's actual allocation: LVM
+        // linear gives root 70% of the VG, the thin pool 95%; LUKS/LVM
+        // metadata and GPT overhead consume ~36 MiB on top.
+        var need_mib: u64 = 4; // GPT overhead
         if (cfg.boot_mode == .uefi) need_mib += cfg.disk.esp_mib else need_mib += 2;
         if (cfg.disk.swap == .partition) need_mib += cfg.disk.swap_mib;
         if (cfg.disk.boot_part) need_mib += 1024;
+        if (cfg.disk.luks or cfg.disk.lvm) need_mib += 32;
+        need_mib += if (cfg.disk.lvm)
+            (if (cfg.system.snapshots == .auto) (8192 * 100 + 94) / 95 else (8192 * 10 + 6) / 7)
+        else
+            8192;
         var size_mib: ?u64 = null;
         if (env_opt) |*e| {
+            // Match kernel names AND persistent names: resolve symlinks
+            // so /dev/disk/by-id/... or /dev/mapper/... compares equal
+            // to the detected /dev/<name> path.
+            var rbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const rlen = std.Io.Dir.cwd().realPathFile(io, cfg.disk.device, &rbuf) catch null;
+            const resolved: ?[]const u8 = if (rlen) |n| rbuf[0..n] else null;
             for (e.disks) |dk| {
-                if (std.mem.eql(u8, dk.path, cfg.disk.device)) size_mib = dk.size_bytes / (1 << 20);
+                if (std.mem.eql(u8, dk.path, cfg.disk.device) or
+                    (resolved != null and std.mem.eql(u8, dk.path, resolved.?)))
+                    size_mib = dk.size_bytes / (1 << 20);
             }
         }
         if (size_mib) |sz| {
             if (sz < need_mib) {
-                try errw.print("{s} is {} MiB — layout needs {} MiB (esp+swap+boot+6GiB root)\n", .{ cfg.disk.device, sz, need_mib });
+                try errw.print("{s} is {} MiB — layout needs {} MiB (esp+swap+boot+8GiB usable root)\n", .{ cfg.disk.device, sz, need_mib });
                 try errw.flush();
                 std.process.exit(2);
             }
