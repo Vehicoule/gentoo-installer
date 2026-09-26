@@ -44,20 +44,25 @@ tagline    = "A lean Gentoo-based desktop"
 notice_url = "https://mydistro.example/relnotes"
 
 [defaults]                       # partial InstallConfig overlay —
-[d.disk]                         # same schema, merged under user input
+                                 # every key lives nested under it
+[defaults.disk]
 root_fs = "btrfs"
 swap    = "zram"
-[d.system]
+[defaults.system]
 init       = "dinit"
 bootloader = "limine"
-[d.security]
+[defaults.stage3]
+libc      = "glibc"              # required: the field is locked below
+[defaults.security]
 hardening = "hardened-selinux"
-[d.packages]
-sets = ["minimal", "mydistro-desktop"]
+[defaults.packages]
+sets = ["minimal"]               # authoritative pre-check list —
+                                 # set.default only applies when unset
 
 [locks]                          # fields the distro fixes — hidden in
 fields = ["stage3.libc", "system.init"]   # the wizard, rejected if a
-                                        # config file sets otherwise
+                                        # config file sets otherwise;
+                                        # each must have a default above
 
 [express]                        # opinionated-flow surface
 enabled = true                   # a distro may ship Express-only
@@ -68,7 +73,8 @@ id          = "minimal"
 label       = "Minimal"
 description = "bootable base: kernel, init, portage, network"
 atoms       = ["app-admin/doas", "sys-apps/dinit", "net-misc/dhcpcd"]
-default     = true               # pre-checked
+default     = true               # pre-checked (when defaults.packages
+                                 # .sets is absent)
 
 [[package_sets]]
 id          = "mydistro-desktop"

@@ -1,0 +1,32 @@
+# Stock Gentoo preset — the reference implementation.
+# Deliberately minimal: zero locks, one package set, no extra steps.
+
+[preset]
+id         = "gentoo"
+name       = "Gentoo"
+version    = "1.0.0"
+engine_min = "0.1.0"
+
+[branding]
+product_name = "Gentoo"
+accent       = "#6e56cf"          # gentoo purple
+dark_default = true
+support_url  = "https://wiki.gentoo.org/wiki/Handbook:Main_Page"
+
+[welcome]
+tagline    = "Welcome to Gentoo."
+notice_url = "https://www.gentoo.org/news/"
+
+# No [defaults] overlay — engine defaults are the Gentoo defaults.
+# No [locks] — every choice stays user-visible.
+
+[express]
+enabled       = true
+fields_shown  = ["disk.device", "confirm"]
+
+[[package_sets]]
+id          = "minimal"
+label       = "Minimal"
+description = "bootable base: kernel, init, portage, network"
+atoms       = []
+default     = true
