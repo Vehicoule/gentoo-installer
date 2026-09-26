@@ -129,7 +129,7 @@ pub fn build(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, pkg_
     try steps.append(alloc, try planKernel(alloc, cfg));
     try steps.append(alloc, try planFstab(alloc, cfg));
     try steps.append(alloc, try planSystemConfig(alloc, cfg));
-    try steps.append(alloc, try planServices(alloc, cfg));
+    try steps.append(alloc, try planServices(alloc, cfg, env));
     try steps.append(alloc, try planPackages(alloc, cfg, pkg_sets));
     try steps.append(alloc, try planBootloader(alloc, cfg));
     try steps.append(alloc, try planFinish(alloc, cfg));
@@ -281,6 +281,18 @@ fn rootMountArgs(alloc: Allocator, cfg: *const Config) struct { dev: []const u8,
 }
 
 /// The device node that carries the root filesystem (through LUKS/LVM).
+/// Kernel command line shared by every bootloader backend.
+fn kernelArgs(alloc: Allocator, cfg: *const Config) []const u8 {
+    var r = s(alloc, "root={s}", .{fsDevice(alloc, cfg)});
+    // btrfs: install mounted subvol=@root — boot must select it too.
+    if (cfg.disk.root_fs == .btrfs)
+        r = s(alloc, "{s} rootflags=subvol=@root", .{r});
+    // LUKS: dracut unlocks via crypttab/rd.luks at initramfs time.
+    if (cfg.disk.luks)
+        r = s(alloc, "{s} rd.luks=1", .{r});
+    return s(alloc, "{s} rootfstype={s}", .{ r, @tagName(cfg.disk.root_fs) });
+}
+
 pub fn fsDevice(alloc: Allocator, cfg: *const Config) []const u8 {
     if (cfg.disk.lvm) return "/dev/vg0/root";
     if (cfg.disk.luks) return "/dev/mapper/cryptroot";
@@ -359,7 +371,16 @@ fn planStage3(alloc: Allocator, cfg: *const Config) !Step {
             .{ base, base, base }) }),
         .desc = "download stage3 tarball + .asc + .DIGESTS (resolved from latest.txt)",
     } });
-    try c.append(alloc, argv(alloc, &.{ "gpg", "--keyserver", "hkps://keys.gentoo.org", "--verify", "/tmp/stage3.tar.xz.asc", "/tmp/stage3.tar.xz" }, "GPG-verify stage3"));
+    // --verify needs the Gentoo release key in the keyring — live media
+    // ship it under openpgp-keys; fall back to keyserver fetch of the
+    // pinned Release Engineering fingerprint.
+    try c.append(alloc, .{ .exec = .{
+        .argv = try alloc.dupe([]const u8, &.{ "sh", "-c",
+            "gpg --import /usr/share/openpgp-keys/gentoo-release.asc 2>/dev/null || " ++
+            "gpg --keyserver hkps://keys.gentoo.org --recv-keys 13EBBDBEDE7A12775DFDB1BABB572E0E2D182910" }),
+        .desc = "import Gentoo release signing key (pinned fingerprint fallback)",
+    } });
+    try c.append(alloc, argv(alloc, &.{ "gpg", "--verify", "/tmp/stage3.tar.xz.asc", "/tmp/stage3.tar.xz" }, "GPG-verify stage3"));
     // DIGESTS mixes SHA256/SHA512/WHIRLPOOL lines — extract our tarball's
     // SHA256 entry and refuse vacuous success when it is absent.
     try c.append(alloc, .{ .exec = .{
@@ -387,9 +408,14 @@ fn makeConf(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) ![]co
 
     var jobs = cfg.makeconf.jobs;
     if (jobs == 0) {
-        // runtime: nproc, capped by ~2GiB/job when mem known; the dry-run
-        // plan fixes a conservative value and notes the rule
-        jobs = 4;
+        jobs = 4; // conservative fallback without detection
+        if (env) |e| {
+            // ~2 GiB per emerge job, bounded by core count and mem_cap.
+            const by_ram: u32 = @intCast(@max(e.ram_mib / 2048, 1));
+            jobs = @max(1, @min(e.cpu_count, by_ram));
+            if (cfg.makeconf.mem_cap_gib > 0)
+                jobs = @max(1, @min(jobs, cfg.makeconf.mem_cap_gib / 2));
+        }
     }
     try w.print("MAKEOPTS=\"-j{}\"\n", .{jobs});
     if (cfg.makeconf.mem_cap_gib > 0)
@@ -476,8 +502,20 @@ fn planPortage(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !S
     try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/make.conf", try makeConf(alloc, cfg, env)));
     try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/package.use/installer", try packageUse(alloc, cfg)));
     try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/repos.conf/gentoo.conf", "[gentoo]\nlocation = /var/db/repos/gentoo\nsync-type = webrsync\n"));
-    if (cfg.system.binhost)
-        try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/binrepos.conf/gentoobinhost.conf", s(alloc, "[gentoobinhost]\npriority = 9999\nsync-uri = https://distfiles.gentoo.org/releases/{s}/binpackages/23.0/x86-64/\n", .{@tagName(cfg.arch)})));
+    if (cfg.system.binhost) {
+        // Gentoo ships binhosts per arch+ABI dir; riscv64 has none.
+        const abi_dir = switch (cfg.arch) {
+            .amd64 => "x86-64",
+            .arm64 => "arm64",
+            else => unreachable, // validate() rejects binhost off amd64/arm64
+        };
+        try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/binrepos.conf/gentoobinhost.conf", s(alloc, "[gentoobinhost]\npriority = 9999\nsync-uri = https://distfiles.gentoo.org/releases/{s}/binpackages/23.0/{s}/\n", .{ @tagName(cfg.arch), abi_dir })));
+    }
+    // LUKS root: crypttab names the GPT partlabel (-cN:root). Written here
+    // — before the kernel emerge — so installkernel's initramfs generation
+    // (dracut --hostonly) picks it up.
+    if (cfg.disk.luks)
+        try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/crypttab", "cryptroot /dev/disk/by-partlabel/root none luks\n"));
     return step(alloc, "portage-config", "Generate portage config", c);
 }
 
@@ -641,10 +679,9 @@ fn planFstab(alloc: Allocator, cfg: *const Config) !Step {
     if (cfg.disk.swap == .zram)
         try w.writeAll("# zram swap configured via /etc/systemd/zram-generator.conf or OpenRC zram service\n");
     try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/fstab", aw.written()));
-    // LUKS root: crypttab names the GPT partlabel (we set -cN:root), so
-    // initramfs unlockers find the raw container behind /dev/mapper/cryptroot.
-    if (cfg.disk.luks)
-        try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/crypttab", "cryptroot /dev/disk/by-partlabel/root none luks\n"));
+    // crypttab is written in planPortage — the kernel emerge's
+    // installkernel hook bakes it into the initramfs; writing it in this
+    // step would be too late.
     return step(alloc, "fstab", "Generate fstab", c);
 }
 
@@ -714,17 +751,25 @@ fn planSystemConfig(alloc: Allocator, cfg: *const Config) !Step {
         .none => {},
     }
 
-    // zram swap config
+    // zram swap: install the backend the config file needs.
     if (cfg.disk.swap == .zram) {
-        if (cfg.system.init == .systemd)
-            try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/systemd/zram-generator.conf", "[zram0]\nzram-size = min(ram / 2, 8192)\ncompression-algorithm = zstd\n"))
-        else
-            try c.append(alloc, .{ .note = "zram via sys-apps/zram-service or init script (per init backend)" });
+        switch (cfg.system.init) {
+            .systemd => {
+                try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-apps/zram-generator" }), .chroot = true, .desc = "zram-generator" } });
+                try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/systemd/zram-generator.conf", "[zram0]\nzram-size = min(ram / 2, 8192)\ncompression-algorithm = zstd\n"));
+            },
+            .openrc => {
+                try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-apps/zram-init" }), .chroot = true, .desc = "zram-init" } });
+                try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/conf.d/zram-init", "num_devices=1\ntype0=swap\nsize0=min(ram / 2, 8192)\ncompr0=zstd\n"));
+                try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "rc-update", "add", "zram-init", "boot" }), .chroot = true, .desc = "enable zram-init" } });
+            },
+            else => try c.append(alloc, .{ .note = "zram on this init lands with its backend in M6" }),
+        }
     }
     return step(alloc, "system-config", "System config", c);
 }
 
-fn planServices(alloc: Allocator, cfg: *const Config) !Step {
+fn planServices(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !Step {
     var c: std.ArrayList(Cmd) = .empty;
     const init = cfg.system.init;
 
@@ -747,19 +792,29 @@ fn planServices(alloc: Allocator, cfg: *const Config) !Step {
     switch (cfg.network.manager) {
         .networkmanager => try enables.append(alloc, .{ .name = "NetworkManager", .runlevel = "default" }),
         .dhcpcd => try enables.append(alloc, .{ .name = "dhcpcd", .runlevel = "default" }),
-        // netifrc: emerge the package, create the net.eth0 symlink, enable.
+        // netifrc: emerge the package, then link + enable a net.<nic>
+        // unit per detected interface (predictable names like enp1s0).
         .netifrc => {
             try c.append(alloc, .{ .exec = .{
                 .argv = try alloc.dupe([]const u8, &.{ "emerge", "net-misc/netifrc" }),
                 .chroot = true,
                 .desc = "netifrc",
             } });
-            try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "ln", "-sf", "net.lo", "/etc/init.d/net.eth0" }),
-                .chroot = true,
-                .desc = "netifrc eth0 unit link",
-            } });
-            try enables.append(alloc, .{ .name = "net.eth0", .runlevel = "default" });
+            if (env != null and env.?.nics.len > 0) {
+                var netconf: std.Io.Writer.Allocating = .init(alloc);
+                for (env.?.nics) |nic| {
+                    try netconf.writer.print("config_{s}=\"dhcp\"\n", .{nic});
+                    try c.append(alloc, .{ .exec = .{
+                        .argv = try alloc.dupe([]const u8, &.{ "ln", "-sf", "net.lo", s(alloc, "/etc/init.d/net.{s}", .{nic}) }),
+                        .chroot = true,
+                        .desc = s(alloc, "netifrc net.{s} unit link", .{nic}),
+                    } });
+                    try enables.append(alloc, .{ .name = s(alloc, "net.{s}", .{nic}), .runlevel = "default" });
+                }
+                try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/conf.d/net", netconf.written()));
+            } else {
+                try c.append(alloc, .{ .note = "netifrc: no NICs detected — enable net.<iface> for each interface" });
+            }
         },
         // systemd-networkd: enable the daemons + resolved stub resolv.conf.
         .@"systemd-networkd" => {
@@ -916,11 +971,43 @@ fn planBootloader(alloc: Allocator, cfg: *const Config) !Step {
                 .desc = "grub.cfg (os-prober merges other OSes)",
             } });
         },
-        .@"systemd-boot" => try c.append(alloc, .{ .exec = .{
-            .argv = try alloc.dupe([]const u8, &.{ "bootctl", "install" }),
-            .chroot = true,
-            .desc = "systemd-boot (UEFI only)",
-        } }),
+        .@"systemd-boot" => {
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "bootctl", "install" }),
+                .chroot = true,
+                .desc = "systemd-boot (UEFI only)",
+            } });
+            // bootctl only installs the manager — a Type-1 entry needs the
+            // kernel + initramfs staged on the ESP and a loader entry.
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c",
+                    "k=$(ls -t /boot/vmlinuz-* 2>/dev/null | head -n1); " ++
+                    "[ -n \"$k\" ] || exit 0; " ++
+                    "mkdir -p /efi/loader/entries && cp -f \"$k\" /efi/vmlinuz; " ++
+                    "i=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img 2>/dev/null | head -n1); " ++
+                    "[ -n \"$i\" ] && cp -f \"$i\" /efi/initramfs.img; true" }),
+                .chroot = true,
+                .desc = "stage kernel + initramfs on the ESP",
+            } });
+            try c.append(alloc, wf(alloc, "/mnt/gentoo/efi/loader/loader.conf", "default gentoo.conf\ntimeout 4\n"));
+            try c.append(alloc, wf(alloc, "/mnt/gentoo/efi/loader/entries/gentoo.conf",
+                s(alloc, "title   Gentoo Linux\nlinux   /vmlinuz\ninitrd  /initramfs.img\noptions {s}\n", .{kernelArgs(alloc, cfg)})));
+            // kernel-install hook keeps the entry current on upgrades.
+            try c.append(alloc, .{ .write_file = .{
+                .path = "/mnt/gentoo/etc/kernel/install.d/91-sd-boot.install",
+                .content =
+                \\#!/bin/sh
+                \\# gentoo-installer systemd-boot hook: restage kernel+initramfs
+                \\# onto the ESP at the fixed paths the loader entry uses.
+                \\[ "$1" = add ] || exit 0
+                \\cp -f "$4" /efi/vmlinuz || exit 1
+                \\initrd=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img 2>/dev/null | head -n1)
+                \\[ -n "$initrd" ] && cp -f "$initrd" /efi/initramfs.img
+                \\exit 0
+                ,
+                .mode = 0o755,
+            } });
+        },
         .efistub => try c.append(alloc, .{ .note = "efistub: kernels boot via firmware NVRAM entries (efibootmgr)" }),
         .refind => try c.append(alloc, .{ .exec = .{
             .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-boot/refind" }),
@@ -942,6 +1029,11 @@ fn planBootloader(alloc: Allocator, cfg: *const Config) !Step {
                 .argv = try alloc.dupe([]const u8, &.{ "sbctl", "create-keys" }),
                 .chroot = true,
                 .desc = "generate secure boot keys",
+            } });
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "sbctl", "enroll-keys" }),
+                .chroot = true,
+                .desc = "enroll keys into firmware (requires Setup Mode)",
             } });
             try c.append(alloc, .{ .exec = .{
                 .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", "for f in /efi/EFI/BOOT/*.EFI /efi/vmlinuz /efi/initramfs.img /efi/EFI/Linux/*.efi; do [ -f \"$f\" ] && sbctl sign -s \"$f\"; done; true" }),
@@ -1003,13 +1095,7 @@ fn limineConf(alloc: Allocator, cfg: *const Config) []const u8 {
     const w = &aw.writer;
     w.writeAll("# generated by gentoo-installer\n") catch {};
     w.writeAll("timeout: 5\n\n") catch {};
-    var root_args = s(alloc, "root={s}", .{fsDevice(alloc, cfg)});
-    // btrfs: install mounted subvol=@root — boot must select it too.
-    if (cfg.disk.root_fs == .btrfs)
-        root_args = s(alloc, "{s} rootflags=subvol=@root", .{root_args});
-    // LUKS: dracut unlocks via crypttab/rd.luks at initramfs time.
-    if (cfg.disk.luks)
-        root_args = s(alloc, "{s} rd.luks=1", .{root_args});
+    const root_args = kernelArgs(alloc, cfg);
     // boot:// resolves on the volume holding limine.conf: ESP root under
     // UEFI or a dedicated /boot partition; the root fs otherwise, where
     // staged files live under /boot/.

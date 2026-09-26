@@ -24,7 +24,10 @@ pub const Env = struct {
     boot_mode: config.BootMode,
     arch: config.Arch,
     ram_mib: u64,
+    cpu_count: u32,
     cpu_flags: []const []const u8,
+    /// non-loopback network interface names (/sys/class/net)
+    nics: []const []const u8,
     gpus: []const Gpu,
     disks: []const DiskInfo,
     net_reachable: bool,
@@ -52,7 +55,9 @@ pub fn detect(alloc: Allocator, io: std.Io) !Env {
             else => .amd64,
         },
         .ram_mib = 0,
+        .cpu_count = 1,
         .cpu_flags = &.{},
+        .nics = &.{},
         .gpus = &.{},
         .disks = &.{},
         .net_reachable = false,
@@ -81,7 +86,9 @@ pub fn detect(alloc: Allocator, io: std.Io) !Env {
     // expose different names — we just record whatever is there.
     if (readSmall(alloc, io, "/proc/cpuinfo")) |cpuinfo| {
         var lines = std.mem.splitScalar(u8, cpuinfo, '\n');
+        var ncpu: u32 = 0;
         while (lines.next()) |line| {
+            if (std.mem.startsWith(u8, line, "processor")) ncpu += 1;
             if (std.mem.startsWith(u8, line, "flags") or std.mem.startsWith(u8, line, "Features")) {
                 if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
                     var flags: std.ArrayList([]const u8) = .empty;
@@ -92,12 +99,30 @@ pub fn detect(alloc: Allocator, io: std.Io) !Env {
                 break;
             }
         }
+        if (ncpu > 0) env.cpu_count = ncpu;
     }
+    env.nics = detectNics(alloc, io);
 
     env.gpus = try detectGpus(alloc, io);
     env.disks = try detectDisks(alloc, io);
     env.net_reachable = detectNet(alloc, io);
     return env;
+}
+
+fn detectNics(alloc: Allocator, io: std.Io) []const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var dir = std.Io.Dir.cwd().openDir(io, "/sys/class/net", .{ .iterate = true }) catch return out.items;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .directory and entry.kind != .sym_link) continue;
+        if (std.mem.eql(u8, entry.name, "lo")) continue;
+        // virtual links (docker0, veth*, br-*) have no device symlink
+        const dev_path = std.fmt.allocPrint(alloc, "/sys/class/net/{s}/device", .{entry.name}) catch continue;
+        std.Io.Dir.cwd().access(io, dev_path, .{}) catch continue;
+        out.append(alloc, alloc.dupe(u8, entry.name) catch continue) catch {};
+    }
+    return out.items;
 }
 
 fn detectNet(alloc: Allocator, io: std.Io) bool {
@@ -216,7 +241,13 @@ pub fn envToJson(alloc: Allocator, env: *const Env, w: *std.Io.Writer) !void {
 pub fn envFieldsJson(alloc: Allocator, env: *const Env, w: *std.Io.Writer) !void {
     try w.writeAll("\"boot\":\"");
     try w.writeAll(@tagName(env.boot_mode));
-    try w.print("\",\"arch\":\"{s}\",\"ram_mib\":{},\"net\":{},", .{ @tagName(env.arch), env.ram_mib, env.net_reachable });
+    try w.print("\",\"arch\":\"{s}\",\"ram_mib\":{},\"cpus\":{},\"net\":{},", .{ @tagName(env.arch), env.ram_mib, env.cpu_count, env.net_reachable });
+    try w.writeAll("\"nics\":[");
+    for (env.nics, 0..) |nic, i| {
+        if (i > 0) try w.writeAll(",");
+        try w.print("\"{s}\"", .{nic});
+    }
+    try w.writeAll("],");
     try w.writeAll("\"gpus\":[");
     for (env.gpus, 0..) |g, i| {
         if (i > 0) try w.writeAll(",");

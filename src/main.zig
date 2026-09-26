@@ -122,6 +122,15 @@ pub fn main(init: std.process.Init) !void {
     };
     defer doc.deinit();
 
+    // Record which detection-relevant keys the USER's document carried
+    // before preset defaults merge in — a preset-supplied boot_mode or
+    // scheme must not mark the value user-pinned.
+    const user_set_boot = doc.root.get("boot_mode") != null;
+    const user_set_scheme = blk: {
+        const d = doc.root.get("disk") orelse break :blk false;
+        break :blk d == .table and d.table.get("scheme") != null;
+    };
+
     var preset: ?engine.preset.Preset = null;
     defer if (preset) |*p| p.deinit();
     if (preset_path) |pp| {
@@ -144,10 +153,16 @@ pub fn main(init: std.process.Init) !void {
         try errw.flush();
         std.process.exit(2);
     };
+    // Only user-supplied keys are "explicit"; preset defaults yield to
+    // live-environment detection.
+    cfg.boot_mode_explicit = user_set_boot;
+    cfg.disk.scheme_explicit = user_set_scheme;
 
-    // detect if the config left arch/boot_mode to detection
+    // Always probe the live env for run/plan/validate — it fills the
+    // boot_mode/scheme defaults and feeds jobs/NICs/VIDEO_CARDS into the
+    // plan (explicit arch is checked below; plan previews still work).
     var env_opt: ?engine.detect.Env = null;
-    if (cfg.arch == .detect or cmd == .run) {
+    {
         env_opt = engine.detect.detect(alloc, io) catch null;
         if (env_opt) |*e| {
             if (cfg.arch == .detect) {
@@ -295,10 +310,14 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
             if (at_eof) break;
             continue;
         }
-        const jl = parseLine(alloc, line);
+        // Per-request arena: JSON trees + probe data die with the reply.
+        var req_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        const req_alloc = req_arena.allocator();
+        const jl = parseLine(req_alloc, line);
         if (jl.malformed) {
             try writeErr(out, null, "invalid json");
             try out.flush();
+            req_arena.deinit();
             if (at_eof) break;
             continue;
         }
@@ -306,6 +325,7 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
         const op = jl.op orelse {
             try writeErr(out, req, "missing op");
             try out.flush();
+            req_arena.deinit();
             if (at_eof) break;
             continue;
         };
@@ -315,7 +335,7 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
             try writeReq(out, req);
             try out.writeAll("\"engine\":\"0.1.0\",\"version\":1,\"caps\":[\"hello\",\"detect\",\"quit\"]}\n");
         } else if (std.mem.eql(u8, op, "detect")) {
-            const env = try engine.detect.detect(alloc, io);
+            const env = try engine.detect.detect(req_alloc, io);
             try out.writeAll("{\"ev\":\"env\",");
             try writeReq(out, req);
             try engine.detect.envFieldsJson(alloc, &env, out);
@@ -334,6 +354,7 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
             try writeErr(out, req, aw.written());
         }
         try out.flush();
+        req_arena.deinit();
         if (at_eof) break;
     }
 }

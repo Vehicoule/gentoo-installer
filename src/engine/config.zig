@@ -460,6 +460,16 @@ pub fn validate(alloc: Allocator, cfg: *const Config, has_nvidia: ?bool) ![][]co
         if (cfg.disk.root_fs != .ext4 and !cfg.disk.boot_part)
             try errs.append(alloc, fmt(alloc, "BIOS limine cannot read {s} roots — set disk.boot_part=true (ext4 /boot)", .{@tagName(cfg.disk.root_fs)}));
     }
+    // Keymaps land in shell-sourced conf.d files under OpenRC — pin to
+    // the keymap-name charset.
+    if (!keymapOk(cfg.system.keymap))
+        try errs.append(alloc, fmt(alloc, "keymap '{s}' has characters outside the keymap charset", .{cfg.system.keymap}));
+    // zram needs an init backend: systemd-generator or OpenRC zram-init.
+    if (cfg.disk.swap == .zram and cfg.system.init != .systemd and cfg.system.init != .openrc)
+        try errs.append(alloc, "disk.swap=zram requires systemd or openrc (other init backends land in M6)");
+    // No official Gentoo binhost exists for riscv64.
+    if (cfg.system.binhost and cfg.arch == .riscv64)
+        try errs.append(alloc, "system.binhost has no upstream binpackages for riscv64");
     // Network managers must match init capabilities.
     if (cfg.network.manager == .netifrc and cfg.system.init != .openrc)
         try errs.append(alloc, "network.manager=netifrc requires init=openrc");
@@ -573,6 +583,16 @@ fn hasShellMeta(v: []const u8) bool {
 }
 
 // URL allowlist: scheme://host/path chars only.
+// OpenRC conf.d keymaps are shell-sourced: lowercase names + - _ only.
+fn keymapOk(v: []const u8) bool {
+    if (v.len == 0 or v.len > 32) return false;
+    for (v) |ch| {
+        const ok = (ch >= 'a' and ch <= 'z') or (ch >= '0' and ch <= '9') or ch == '-' or ch == '_';
+        if (!ok) return false;
+    }
+    return true;
+}
+
 // USE flag names: letters, digits, _ - + @ (e.g. wayland, l10n_de)
 fn useFlagOk(v: []const u8) bool {
     if (v.len == 0) return false;
