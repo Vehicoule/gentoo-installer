@@ -458,4 +458,7 @@ build `-Drelease=small` and fail on binary-size or peak-RSS regression
 - **Zig pin**: exact version, pinned in `build.zig.zon` + CI + the
   environment blueprint — distro zig is not assumed.
 - **First custom preset**: deferred to M6; the preset schema is drafted
-  against the distro wish-list (wayland WM + tools).
+  against the distro wish-list (wayland WM + tools). Target profile:
+  dinit + glibc + btrfs + zram + limine + doas + hardened-selinux;
+  COSMIC session/seat needs on dinit ride the Chimera-proven stack —
+  turnstile + seatd + dbus (replaces most of elogind).
