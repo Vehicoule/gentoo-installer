@@ -310,7 +310,9 @@ fn rootMountArgs(alloc: Allocator, cfg: *const Config) struct { dev: []const u8,
 /// fails the step (`|| exit 1`); nothing after it may mask the status.
 fn initrdStage(alloc: Allocator, cfg: *const Config, dir: []const u8) []const u8 {
     if (cfg.system.initramfs == .none) return "";
-    return s(alloc, "; i=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img 2>/dev/null | head -n1); " ++
+    // kernel-install places artifacts flat (/boot/initramfs-*.img) under
+    // 'flat'/'compat' layouts but /boot/<token>/<kver>/ under 'bls' — glob both.
+    return s(alloc, "; i=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img /boot/*/*/initrd* 2>/dev/null | head -n1); " ++
         "[ -n \"$i\" ] || {{ echo 'no initramfs to stage' >&2; exit 1; }}; " ++
         "cp -f \"$i\" {s}/initramfs.img || exit 1", .{dir});
 }
@@ -459,14 +461,16 @@ fn planStage3(alloc: Allocator, cfg: *const Config) !Step {
         .desc = "import Gentoo release signing key (pinned fingerprint fallback)",
     } });
     try c.append(alloc, argv(alloc, &.{ "gpg", "--verify", "/tmp/stage3.tar.xz.asc", "/tmp/stage3.tar.xz" }, "GPG-verify stage3"));
-    // DIGESTS mixes SHA256/SHA512/WHIRLPOOL lines — extract our tarball's
-    // SHA256 entry and refuse vacuous success when it is absent.
+    // DIGESTS carries per-section entries (# BLAKE2B HASH / # SHA512 HASH
+    // — SHA256 was dropped) — extract our tarball's SHA512 entry (both
+    // hashes are 128-hex, so the section header must scope the match) and
+    // refuse vacuous success when it is absent.
     try c.append(alloc, .{ .exec = .{
         .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", "b=$(basename \"$(readlink -f /tmp/stage3.tar.xz)\"); " ++
-            "awk -v f=\"$b\" '$2 == f && length($1) == 64' /tmp/stage3.DIGESTS > /tmp/stage3.sha256; " ++
-            "test -s /tmp/stage3.sha256 || { echo 'no SHA256 digest entry for stage3' >&2; exit 1; }; " ++
-            "(cd /tmp && sha256sum -c /tmp/stage3.sha256)" }),
-        .desc = "digest-verify stage3 (SHA256 entry for the tarball)",
+            "awk -v f=\"$b\" '/^# SHA512 HASH/{h=1; next} /^#/{h=0} h && $2 == f' /tmp/stage3.DIGESTS > /tmp/stage3.sha512; " ++
+            "test -s /tmp/stage3.sha512 || { echo 'no SHA512 digest entry for stage3' >&2; exit 1; }; " ++
+            "(cd /tmp && sha512sum -c /tmp/stage3.sha512)" }),
+        .desc = "digest-verify stage3 (SHA512 entry for the tarball)",
     } });
     try c.append(alloc, argv(alloc, &.{ "tar", "--xattrs-include=*.*", "--numeric-owner", "-xpf", "/tmp/stage3.tar.xz", "-C", "/mnt/gentoo" }, "extract stage3"));
     return step(alloc, "stage3", "Stage3 download + extract", c);
@@ -578,6 +582,26 @@ fn planPortage(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !S
     var c: std.ArrayList(Cmd) = .empty;
     try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/make.conf", try makeConf(alloc, cfg, env)));
     try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/package.use/installer", try packageUse(alloc, cfg)));
+    // Firmware + microcode carry non-free licenses that @FREE masks —
+    // grant per-package instead of loosening ACCEPT_LICENSE globally.
+    // (AMD microcode ships inside linux-firmware, so one grant covers it.)
+    var lic: std.Io.Writer.Allocating = .init(alloc);
+    try lic.writer.writeAll("sys-kernel/linux-firmware linux-fw-redistributable\n");
+    if (ucodeAtom(cfg, env)) |atom| {
+        if (std.mem.eql(u8, atom, "sys-firmware/intel-microcode"))
+            try lic.writer.writeAll("sys-firmware/intel-microcode intel-ucode\n");
+    }
+    try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/package.license/installer", lic.written()));
+    // limine is ~arch-masked in ::gentoo — accept-keyword it when chosen.
+    if (config.resolveBootloader(cfg) == .limine) {
+        const kw = switch (cfg.arch) {
+            .amd64 => "~amd64",
+            .arm64 => "~arm64",
+            .riscv64 => "~riscv",
+            .detect => "~amd64",
+        };
+        try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/package.accept_keywords/installer", s(alloc, "sys-boot/limine {s}\n", .{kw})));
+    }
     try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/repos.conf/gentoo.conf", "[gentoo]\nlocation = /var/db/repos/gentoo\nsync-type = webrsync\n"));
     if (cfg.system.binhost) {
         // Gentoo ships binhosts per arch+ABI dir; riscv64 has none.
@@ -677,7 +701,7 @@ fn planKernel(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !St
     // firmware + microcode
     var fw_atoms: std.ArrayList([]const u8) = .empty;
     try fw_atoms.append(alloc, "sys-kernel/linux-firmware");
-    try fw_atoms.append(alloc, "media-sound/sof-firmware");
+    try fw_atoms.append(alloc, "sys-firmware/sof-firmware");
     if (ucodeAtom(cfg, env)) |atom| try fw_atoms.append(alloc, atom);
     try c.append(alloc, .{ .exec = .{
         .argv = try prepend(alloc, "emerge", fw_atoms.items),
@@ -1053,7 +1077,7 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
                     \\[ "$1" = add ] || exit 0
                     \\esp={s}
                     \\cp -f "$4" "$esp/vmlinuz" || exit 1
-                    \\initrd=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img /boot/initrd-* 2>/dev/null | head -n1)
+                    \\initrd=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img /boot/initrd-* /boot/*/*/initrd* 2>/dev/null | head -n1)
                     \\[ -n "$initrd" ] && cp -f "$initrd" "$esp/initramfs.img"
                     \\exit 0
                 , .{stage_dir}),
@@ -1062,7 +1086,7 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
             // The hook only fires for FUTURE kernel installs — the kernel
             // emerged earlier this install was never staged. Stage it now.
             try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "k=$(ls -t /boot/vmlinuz-* 2>/dev/null | head -n1); " ++
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "k=$(ls -t /boot/vmlinuz-* /boot/kernel-* /boot/*/*/vmlinuz 2>/dev/null | head -n1); " ++
                     "[ -n \"$k\" ] || {{ echo 'no kernel to stage' >&2; exit 1; }}; " ++
                     "cp -f \"$k\" {s}/vmlinuz || exit 1{s}", .{ stage_dir, initrdStage(alloc, cfg, stage_dir) }) }),
                 .chroot = true,
@@ -1101,7 +1125,7 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
             // bootctl only installs the manager — a Type-1 entry needs the
             // kernel + initramfs staged on the ESP and a loader entry.
             try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "k=$(ls -t /boot/vmlinuz-* 2>/dev/null | head -n1); " ++
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "k=$(ls -t /boot/vmlinuz-* /boot/kernel-* /boot/*/*/vmlinuz 2>/dev/null | head -n1); " ++
                     "[ -n \"$k\" ] || {{ echo 'no kernel to stage' >&2; exit 1; }}; " ++
                     "mkdir -p /efi/loader/entries && cp -f \"$k\" /efi/vmlinuz || exit 1{s}", .{initrdStage(alloc, cfg, "/efi")}) }),
                 .chroot = true,
@@ -1135,7 +1159,7 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
                 .desc = "efibootmgr",
             } });
             try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "k=$(ls -t /boot/vmlinuz-* 2>/dev/null | head -n1); " ++
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "k=$(ls -t /boot/vmlinuz-* /boot/kernel-* /boot/*/*/vmlinuz 2>/dev/null | head -n1); " ++
                     "[ -n \"$k\" ] || {{ echo 'no kernel to stage' >&2; exit 1; }}; " ++
                     "cp -f \"$k\" /efi/vmlinuz || exit 1{s}", .{initrdStage(alloc, cfg, "/efi")}) }),
                 .chroot = true,

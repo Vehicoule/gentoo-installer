@@ -149,6 +149,12 @@ pub fn run(io: std.Io, alloc: Allocator, p: plan.Plan, opts: Options) !void {
                             return error.MissingStdinData;
                         execCmd(io, alloc, e) catch |err| {
                             journal.cmdExec(step.id, e, "fail");
+                            // the step event carries no context — name the
+                            // failing command + error on stderr at least
+                            var ebuf: [4096]u8 = undefined;
+                            var ew = std.Io.File.stderr().writer(io, &ebuf);
+                            ew.interface.print("command failed ({s}): {s}\n", .{ e.desc, @errorName(err) }) catch {};
+                            ew.interface.flush() catch {};
                             if (opts.on_step) |cb| cb(opts.ctx, i + 1, p.steps.len, step.id, "failed");
                             return err;
                         };
