@@ -234,8 +234,8 @@ locale      = "en_US.UTF-8"      # default LANG (⊂ locales)
 keymap      = "us"
 kernel      = "dist-bin"         # dist-bin | dist | manual
 bootloader  = "auto"             # auto | grub | systemd-boot | efistub | limine | refind
-                               # Express pins limine (uniform BIOS+UEFI); auto
-                               # is the Advanced-flow default resolution
+                               # auto always resolves to limine (uniform
+                               # BIOS+UEFI); the rest are explicit Advanced picks
 initramfs   = "dracut"           # dracut | ugrd | none
 uki         = false              # unified kernel image
 binhost     = true               # official gentoo binhost
@@ -446,17 +446,15 @@ Enforcement (planned — no build/CI exists yet): once the repo has CI,
 build `-Drelease=small` and fail on binary-size or peak-RSS regression
 (QEMU smoke run); the table is the ratchet.
 
-## Open questions
+## Decisions
 
-1. License — defaulting to **GPL-3.0-or-later** (installer convention, e.g.
-   Calamares; Slint not in play anymore so no constraint). Confirm or pick
-   MIT/Apache-2.0.
-2. Binary naming: `gentoo-installer` (cli+tui+headless) and
-   `gentoo-installer-gui`? 
-3. Bootloader default on UEFI: `systemd-boot` (lighter, fits the efficiency
-   ethos) vs `grub` (most familiar)? Proposal: `auto` resolves boot mode
-   first — BIOS ⇒ always grub; UEFI ⇒ systemd-boot on systemd variants,
-   grub on openrc. VALIDATE hard-rejects systemd-boot/efistub/uki on BIOS.
-4. Do we ship a `.zigmod`/`zig` version manager pin or rely on distro zig?
-5. First distro preset beyond stock gentoo — defer until M6, but the schema
-   should be drafted against a real wish-list (your wayland WM + tools).
+- **License**: GPL-3.0-or-later (installer convention, e.g. Calamares).
+- **Binaries**: `gentoo-installer` (engine+TUI+headless) and
+  `gentoo-installer-gui` (libcosmic shell).
+- **Bootloader `auto`**: resolves to **limine** on both BIOS and UEFI,
+  both flows; grub/systemd-boot/efistub/rEFInd are explicit Advanced
+  picks. VALIDATE hard-rejects systemd-boot/efistub/uki on BIOS.
+- **Zig pin**: exact version, pinned in `build.zig.zon` + CI + the
+  environment blueprint — distro zig is not assumed.
+- **First custom preset**: deferred to M6; the preset schema is drafted
+  against the distro wish-list (wayland WM + tools).

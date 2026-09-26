@@ -139,7 +139,7 @@ password on a surviving account, or `sshd=true` + authorized key.
 | kernel | enum with user-facing explanations: `dist-bin` = "prebuilt official kernel — fastest, recommended"; `dist` = "compiled from source with Gentoo defaults — tunable"; `manual` = "gentoo-sources, you configure it" (expert) | `dist-bin` | — |
 | initramfs | enum `dracut\|ugrd\|none` | `dracut` | `none` unsafe with LUKS/LVM/separate-/usr — VALIDATE warns/blocks |
 | uki | bool | false | implies dracut/ugrd + installkernel[uki] |
-| bootloader | enum `auto\|grub\|systemd-boot\|efistub\|limine\|refind` | `limine` in Express (pinned, uniform BIOS+UEFI); `auto` in Advanced | auto resolves **boot mode first**: BIOS ⇒ grub always; UEFI ⇒ systemd-boot on systemd, grub on openrc. Explicit `systemd-boot`/`efistub`/`uki`/`limine-efi`/`refind` on BIOS are hard-rejected by VALIDATE (limine BIOS mode exists — offered separately under `limine` with `bios` sub-option) |
+| bootloader | enum `auto\|grub\|systemd-boot\|efistub\|limine\|refind` | `auto` (resolves to **limine** on both BIOS and UEFI, both flows) | grub/systemd-boot/efistub/rEFInd are explicit Advanced picks. VALIDATE hard-rejects `systemd-boot`/`efistub`/`uki`/`refind` on BIOS (limine BIOS mode is supported) |
 | secure_boot | enum `off\|sbctl\|shim` | `off` | UEFI-only — hidden and forced `off` on BIOS boots (VALIDATE rejects non-`off` there too); `sbctl` requires uki or signed bootloader; `shim` for grub only |
 | snapshots | enum `auto\|off` | `auto` | system snapshots before world-update/kernel installs; needs btrfs root or `lvm=on`, else kernel rollback only |
 | keep_kernels | int | 3 | kernel boot entries retained; 0 = never prune |
