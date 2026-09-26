@@ -438,12 +438,13 @@ Memory efficiency is a distro value, so the installer measures itself:
 | engine RSS | ≤ 32 MiB during any step | installs must work on ≤ 1 GiB VMs |
 | TUI repaint | ≤ 16 ms full draw at 80×24 | libvaxis does terminal-query detection — no terminfo dep on a stripped ISO |
 | GUI binary | ≤ 15 MiB, ≤ 150 MiB RSS | LiveGUI only — never shipped on the minimal ISO |
-| ISO additive weight | ≤ 25 MiB total (engine+TUI+GUI+preset assets) | keeps the live image lean |
+| ISO additive weight | ≤ 6 MiB on the *minimal* ISO (engine+TUI+assets); ≤ 25 MiB on *LiveGUI* (adds the GUI) | keeps both live images lean |
 | startup | `hello` → first page ≤ 300 ms cold | perceived polish |
 | event stream | ≤ 1 MB/day steady-state | NDJSON lines are tiny; `log` events dominate, streamed not buffered |
 
-Enforcement: CI builds `-Drelease=small` and fails on binary-size or
-peak-RSS regression (QEMU smoke run); the table is the ratchet.
+Enforcement (planned — no build/CI exists yet): once the repo has CI,
+build `-Drelease=small` and fail on binary-size or peak-RSS regression
+(QEMU smoke run); the table is the ratchet.
 
 ## Open questions
 
