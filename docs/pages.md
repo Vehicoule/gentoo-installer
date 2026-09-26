@@ -145,6 +145,7 @@ password on a surviving account, or `sshd=true` + authorized key.
 | keep_kernels | int | 3 | kernel boot entries retained; 0 = never prune |
 | net_manager | enum `networkmanager\|dhcpcd\|netifrc\|systemd-networkd` | `networkmanager` | `systemd-networkd` needs init=systemd |
 | wifi_fw | bool | detected | `linux-firmware` + `sof-firmware` |
+| gpu_driver | enum `auto\|nouveau\|nvidia-open\|nvidia-drivers` | `auto` | `auto` = in-kernel/mesa; NVIDIA ⇒ `nouveau`. The `nvidia-*` options appear only when `env.gpus[]` reports an NVIDIA device — they imply `ACCEPT_LICENSE=+NVIDIA` and kernel-module signing when secure_boot is on |
 | microcode | bool | detected (vendor) | intel-microcode / amd via linux-firmware |
 | services.sshd / .logger / .cron | bool | false/true/true | — |
 
@@ -177,7 +178,7 @@ firmware menu, which already lists them.
 
 | Field | Type | Default |
 |---|---|---|
-| package_sets | multi-select from preset — stock preset ships `minimal` only; downstream distros define their own sets | `minimal` |
+| package_sets | multi-select from preset — stock gentoo preset ships `minimal` / `cosmic` (minimal COSMIC DE) / `cosmic-full` (full COSMIC DE incl. apps); downstream distros define their own | `minimal` |
 | extra_atoms | list editor | `[]` |
 | use_global | searchable flag editor (tri-state: on/off/unset) with `use.desc` descriptions | profile defaults |
 | use_pkg | per-package `package.use` records (v2; v1 edits a raw table) | `[]` |

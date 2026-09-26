@@ -1,5 +1,6 @@
 # Stock Gentoo preset — the reference implementation.
-# Deliberately minimal: zero locks, one package set, no extra steps.
+# Deliberately minimal: zero locks, no extra steps; ships the three
+# package tiers (minimal / cosmic / cosmic-full via the cosmic overlay).
 
 [preset]
 id         = "gentoo"
@@ -24,9 +25,33 @@ notice_url = "https://www.gentoo.org/news/"
 enabled       = true
 fields_shown  = ["disk.device", "confirm"]
 
+[[repos]]
+name     = "cosmic"
+sync_uri = ""                    # empty = eselect repository enable
+
 [[package_sets]]
 id          = "minimal"
 label       = "Minimal"
 description = "bootable base: kernel, init, portage, network"
 atoms       = []
 default     = true
+
+[[package_sets]]
+id          = "cosmic"
+label       = "COSMIC (minimal)"
+description = "COSMIC session: compositor, greeter, seat stack"
+repos       = ["cosmic"]
+atoms       = ["cosmic-de/cosmic-meta", "media-libs/pipewire",
+               "gui-apps/turnstile", "sys-auth/seatd", "sys-apps/dbus"]
+default     = false
+
+[[package_sets]]
+id          = "cosmic-full"
+label       = "COSMIC (full)"
+description = "minimal COSMIC + apps: files, terminal, editor, store"
+repos       = ["cosmic"]
+atoms       = ["cosmic-de/cosmic-meta", "cosmic-de/cosmic-apps",
+               "media-libs/pipewire", "gui-apps/turnstile",
+               "sys-auth/seatd", "sys-apps/dbus"]
+extends     = "cosmic"
+default     = false

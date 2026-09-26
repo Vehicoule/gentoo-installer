@@ -106,7 +106,8 @@ sensible):
 
 1. **detect** — boot mode (UEFI vs BIOS via `/sys/firmware/efi`), arch
    (`uname -m` → amd64/arm64/riscv64), RAM, CPU flags (`cpuid2cpuflags`
-   equivalent), network reachability, clock sanity (offer `chronyd -q`).
+   equivalent), network reachability, clock sanity (offer `chronyd -q`),
+   GPUs from udev sysfs (`gpus[]` → `video_cards`/`gpu.driver`).
 2. **partition** — guided layouts: `efi+swap+root` (GPT, EF00/8200/8304
    DPS GUIDs) or `bios-boot+swap+root`; LUKS2 container option; LVM option;
    `alongside` mode for dual-boot (probe existing OSes via os-prober-style
@@ -249,8 +250,16 @@ snapshots   = "auto"             # auto | off — auto: btrfs @snapshots, or
 cflags      = "native"           # safe | native | custom "<flags>"
 jobs        = 0                  # 0 = auto (nproc, mem-capped)
 mem_cap_gib = 0                  # 0 = auto (~2 GiB/job heuristic)
-video_cards = "auto"
+video_cards = "auto"             # auto ⇒ detected from gpus[]
 accept_license = "@FREE"
+
+[gpu]
+driver      = "auto"             # auto | nouveau | nvidia-open | nvidia-drivers
+                               # auto ⇒ in-kernel/mesa everywhere except NVIDIA,
+                               # which lands nouveau; the nvidia-* picks appear
+                               # only when an NVIDIA GPU is detected — they imply
+                               # ACCEPT_LICENSE=+NVIDIA and module signing under
+                               # secure_boot
 
 [network]
 manager     = "networkmanager"   # networkmanager | dhcpcd | netifrc | systemd-networkd
@@ -422,7 +431,8 @@ GUI is a separate build artifact; the TUI/engine binary stays dependency-free.
 - **M3** — QEMU green: real install boots on amd64 for the happy path.
 - **M4** — libcosmic GUI shell on the headless protocol.
 - **M5** — option matrix: LUKS, LVM, btrfs subvols, nomultilib, manual
-  kernel, custom partitions; musl + llvm + hardened(-selinux) stage3
+  kernel, custom partitions; musl + llvm + hardened(-selinux) stage3;
+  proprietary-NVIDIA driver path
   paths; BIOS/CSM boot path; arm64 + riscv64 bring-up.
 - **M6** — secure boot signing flow (sbctl path first), dual-boot
   alongside-mode + menu merge, runit/s6/dinit init-backend exploration.

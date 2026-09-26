@@ -72,7 +72,7 @@ journal. (`repair` in-protocol is the same engine path as the
 |---|---|---|
 | `hello` | `engine`, `version`, `caps[]` | handshake reply — doubles as `ready` |
 | `result` | `req?`, `ok:true`, `data?` | ack for mutation ops (`set`, `answer`, `retry`…); `req` omitted when the op didn't send one |
-| `env` | `boot`, `arch`, `ram_mib`, `net`, `disks[]`, `oses[]`, `esps[]`, `live_media` | after `detect`; also pushed when hotplug changes disks |
+| `env` | `boot`, `arch`, `ram_mib`, `net`, `disks[]`, `oses[]`, `esps[]`, `gpus[]`, `live_media` | after `detect`; also pushed when hotplug changes disks |
 | `config` | `config` (secrets masked) | `get_config` reply |
 | `page` | `page` (name), `index`, `of`, `title`, `fields[]`, `actions[]` | navigation replies |
 | `validate` | `errors[]{path,code,message,hint}`, `warnings[]` | after `set`, `next`, `validate` |
