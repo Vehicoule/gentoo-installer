@@ -188,10 +188,18 @@ const DrainArgs = struct { io: std.Io, file: std.Io.File, collect: ?*std.Io.Writ
 /// Strip bytes that could drive terminal control sequences — child
 /// output can carry attacker-controlled content (mirror metadata,
 /// package logs). C0/DEL controls are dropped; \n/\t/\r and ≥0x80
-/// (UTF-8 text) are kept.
+/// (UTF-8 text) are kept — except the C1 range: U+0080–U+009F encode
+/// as 0xC2 0x80–0x9F and real terminals honor them (U+009B is CSI),
+/// so the pair is dropped as well.
 fn termSanitize(dst: []u8, src: []const u8) []const u8 {
     var n: usize = 0;
-    for (src) |b| {
+    var i: usize = 0;
+    while (i < src.len) {
+        const b = src[i];
+        if (b == 0xC2 and i + 1 < src.len and src[i + 1] >= 0x80 and src[i + 1] <= 0x9F) {
+            i += 2;
+            continue;
+        }
         const ok = switch (b) {
             '\n', '\t', '\r' => true,
             0x7f => false,
@@ -201,6 +209,7 @@ fn termSanitize(dst: []u8, src: []const u8) []const u8 {
             dst[n] = b;
             n += 1;
         }
+        i += 1;
     }
     return dst[0..n];
 }
@@ -330,4 +339,10 @@ fn execCmd(io: std.Io, alloc: Allocator, e: plan.Exec) !void {
         },
         else => return error.CommandFailed,
     }
+}
+
+test "termSanitize drops C0/C1/DEL, keeps text and utf8" {
+    var buf: [256]u8 = undefined;
+    const out = termSanitize(&buf, "a\x1b[2kb\xc2\x9bPAYLOAD\xc2\xa0ok\x7f\x08\t\n");
+    try std.testing.expectEqualStrings("a[2kbPAYLOAD\xc2\xa0ok\t\n", out);
 }

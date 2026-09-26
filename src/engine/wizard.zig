@@ -1355,17 +1355,24 @@ pub const Wizard = struct {
         }
         try o.print("[extra]\nupdate_world = {}\n", .{w.cfg.extra.update_world});
         const real = try confinedWrite(w, path);
+        // Force 0600 BEFORE content lands: an existing file keeps its
+        // mode through a truncating write, so secrets written while it is
+        // still permissive would sit readable (permanently if a late
+        // chmod failed). A write-only open works even on 0200 files —
+        // fchmod needs no read access — and a missing file just falls
+        // through to create-with-0600 below.
+        if (std.Io.Dir.cwd().openFile(w.io, real, .{ .mode = .write_only })) |f| {
+            f.setPermissions(w.io, .fromMode(0o600)) catch {
+                f.close(w.io);
+                return error.WriteFailed;
+            };
+            f.close(w.io);
+        } else |_| {}
         std.Io.Dir.cwd().writeFile(w.io, .{
             .sub_path = real,
             .data = aw.written(),
             .flags = .{ .truncate = true, .permissions = .fromMode(0o600) },
         }) catch return error.WriteFailed;
-        // permissions only apply at create — an existing file keeps its
-        // mode, so force 0600 to cover overwriting a permissive one.
-        if (std.Io.Dir.cwd().openFile(w.io, real, .{})) |f| {
-            defer f.close(w.io);
-            f.setPermissions(w.io, .fromMode(0o600)) catch return error.WriteFailed;
-        } else |_| return error.WriteFailed;
     }
 
     /// Resolve cfg.packages.sets through the attached preset (or the
