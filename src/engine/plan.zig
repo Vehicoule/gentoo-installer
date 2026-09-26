@@ -103,7 +103,18 @@ pub const Sets = struct {
     repos: []const []const u8 = &.{},
 };
 
-pub fn build(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, pkg_sets: Sets) !Plan {
+/// `disk_seed` namespaces the partition GUIDs this plan assigns — pass a
+/// fixed value in tests; null draws a random per-install seed so two
+/// installer-produced disks never collide on PARTUUID.
+pub fn build(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, pkg_sets: Sets, disk_seed: ?u128) !Plan {
+    const seed = disk_seed orelse blk: {
+        var buf: [16]u8 = undefined;
+        const rc = std.os.linux.getrandom(&buf, buf.len, 0);
+        break :blk if (std.os.linux.errno(rc) == .SUCCESS)
+            std.mem.readInt(u128, &buf, .little)
+        else
+            @as(u128, @intCast(std.os.linux.getpid())) *% 0x9e3779b97f4a7c15c39d7f1b08b5e9;
+    };
     var steps: std.ArrayList(Step) = .empty;
 
     try steps.append(alloc, step(alloc, "detect", "Detect environment", blk: {
@@ -116,7 +127,7 @@ pub fn build(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, pkg_
         break :blk c;
     }));
 
-    try steps.append(alloc, try planPartition(alloc, cfg, env));
+    try steps.append(alloc, try planPartition(alloc, cfg, env, seed));
     try steps.append(alloc, try planMount(alloc, cfg));
     try steps.append(alloc, try planStage3(alloc, cfg));
     try steps.append(alloc, try planPortage(alloc, cfg, env));
@@ -127,11 +138,11 @@ pub fn build(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, pkg_
         try steps.append(alloc, try planWorldUpdate(alloc, cfg));
     try steps.append(alloc, try planBaseConfig(alloc, cfg));
     try steps.append(alloc, try planKernel(alloc, cfg, env));
-    try steps.append(alloc, try planFstab(alloc, cfg));
+    try steps.append(alloc, try planFstab(alloc, cfg, seed));
     try steps.append(alloc, try planSystemConfig(alloc, cfg));
     try steps.append(alloc, try planServices(alloc, cfg, env));
     try steps.append(alloc, try planPackages(alloc, cfg, pkg_sets));
-    try steps.append(alloc, try planBootloader(alloc, cfg));
+    try steps.append(alloc, try planBootloader(alloc, cfg, seed));
     try steps.append(alloc, try planFinish(alloc, cfg));
 
     return .{ .steps = steps.items };
@@ -139,7 +150,7 @@ pub fn build(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, pkg_
 
 // ------------------------------------------------------------------ //
 
-fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !Step {
+fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, seed: u128) !Step {
     var c: std.ArrayList(Cmd) = .empty;
     const dev = cfg.disk.device;
     const d = cfg.disk;
@@ -177,26 +188,26 @@ fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) 
     if (cfg.boot_mode == .uefi) {
         n += 1;
         esp_part = partPath(alloc, dev, n);
-        try c.append(alloc, argv(alloc, &.{ "sgdisk", s(alloc, "-n{}:0:+{}MiB", .{ n, d.esp_mib }), s(alloc, "-t{}:EF00", .{n}), s(alloc, "-c{}:ESP", .{n}), s(alloc, "-u{}:{s}", .{ n, partGuid(alloc, n) }), dev }, s(alloc, "ESP {}MiB at partition {}", .{ d.esp_mib, n })));
+        try c.append(alloc, argv(alloc, &.{ "sgdisk", s(alloc, "-n{}:0:+{}MiB", .{ n, d.esp_mib }), s(alloc, "-t{}:EF00", .{n}), s(alloc, "-c{}:ESP", .{n}), s(alloc, "-u{}:{s}", .{ n, partGuid(alloc, seed, n) }), dev }, s(alloc, "ESP {}MiB at partition {}", .{ d.esp_mib, n })));
     } else {
         n += 1;
-        try c.append(alloc, argv(alloc, &.{ "sgdisk", s(alloc, "-n{}:0:+2MiB", .{n}), s(alloc, "-t{}:EF02", .{n}), s(alloc, "-c{}:biosboot", .{n}), s(alloc, "-u{}:{s}", .{ n, partGuid(alloc, n) }), dev }, "BIOS boot partition (2MiB, EF02)"));
+        try c.append(alloc, argv(alloc, &.{ "sgdisk", s(alloc, "-n{}:0:+2MiB", .{n}), s(alloc, "-t{}:EF02", .{n}), s(alloc, "-c{}:biosboot", .{n}), s(alloc, "-u{}:{s}", .{ n, partGuid(alloc, seed, n) }), dev }, "BIOS boot partition (2MiB, EF02)"));
     }
     if (d.swap == .partition) {
         n += 1;
         swap_part = partPath(alloc, dev, n);
-        try c.append(alloc, argv(alloc, &.{ "sgdisk", s(alloc, "-n{}:0:+{}MiB", .{ n, d.swap_mib }), s(alloc, "-t{}:8200", .{n}), s(alloc, "-c{}:swap", .{n}), s(alloc, "-u{}:{s}", .{ n, partGuid(alloc, n) }), dev }, s(alloc, "swap {}MiB at partition {}", .{ d.swap_mib, n })));
+        try c.append(alloc, argv(alloc, &.{ "sgdisk", s(alloc, "-n{}:0:+{}MiB", .{ n, d.swap_mib }), s(alloc, "-t{}:8200", .{n}), s(alloc, "-c{}:swap", .{n}), s(alloc, "-u{}:{s}", .{ n, partGuid(alloc, seed, n) }), dev }, s(alloc, "swap {}MiB at partition {}", .{ d.swap_mib, n })));
     }
     var boot_part: ?[]const u8 = null;
     if (d.boot_part) {
         n += 1;
         boot_part = partPath(alloc, dev, n);
-        try c.append(alloc, argv(alloc, &.{ "sgdisk", s(alloc, "-n{}:0:+1024MiB", .{n}), s(alloc, "-t{}:8300", .{n}), s(alloc, "-c{}:boot", .{n}), s(alloc, "-u{}:{s}", .{ n, partGuid(alloc, n) }), dev }, s(alloc, "boot partition 1GiB at partition {}", .{n})));
+        try c.append(alloc, argv(alloc, &.{ "sgdisk", s(alloc, "-n{}:0:+1024MiB", .{n}), s(alloc, "-t{}:8300", .{n}), s(alloc, "-c{}:boot", .{n}), s(alloc, "-u{}:{s}", .{ n, partGuid(alloc, seed, n) }), dev }, s(alloc, "boot partition 1GiB at partition {}", .{n})));
     }
     n += 1;
     const root_part = partPath(alloc, dev, n);
     // 8304 = Linux root DPS GUID (auto-discovery on systemd)
-    try c.append(alloc, argv(alloc, &.{ "sgdisk", s(alloc, "-n{}:0:0", .{n}), s(alloc, "-t{}:8304", .{n}), s(alloc, "-c{}:root", .{n}), s(alloc, "-u{}:{s}", .{ n, partGuid(alloc, n) }), dev }, s(alloc, "root partition {} (rest of disk)", .{n})));
+    try c.append(alloc, argv(alloc, &.{ "sgdisk", s(alloc, "-n{}:0:0", .{n}), s(alloc, "-t{}:8304", .{n}), s(alloc, "-c{}:root", .{n}), s(alloc, "-u{}:{s}", .{ n, partGuid(alloc, seed, n) }), dev }, s(alloc, "root partition {} (rest of disk)", .{n})));
     // Separate /home is an LVM thin LV (or a btrfs @home subvol), never a
     // standalone partition — validation enforces that pairing.
     _ = d.home_part;
@@ -304,18 +315,26 @@ fn initrdStage(alloc: Allocator, cfg: *const Config, dir: []const u8) []const u8
         "[ -n \"$i\" ] || {{ echo 'no initramfs to stage' >&2; exit 1; }}; " ++
         "cp -f \"$i\" {s}/initramfs.img || exit 1", .{dir});
 }
-// Partition GUIDs we assign at sgdisk time — deterministic per index so
-// the plan knows its own PARTUUIDs and can persist them in fstab/root=
-// (kernel names like /dev/sda3 are NOT stable across renumbering).
-fn partGuid(alloc: Allocator, n: u32) []const u8 {
-    return s(alloc, "0f8b2e00-1e1e-4a00-a000-{x:0>12}", .{n});
+// Partition GUIDs we assign at sgdisk time — derived from the plan's
+// random disk seed XOR the index, so every install's PARTUUIDs are
+// globally unique and the plan can persist them in fstab/root= (kernel
+// names like /dev/sda3 are NOT stable across renumbering). RFC 4122
+// version/variant bits are set so the values are well-formed UUIDs.
+fn partGuid(alloc: Allocator, seed: u128, n: u32) []const u8 {
+    const mix = seed ^ (@as(u128, n) *% 0x9e3779b97f4a7c15c39d7f1b08b5e9);
+    const a: u32 = @truncate(mix >> 96);
+    const b: u16 = @truncate(mix >> 80);
+    const c: u16 = (@as(u16, @truncate(mix >> 64)) & 0x0fff) | 0x4000;
+    const d: u16 = (@as(u16, @truncate(mix >> 48)) & 0x3fff) | 0x8000;
+    const e: u48 = @truncate(mix);
+    return s(alloc, "{x:0>8}-{x:0>4}-{x:0>4}-{x:0>4}-{x:0>12}", .{ a, b, c, d, e });
 }
 
 /// Persistent identifier for a partition — PARTUUID, resolved by mount
 /// and the kernel alike. Exec-time ops (sgdisk/mkfs/mount) keep using
 /// the canonical /dev path from partPath.
-fn partIdent(alloc: Allocator, n: u32) []const u8 {
-    return s(alloc, "PARTUUID={s}", .{partGuid(alloc, n)});
+fn partIdent(alloc: Allocator, seed: u128, n: u32) []const u8 {
+    return s(alloc, "PARTUUID={s}", .{partGuid(alloc, seed, n)});
 }
 
 /// The partition index the root filesystem lands on (plain layouts).
@@ -328,14 +347,14 @@ fn rootPartIdx(cfg: *const Config) u32 {
 
 /// Persistent root identifier for root= and fstab: mapper/LV names are
 /// already stable; plain partitions use their assigned PARTUUID.
-pub fn rootIdent(alloc: Allocator, cfg: *const Config) []const u8 {
+pub fn rootIdent(alloc: Allocator, cfg: *const Config, seed: u128) []const u8 {
     if (cfg.disk.lvm) return "/dev/vg0/root";
     if (cfg.disk.luks) return "/dev/mapper/cryptroot";
-    return partIdent(alloc, rootPartIdx(cfg));
+    return partIdent(alloc, seed, rootPartIdx(cfg));
 }
 
-fn kernelArgs(alloc: Allocator, cfg: *const Config) []const u8 {
-    var r = s(alloc, "root={s}", .{rootIdent(alloc, cfg)});
+fn kernelArgs(alloc: Allocator, cfg: *const Config, seed: u128) []const u8 {
+    var r = s(alloc, "root={s}", .{rootIdent(alloc, cfg, seed)});
     // btrfs: install mounted subvol=@root — boot must select it too.
     if (cfg.disk.root_fs == .btrfs)
         r = s(alloc, "{s} rootflags=subvol=@root", .{r});
@@ -743,7 +762,7 @@ fn prepend(alloc: Allocator, head: []const u8, tail: []const []const u8) ![]cons
     return out;
 }
 
-fn planFstab(alloc: Allocator, cfg: *const Config) !Step {
+fn planFstab(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
     var c: std.ArrayList(Cmd) = .empty;
     var aw: std.Io.Writer.Allocating = .init(alloc);
     const w = &aw.writer;
@@ -751,15 +770,15 @@ fn planFstab(alloc: Allocator, cfg: *const Config) !Step {
     // Persistent identifiers only: PARTUUID for partitions (assigned by
     // our own sgdisk -u flags), mapper/LV names where already stable —
     // kernel /dev/sdX names can shift across renumbering.
-    const root_ident = rootIdent(alloc, cfg);
+    const root_ident = rootIdent(alloc, cfg, seed);
     try w.writeAll("# generated by gentoo-installer (persistent ids)\n");
     try w.print("{s}\t/\t{s}\t{s}defaults\t0 1\n", .{ root_ident, @tagName(cfg.disk.root_fs), if (root.opts.len > 0) s(alloc, "{s},", .{root.opts}) else "" });
     if (cfg.boot_mode == .uefi)
-        try w.print("{s}\t/efi\tvfat\tdefaults\t0 2\n", .{partIdent(alloc, 1)});
+        try w.print("{s}\t/efi\tvfat\tdefaults\t0 2\n", .{partIdent(alloc, seed, 1)});
     if (cfg.disk.swap == .partition)
-        try w.print("{s}\tnone\tswap\tsw\t0 0\n", .{partIdent(alloc, 2)}); // swap is always index 2 (after esp/biosboot)
+        try w.print("{s}\tnone\tswap\tsw\t0 0\n", .{partIdent(alloc, seed, 2)}); // swap is always index 2 (after esp/biosboot)
     if (cfg.disk.boot_part)
-        try w.print("{s}\t/boot\text4\tdefaults\t0 2\n", .{partIdent(alloc, bootPartIdx(cfg))});
+        try w.print("{s}\t/boot\text4\tdefaults\t0 2\n", .{partIdent(alloc, seed, bootPartIdx(cfg))});
     if (cfg.disk.lvm and cfg.disk.home_part and cfg.disk.root_fs != .btrfs)
         try w.print("/dev/vg0/home\t/home\t{s}\tdefaults\t0 2\n", .{@tagName(cfg.disk.root_fs)});
     if (cfg.disk.root_fs == .btrfs) {
@@ -991,7 +1010,7 @@ fn planPackages(alloc: Allocator, cfg: *const Config, sets: Sets) !Step {
     return step(alloc, "packages", "Install packages", c);
 }
 
-fn planBootloader(alloc: Allocator, cfg: *const Config) !Step {
+fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
     var c: std.ArrayList(Cmd) = .empty;
     const bl = config.resolveBootloader(cfg);
     switch (bl) {
@@ -1025,7 +1044,7 @@ fn planBootloader(alloc: Allocator, cfg: *const Config) !Step {
             // (a separate ext4 partition when disk.boot_part, else the
             // root fs — validation restricts bare-root BIOS to ext4).
             const stage_dir = if (cfg.boot_mode == .uefi) "/efi" else "/boot";
-            try c.append(alloc, wf(alloc, s(alloc, "/mnt/gentoo{s}/limine.conf", .{stage_dir}), limineConf(alloc, cfg)));
+            try c.append(alloc, wf(alloc, s(alloc, "/mnt/gentoo{s}/limine.conf", .{stage_dir}), limineConf(alloc, cfg, seed)));
             // kernel-install hook: stage kernel+initramfs at the fixed
             // paths limine.conf references. installkernel invokes this on
             // every kernel add/remove — upgrades stay seamless.
@@ -1097,7 +1116,7 @@ fn planBootloader(alloc: Allocator, cfg: *const Config) !Step {
             } });
             try c.append(alloc, wf(alloc, "/mnt/gentoo/efi/loader/loader.conf", "default gentoo.conf\ntimeout 4\n"));
             try c.append(alloc, wf(alloc, "/mnt/gentoo/efi/loader/entries/gentoo.conf",
-                s(alloc, "title   Gentoo Linux\nlinux   /vmlinuz\n{s}options {s}\n", .{ if (cfg.system.initramfs == .none) "" else "initrd  /initramfs.img\n", kernelArgs(alloc, cfg) })));
+                s(alloc, "title   Gentoo Linux\nlinux   /vmlinuz\n{s}options {s}\n", .{ if (cfg.system.initramfs == .none) "" else "initrd  /initramfs.img\n", kernelArgs(alloc, cfg, seed) })));
             // kernel-install hook keeps the entry current on upgrades.
             try c.append(alloc, .{ .write_file = .{
                 .path = "/mnt/gentoo/etc/kernel/install.d/91-sd-boot.install",
@@ -1137,7 +1156,7 @@ fn planBootloader(alloc: Allocator, cfg: *const Config) !Step {
                     "d=$(lsblk -no PKNAME \"$esp\"); p=$(lsblk -no PARTN \"$esp\"); " ++
                     "[ -n \"$d\" ] && [ -n \"$p\" ] || exit 1; " ++
                     "efibootmgr -c -d /dev/$d -p $p -L Gentoo -l '\\vmlinuz' " ++
-                    "-u '{s}{s}'", .{ kernelArgs(alloc, cfg), if (cfg.system.initramfs == .none) "" else " initrd=\\initramfs.img" }) }),
+                    "-u '{s}{s}'", .{ kernelArgs(alloc, cfg, seed), if (cfg.system.initramfs == .none) "" else " initrd=\\initramfs.img" }) }),
                 .chroot = true,
                 .desc = "efibootmgr: create Gentoo NVRAM entry",
             } });
@@ -1236,12 +1255,12 @@ fn grubEfiTarget(cfg: *const Config) []const u8 {
     };
 }
 
-fn limineConf(alloc: Allocator, cfg: *const Config) []const u8 {
+fn limineConf(alloc: Allocator, cfg: *const Config, seed: u128) []const u8 {
     var aw: std.Io.Writer.Allocating = .init(alloc);
     const w = &aw.writer;
     w.writeAll("# generated by gentoo-installer\n") catch {};
     w.writeAll("timeout: 5\n\n") catch {};
-    const root_args = kernelArgs(alloc, cfg);
+    const root_args = kernelArgs(alloc, cfg, seed);
     // boot:// resolves on the volume holding limine.conf: ESP root under
     // UEFI or a dedicated /boot partition; the root fs otherwise, where
     // staged files live under /boot/.
@@ -1306,7 +1325,7 @@ test "golden plan: uefi + luks + lvm + btrfs + limine" {
     defer arena.deinit();
     const alloc = arena.allocator();
     const cfg = try config.decode(alloc, doc);
-    const plan = try build(alloc, &cfg, null, .{});
+    const plan = try build(alloc, &cfg, null, .{}, 0x0123456789abcdef0123456789abcdef);
 
     const expected_ids = [_][]const u8{
         "detect",       "partition",      "mount",          "stage3",
@@ -1369,34 +1388,54 @@ test "persistent ids: fstab + kernel args use PARTUUID, exec paths use /dev" {
     const alloc = arena.allocator();
     var cfg = try config.decode(alloc, doc);
     cfg.boot_mode = .uefi;
-    const plan = try build(alloc, &cfg, null, .{});
+    const seed: u128 = 0xdeadbeefcafebabe0123456789abcdef;
+    const plan = try build(alloc, &cfg, null, .{}, seed);
 
-    var saw_partuuid_root = false;
+    // UEFI + swap-partition: esp=1, swap=2, root=3. Assert each fstab
+    // entry carries ITS partition's GUID, not just any PARTUUID.
+    const guid_root = partGuid(alloc, seed, 3);
+    const guid_esp = partGuid(alloc, seed, 1);
+    const guid_swap = partGuid(alloc, seed, 2);
+    const root_ref = s(alloc, "PARTUUID={s}", .{guid_root});
+    var saw_root = false;
+    var saw_esp = false;
+    var saw_swap = false;
+    var saw_rootarg = false;
     var saw_dev_root = false;
     var sgdisk_u = false;
     for (plan.steps) |st| for (st.cmds) |cmd| {
         switch (cmd) {
             .write_file => |w| {
-                if (std.mem.indexOf(u8, w.content, "PARTUUID=0f8b2e00-1e1e-4a00-a000-") != null) {
-                    if (std.mem.indexOf(u8, w.content, "/\t") != null)
-                        saw_partuuid_root = true;
-                    if (std.mem.indexOf(u8, w.content, "root=PARTUUID=") != null)
-                        saw_partuuid_root = true;
+                if (std.mem.eql(u8, w.path, "/mnt/gentoo/etc/fstab")) {
+                    var it = std.mem.splitScalar(u8, w.content, '\n');
+                    while (it.next()) |line| {
+                        if (std.mem.indexOf(u8, line, "\t/\t") != null and std.mem.indexOf(u8, line, root_ref) != null)
+                            saw_root = true;
+                        if (std.mem.indexOf(u8, line, "/efi") != null and std.mem.indexOf(u8, line, s(alloc, "PARTUUID={s}", .{guid_esp})) != null)
+                            saw_esp = true;
+                        if (std.mem.indexOf(u8, line, "swap") != null and std.mem.indexOf(u8, line, s(alloc, "PARTUUID={s}", .{guid_swap})) != null)
+                            saw_swap = true;
+                    }
+                    if (std.mem.indexOf(u8, w.content, "/dev/vdb") != null)
+                        saw_dev_root = true;
                 }
-                if (std.mem.indexOf(u8, w.content, "root=/dev/vdb") != null)
-                    saw_dev_root = true;
+                if (std.mem.indexOf(u8, w.content, s(alloc, "root=PARTUUID={s}", .{guid_root})) != null)
+                    saw_rootarg = true;
             },
             .exec => |e| {
                 if (std.mem.eql(u8, e.argv[0], "sgdisk"))
                     for (e.argv) |a| {
-                        if (std.mem.startsWith(u8, a, "-u") and std.mem.indexOf(u8, a, "0f8b2e00") != null)
+                        if (std.mem.startsWith(u8, a, "-u") and std.mem.endsWith(u8, a, guid_root))
                             sgdisk_u = true;
                     };
             },
             else => {},
         }
     };
-    try std.testing.expect(sgdisk_u);
-    try std.testing.expect(saw_partuuid_root);
-    try std.testing.expect(!saw_dev_root);
+    try std.testing.expect(sgdisk_u);      // sgdisk assigned root's PARTUUID
+    try std.testing.expect(saw_root);      // fstab / line uses root PARTUUID
+    try std.testing.expect(saw_esp);       // fstab /efi line uses esp PARTUUID
+    try std.testing.expect(saw_swap);      // fstab swap line uses swap PARTUUID
+    try std.testing.expect(saw_rootarg);   // a written file carries root=PARTUUID
+    try std.testing.expect(!saw_dev_root); // no /dev/vdb persisted
 }

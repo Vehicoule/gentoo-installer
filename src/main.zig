@@ -322,7 +322,7 @@ pub fn main(init: std.process.Init) !void {
     }
     pkg_sets = .{ .atoms = rs.resolved.atoms, .repos = rs.resolved.repos };
 
-    const p = try engine.plan.build(alloc, &cfg, if (env_opt) |*e| e else null, pkg_sets);
+    const p = try engine.plan.build(alloc, &cfg, if (env_opt) |*e| e else null, pkg_sets, null);
     try engine.runner.run(io, alloc, p, .{
         .mode = if (dry_run or cmd == .plan) .dry_run else .exec,
         .journal_path = if (cmd == .run and !dry_run) journal_path else null,
