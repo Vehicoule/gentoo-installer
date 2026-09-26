@@ -428,6 +428,23 @@ GUI is a separate build artifact; the TUI/engine binary stays dependency-free.
 - **M7** — distro preset layer hardening (branding, extra steps,
   post-install hooks), docs, 1.0.
 
+## Efficiency budget
+
+Memory efficiency is a distro value, so the installer measures itself:
+
+| surface | target | rationale |
+|---|---|---|
+| engine+TUI binary | ≤ 4 MiB, one artifact | runs on the *minimal* ISO; no deps past libc |
+| engine RSS | ≤ 32 MiB during any step | installs must work on ≤ 1 GiB VMs |
+| TUI repaint | ≤ 16 ms full draw at 80×24 | libvaxis does terminal-query detection — no terminfo dep on a stripped ISO |
+| GUI binary | ≤ 15 MiB, ≤ 150 MiB RSS | LiveGUI only — never shipped on the minimal ISO |
+| ISO additive weight | ≤ 25 MiB total (engine+TUI+GUI+preset assets) | keeps the live image lean |
+| startup | `hello` → first page ≤ 300 ms cold | perceived polish |
+| event stream | ≤ 1 MB/day steady-state | NDJSON lines are tiny; `log` events dominate, streamed not buffered |
+
+Enforcement: CI builds `-Drelease=small` and fails on binary-size or
+peak-RSS regression (QEMU smoke run); the table is the ratchet.
+
 ## Open questions
 
 1. License — defaulting to **GPL-3.0-or-later** (installer convention, e.g.
