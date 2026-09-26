@@ -396,31 +396,43 @@ pub const Wizard = struct {
     fn emitSummary(w: *Wizard, out: *std.Io.Writer) !void {
         var buf: [pages.len]usize = undefined;
         const order = w.flowOrder(&buf);
+        var seen: [pages.len]bool = .{false} ** pages.len;
         var first_g = true;
         for (order) |pi| {
             const pg = pages[pi];
             if (std.mem.eql(u8, pg.id, "review")) continue;
-            if (!first_g) try out.writeAll(",");
-            first_g = false;
-            try out.writeAll("{\"title\":\"");
-            jesc(out, pg.title);
-            try out.writeAll("\",\"lines\":[");
-            var first_l = true;
-            for (pg.fields) |f| {
-                if (f.expert and w.flow == .express) continue;
-                if (f.visible) |vis| if (!vis(w)) continue;
-                if (!first_l) try out.writeAll(",");
-                first_l = false;
-                var aw: std.Io.Writer.Allocating = .init(w.alloc);
-                defer aw.deinit();
-                try aw.writer.writeAll(f.label);
-                try aw.writer.writeAll(": ");
-                try w.fmtField(&aw.writer, f);
-                try jstr(out, aw.written());
-            }
-            try out.writeAll("]}");
+            seen[pi] = true;
+            try w.emitSummaryGroup(out, pg, &first_g);
+        }
+        // Pages hidden by the flow still carry the configured defaults —
+        // the review must show them before the user confirms.
+        for (pages, 0..) |pg, pi| {
+            if (seen[pi] or std.mem.eql(u8, pg.id, "review")) continue;
+            try w.emitSummaryGroup(out, pg, &first_g);
         }
         try out.writeAll("]");
+    }
+
+    fn emitSummaryGroup(w: *Wizard, out: *std.Io.Writer, pg: Page, first_g: *bool) !void {
+        if (!first_g.*) try out.writeAll(",");
+        first_g.* = false;
+        try out.writeAll("{\"title\":\"");
+        jesc(out, pg.title);
+        try out.writeAll("\",\"lines\":[");
+        var first_l = true;
+        for (pg.fields) |f| {
+            if (f.expert and w.flow == .express) continue;
+            if (f.visible) |vis| if (!vis(w)) continue;
+            if (!first_l) try out.writeAll(",");
+            first_l = false;
+            var aw: std.Io.Writer.Allocating = .init(w.alloc);
+            defer aw.deinit();
+            try aw.writer.writeAll(f.label);
+            try aw.writer.writeAll(": ");
+            try w.fmtField(&aw.writer, f);
+            try jstr(out, aw.written());
+        }
+        try out.writeAll("]}");
     }
 
     /// Human-readable field value — same policy as emitValue but text.
@@ -633,13 +645,24 @@ pub const Wizard = struct {
     pub fn setField(w: *Wizard, name: []const u8, v: std.json.Value) WizardError!void {
         // Snapshot before mutation — cfg fields are replaced, never
         // edited in place, so restoring the struct is a full rollback.
+        // flow/page_idx ride along: a rejected `flow.mode` switch or a
+        // locked answer file must leave the wizard exactly where it was.
         const prev = w.cfg;
-        try w.setFieldInner(name, v);
+        const prev_flow = w.flow;
+        const prev_page = w.page_idx;
+        w.setFieldInner(name, v) catch |e| {
+            w.cfg = prev;
+            w.flow = prev_flow;
+            w.page_idx = prev_page;
+            return e;
+        };
         // Derived changes (libc→init, hardening→selinux, init→netmanager)
         // skip the per-field lock check — verify every locked path on the
         // final cfg and roll the whole set back on violation.
         w.checkLocksPost() catch |e| {
             w.cfg = prev;
+            w.flow = prev_flow;
+            w.page_idx = prev_page;
             return e;
         };
     }
@@ -815,6 +838,9 @@ pub const Wizard = struct {
 
     /// Hash a plaintext password via openssl — stdin only, never argv.
     fn hashPassword(w: *Wizard, pw: []const u8) WizardError![]const u8 {
+        // Bound the payload: stdin is written before stdout drains, so an
+        // unbounded password could stall the session on pipe backpressure.
+        if (pw.len > 1024) return error.BadValue;
         var child = std.process.spawn(w.io, .{
             .argv = &.{ "openssl", "passwd", "-6", "-stdin" },
             .stdin = .pipe,
@@ -1334,6 +1360,12 @@ pub const Wizard = struct {
             .data = aw.written(),
             .flags = .{ .truncate = true, .permissions = .fromMode(0o600) },
         }) catch return error.WriteFailed;
+        // permissions only apply at create — an existing file keeps its
+        // mode, so force 0600 to cover overwriting a permissive one.
+        if (std.Io.Dir.cwd().openFile(w.io, real, .{})) |f| {
+            defer f.close(w.io);
+            f.setPermissions(w.io, .fromMode(0o600)) catch return error.WriteFailed;
+        } else |_| return error.WriteFailed;
     }
 
     /// Resolve cfg.packages.sets through the attached preset (or the

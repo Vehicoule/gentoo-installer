@@ -185,6 +185,26 @@ fn writeFile(io: std.Io, path: []const u8, content: []const u8, mode: u32) !void
 /// commands need post-hoc redaction before anything reaches stderr.
 const DrainArgs = struct { io: std.Io, file: std.Io.File, collect: ?*std.Io.Writer.Allocating };
 
+/// Strip bytes that could drive terminal control sequences — child
+/// output can carry attacker-controlled content (mirror metadata,
+/// package logs). C0/DEL controls are dropped; \n/\t/\r and ≥0x80
+/// (UTF-8 text) are kept.
+fn termSanitize(dst: []u8, src: []const u8) []const u8 {
+    var n: usize = 0;
+    for (src) |b| {
+        const ok = switch (b) {
+            '\n', '\t', '\r' => true,
+            0x7f => false,
+            else => b >= 0x20,
+        };
+        if (ok) {
+            dst[n] = b;
+            n += 1;
+        }
+    }
+    return dst[0..n];
+}
+
 fn drainChild(da: DrainArgs) void {
     var rbuf: [8192]u8 = undefined;
     var r = da.file.reader(da.io, &rbuf);
@@ -193,7 +213,15 @@ fn drainChild(da: DrainArgs) void {
     } else {
         var sbuf: [8192]u8 = undefined;
         var sw = std.Io.File.stderr().writer(da.io, &sbuf);
-        _ = r.interface.streamRemaining(&sw.interface) catch {};
+        var fbuf: [8192]u8 = undefined;
+        // peekGreedy(1) = one underlying read — forward each chunk
+        // sanitized instead of waiting to fill a large buffer.
+        while (true) {
+            const chunk = r.interface.peekGreedy(1) catch break;
+            if (chunk.len == 0) break;
+            r.interface.toss(chunk.len);
+            sw.interface.writeAll(termSanitize(&fbuf, chunk)) catch break;
+        }
         sw.interface.flush() catch {};
     }
 }
@@ -274,6 +302,7 @@ fn execCmd(io: std.Io, alloc: Allocator, e: plan.Exec) !void {
         const data = e.stdin.?;
         var sebuf: [8192]u8 = undefined;
         var sew = std.Io.File.stderr().writer(io, &sebuf);
+        var fbuf: [8192]u8 = undefined;
         for ([_][]const u8{ out_buf.written(), err_buf.written() }) |raw| {
             var body = raw;
             if (body.len == 0) continue;
@@ -285,7 +314,13 @@ fn execCmd(io: std.Io, alloc: Allocator, e: plan.Exec) !void {
                 if (t.len == 0) continue;
                 body = std.mem.replaceOwned(u8, alloc, body, t, "[redacted]") catch body;
             }
-            sew.interface.writeAll(body) catch {};
+            // same terminal-escape filter as the streaming drain
+            var off: usize = 0;
+            while (off < body.len) {
+                const n = @min(body.len - off, fbuf.len);
+                sew.interface.writeAll(termSanitize(&fbuf, body[off..][0..n])) catch break;
+                off += n;
+            }
         }
         sew.interface.flush() catch {};
     }

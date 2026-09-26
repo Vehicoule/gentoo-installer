@@ -337,14 +337,20 @@ pub const Tui = struct {
             else => "",
         };
         var idx: usize = 0;
+        var matched = false;
         for (f.options, 0..) |o, i| {
             if (std.mem.eql(u8, o.v, cur)) {
                 idx = i;
+                matched = true;
                 break;
             }
         }
         const n = f.options.len;
-        const ni = @mod(@as(i32, @intCast(idx)) + dir, @as(i32, @intCast(n)));
+        // unset value → first option on forward cycle, last on backward
+        const ni: usize = if (!matched)
+            (if (dir > 0) 0 else n - 1)
+        else
+            @intCast(@mod(@as(i32, @intCast(idx)) + dir, @as(i32, @intCast(n))));
         try t.wiz.setField(f.name, .{ .string = f.options[@intCast(ni)].v });
         try t.refreshErrors();
         try t.refreshPage();
