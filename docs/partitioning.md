@@ -52,11 +52,18 @@ offered as a target.
 Every `create_part`/`format` op carries ID postconditions so `--resume`
 and `detect --repair` can distinguish "op already applied" from "op
 needed". IDs are **prescribed where the tool allows** — `sgdisk -u
-<part>:<GUID>` sets the planned PARTUUID, `mkfs.* -U` (btrfs/ext4/f2fs)
-/ `-m uuid=` (xfs) / `-i` (vfat) set the fs uuid — and **captured
-post-op where they can't be** (LUKS container UUID via
-`cryptsetup luksUUID`, md/LVM metadata ids via `blkid` after partprobe).
-Either way the journal records what the disk actually ended up with.
+<part>:<GUID>` sets the planned PARTUUID; `mkfs.* -U` (btrfs/ext4/f2fs),
+`-m uuid=` (xfs), `-i` (vfat — a 32-bit serial surfaced as `XXXX-XXXX`,
+FAT has no real UUID) set fs ids; `cryptsetup luksFormat --uuid` sets
+the LUKS UUID; `pvcreate --uuid` sets the PV uuid. What remains
+unprescribed — VG/LV uuids — is probed with the LVM tools
+(`vgs`/`lvs -o *_uuid`, not `blkid`) and journaled.
+
+Repair after a reboot (live journal gone) anchors on prescribed IDs,
+never generated ones: a partition slot is identified by its planned
+PARTUUID; `cryptsetup isLuks` or an LVM PV signature on that slot
+proves `luks_format`/`pvcreate` ran; `vg0`/`tank`/`root` names plus
+the parent PV's signature are the VG/LV identity check.
 
 ## Layer stacking (fixed order)
 
@@ -175,6 +182,9 @@ journal, never `Cmd` serialization (the dry-run log redacts them).
   state against a planned `DiskPlan`, classify ops as done/pending/failed.
 - The point of no return is the **first mutating op**: `wipe_table` on
   erase layouts, `resize_fs` on alongside (which has no wipe_table).
-  P7's gate — type-the-disk for `wipe=true`, the "existing OS will be
-  modified/shrunk" acknowledgement for alongside — stands immediately
-  before that op in the stream; every op before it is read-only.
+  P7's gate stands immediately before it — type-the-disk for
+  `wipe=true`; for alongside, a **plan-derived** acknowledgement:
+  "shrink <fs> on <part> by N MiB" under `space_src=shrink`, "create
+  partitions in unallocated space beside <os>" under `free-space`
+  (nothing existing is touched). Every op before the gate is
+  read-only.

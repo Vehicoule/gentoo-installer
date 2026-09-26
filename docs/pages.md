@@ -206,7 +206,7 @@ private" notice. SSH authorized keys are copied verbatim.
 | Field | Type | Notes |
 |---|---|---|
 | confirm_wipe | type-the-device-name | required when `wipe=true` |
-| confirm_text | acknowledge checkbox | alongside mode: "existing OS will be modified/shrunk" |
+| confirm_text | acknowledge checkbox | alongside mode: plan-derived — `shrink` ⇒ "existing OS partition will be shrunk"; `free-space` ⇒ "new partitions in unallocated space; existing data untouched" |
 
 ## P8 — Progress
 
