@@ -19,11 +19,14 @@ multi-line payloads (embedded text is `\n`-escaped inside the object).
 
 ## Correlation
 
-Every op may carry `"id": <int>`; its terminal reply
-(`result`/`error`/`answer_needed`) echoes that id. Ops are processed in
-order, but **unsolicited events** (`step`, `log`, `progress`) interleave
-freely and carry no id — frontends must not assume reply adjacency.
-An `id`-less op gets the next reply; interactive frontends may omit ids.
+Every op may carry `"req": <int>` — a client-chosen correlation token
+its terminal reply (`result`, `error`, or the solicited event itself)
+echoes in `req`. Ops are processed in order, but **unsolicited
+events** (`step`, `log`, `progress`, `ask`) interleave freely and
+carry no `req` — frontends must not assume reply adjacency.
+`req` is only correlation — object identity uses named fields: page
+selection is `"page"`, ask/answer matching is `"ask"` (an opaque
+token), both strings.
 
 ## Session lifecycle
 
@@ -34,9 +37,11 @@ hello ──► ready ──► (detect) ──► wizard ──► review ─�
                                         any time: cancel ──►┴─ cancelled
 ```
 
-`ready` means the engine accepted the handshake; `installing` means the
-pipeline is running; terminal states are `done` and `cancelled`.
-`--resume` enters at `installing` with a restored journal.
+The `hello` reply **is** the ready signal — no separate `ready` event.
+`installing` means the pipeline is running; terminal states are `done`
+and `cancelled`. `--resume` enters at `installing` with a restored
+journal. (`repair` in-protocol is the same engine path as the
+`detect --repair` CLI — one implementation, two entry points.)
 
 ## Ops
 
@@ -47,37 +52,38 @@ pipeline is running; terminal states are `done` and `cancelled`.
 | `get_config` | — | `config` | secrets masked (`{"secret":true,"is_set":bool}`) |
 | `set` | `field`, `value` | `result` + `validate` delta | dotted path (`disk.root_fs`); secrets accepted, never re-emitted |
 | `set_config` | `config` | `result` + `validate` | bulk load (answer file import) |
-| `page` | `id?` | `page` | current page or the named one |
+| `page` | `page?` (name) | `page` | current page or the named one |
 | `next` | — | `page` or `review` | runs page VALIDATE first; `error` on failure |
 | `back` | — | `page` | — |
-| `goto` | `id` | `page` | review-page jump links; backward jumps only mutate nav |
+| `goto` | `page` | `page` | review-page jump links; backward jumps only mutate nav |
 | `plan` | — | `plan` | the DiskPlan/`Cmd` preview — dry-run identical |
 | `validate` | — | `validate` | whole-config check (P7's gate backend) |
 | `export_answer` | `path` | `result` | writes TOML mode 0600; passwords → hashes |
 | `install` | `dry_run` | stream, ends `done` | enters `installing` |
-| `answer` | `id`, `value` | `result` | replies to `ask` events |
+| `answer` | `ask`, `value` | `result` | replies to `ask` events by token |
 | `retry` / `skip` / `abort` | — | `result` | valid only during `step_failed` pause |
 | `cancel` | — | `cancelled` when safe point hit | finishes the in-flight step first |
-| `repair` | — | `env` + `plan` | post-reboot path: diff disk vs plan |
+| `repair` | — | `env` + `plan` | in-protocol form of `detect --repair`: post-reboot diff of disk vs plan |
 | `quit` | — | `bye` | clean close |
 
 ## Events
 
 | ev | fields | when |
 |---|---|---|
-| `hello` | `engine`, `version`, `caps[]` | handshake reply |
+| `hello` | `engine`, `version`, `caps[]` | handshake reply — doubles as `ready` |
+| `result` | `req`, `ok:true`, `data?` | ack for mutation ops (`set`, `answer`, `retry`…) |
 | `env` | `boot`, `arch`, `ram_mib`, `net`, `disks[]`, `oses[]`, `esps[]`, `live_media` | after `detect`; also pushed when hotplug changes disks |
 | `config` | `config` (secrets masked) | `get_config` reply |
-| `page` | `id`, `index`, `of`, `title`, `fields[]`, `actions[]` | navigation replies |
+| `page` | `page` (name), `index`, `of`, `title`, `fields[]`, `actions[]` | navigation replies |
 | `validate` | `errors[]{path,code,message,hint}`, `warnings[]` | after `set`, `next`, `validate` |
 | `plan` | `ops[]` (the partitioning doc's op list), `cmds[]` preview | `plan` reply |
 | `step` | `i`, `of`, `name`, `state`(started/done/failed/skipped), `secs?` | pipeline progress |
 | `progress` | `step`, `bytes?`, `pct?`, `label` | sub-step detail (downloads, rsync, emerge ETA) |
 | `log` | `step`, `stream`(out/err), `line` | tool output, line-buffered |
-| `ask` | `id`, `kind`(choice/confirm/secret/string), `prompt`, `options[]?` | engine needs input mid-step (LUKS passphrase, retry choice) |
-| `answer_needed` | `id` | marker that a step is paused on `ask` |
+| `ask` | `ask` (token), `kind`(choice/confirm/secret/string), `prompt`, `options[]?` | engine needs input mid-step (LUKS passphrase, retry choice) |
+| `answer_needed` | `ask` | marker that a step is paused awaiting `answer` |
 | `done` | `ok`, `summary?`, `failures[]?` | install finished |
-| `error` | `code`, `message`, `hint`, `id?` | op failure or fatal step |
+| `error` | `code`, `message`, `hint`, `req?` | op failure or fatal step |
 | `cancelled` | `completed_steps`, `resumable` | cancel finished |
 | `bye` | — | quit acknowledged |
 
@@ -87,22 +93,25 @@ pipeline is running; terminal states are `done` and `cancelled`.
 owns labels, defaults, options, visibility:
 
 ```json
-{"ev":"page","id":"disk","index":1,"of":9,"fields":[
+{"ev":"page","page":"disk","index":1,"of":9,"fields":[
   {"name":"disk.scheme","type":"enum","label":"Install mode",
    "options":[{"v":"normal","label":"Erase disk"},
               {"v":"alongside","label":"Install alongside Windows",
-               "help":"Keeps your existing OS","hidden_if":"!oses"}],
+               "help":"Keeps your existing OS"}],
    "value":"normal","default":"normal"},
   {"name":"disk.luks_passphrase","type":"secret","label":"Encryption passphrase",
-   "visible_if":"disk.luks","min":8,"confirm":true}],
+   "min":8,"confirm":true}],
  "actions":["next","back"]}
 ```
 
 Field types: `enum`, `bool`, `int`, `string`, `secret`, `list`, `record`,
-`table`, `path`. `visible_if`/`hidden_if` are expressions evaluated by
-the engine — frontends get a fresh `page` event whenever a `set` changes
-visibility, so they never evaluate predicates themselves. `expert` fields
-are simply absent in Express flow.
+`table`, `path`. Visibility predicates live **engine-side only**: the
+emitted schema already omits fields and enum options whose conditions
+are false (the example above is emitted for a machine with a detected
+OS and `disk.luks=true` — otherwise `alongside` and the passphrase
+field are simply absent). Frontends get a fresh `page` event whenever
+a `set` changes visibility; they never evaluate predicates. `expert`
+fields are absent in Express flow.
 
 ## Secrets
 
@@ -132,23 +141,22 @@ bump — consumers ignore unknown keys; removing/renaming is a major bump.
 ```jsonl
 → {"op":"hello","version":1,"client":"gui-libcosmic"}
 ← {"ev":"hello","engine":"0.2.0","version":1,"caps":["wizard","install","detect","repair"]}
-→ {"op":"detect","id":1}
-← {"ev":"env","id":1,"boot":"uefi","arch":"amd64","ram_mib":15625,
-   "net":true,"oses":[{"kind":"windows","disk":"/dev/nvme0n1"}],
-   "disks":[{...}],"esps":[{...}]}
+→ {"op":"detect","req":1}
+← {"ev":"env","req":1,"boot":"uefi","arch":"amd64","ram_mib":15625,"net":true,"oses":[{"kind":"windows","disk":"/dev/nvme0n1"}],"disks":[{"path":"/dev/nvme0n1","size_gib":476,"model":"nvme"}],"esps":[{"part":"/dev/nvme0n1p1","free_mib":240}]}
 → {"op":"set","field":"mode","value":"express"}
-→ {"op":"page","id":2}
-← {"ev":"page","id":"disk",...}
-→ {"op":"set","field":"disk.device","value":"/dev/nvme0n1","id":3}
-← {"ev":"validate","id":3,"errors":[],"warnings":[{"code":"W_ESP","message":"existing ESP has 240 MiB free"}]}
-← {"ev":"page","id":"disk","fields":[... shrunk visibility update ...]}
-→ {"op":"plan","id":4}
-← {"ev":"plan","id":4,"ops":[{"op":"wipe_table",...}],"cmds":["sgdisk -Z /dev/nvme0n1", ...]}
+→ {"op":"page","page":"disk","req":2}
+← {"ev":"page","req":2,"page":"disk","index":1,"of":9,"fields":[{"name":"disk.device","type":"enum","options":[{"v":"/dev/nvme0n1","label":"nvme · 476 GiB"}]}],"actions":["next","back"]}
+→ {"op":"set","field":"disk.device","value":"/dev/nvme0n1","req":3}
+← {"ev":"result","req":3,"ok":true}
+← {"ev":"validate","errors":[],"warnings":[{"code":"W_ESP","message":"existing ESP has 240 MiB free"}]}
+→ {"op":"plan","req":4}
+← {"ev":"plan","req":4,"ops":[{"op":"wipe_table","disk":"/dev/nvme0n1"},{"op":"create_part","name":"ESP","size_mib":512,"type":"EF00"}],"cmds":["sgdisk -Z /dev/nvme0n1","sgdisk -n1:1MiB:+512MiB -t1:EF00 /dev/nvme0n1"]}
 → {"op":"install","dry_run":false}
 ← {"ev":"step","i":1,"of":16,"name":"detect","state":"done","secs":0.8}
 ← {"ev":"step","i":2,"of":16,"name":"partition","state":"started"}
-← {"ev":"ask","id":"a1","kind":"confirm","prompt":"Wipe /dev/nvme0n1? type nvme0n1"}
-→ {"op":"answer","id":"a1","value":"nvme0n1"}
+← {"ev":"ask","ask":"a1","kind":"confirm","prompt":"Wipe /dev/nvme0n1? type nvme0n1"}
+→ {"op":"answer","ask":"a1","value":"nvme0n1"}
+← {"ev":"result","ok":true}
 ← {"ev":"log","step":2,"stream":"out","line":"Created new GPT entries"}
 ← {"ev":"step","i":2,"state":"done","secs":3.1}
 ← {"ev":"done","ok":true,"summary":{"hostname":"gentoo","users":["larry"]}}
