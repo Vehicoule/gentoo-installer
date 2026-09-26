@@ -4,3 +4,4 @@ zig-out/
 target/
 *.swp
 .DS_Store
+zig-pkg/
