@@ -1,6 +1,3 @@
-zig-cache/
 zig-out/
 .zig-cache/
-target/
-*.swp
-.DS_Store
+zig-cache/
