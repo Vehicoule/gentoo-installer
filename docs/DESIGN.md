@@ -199,6 +199,11 @@ ssh_authorized_keys = ["ssh-ed25519 AAAA…"]
 [root]
 password_hash = "$6$…"              # same rule; absent = root stays locked
 
+# VALIDATE must prove at least one login path exists: a password_hash on
+# any account (root or user), OR services.sshd = true with at least one
+# ssh_authorized_keys. Key-only + sshd=false is rejected — it would yield
+# a system no one can log into.
+
 [extra]
 packages = []                    # additional emerges
 update_world = true
