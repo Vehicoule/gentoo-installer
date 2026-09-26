@@ -153,13 +153,18 @@ pub fn main(init: std.process.Init) !void {
         try errw.flush();
         std.process.exit(2);
     };
-    // Only user-supplied keys are "explicit" — except scheme, where a
-    // preset default is data-preservation policy (alongside/manual) and
-    // must not be overwritten by detection.
+    // Only user-supplied keys are "explicit" — except preservation
+    // schemes (alongside/manual), where a preset default is
+    // data-preservation policy and must not be overwritten by
+    // detection. A preset's erase scheme still yields to firmware
+    // (efi-swap-root ↔ bios-boot-swap-root).
     cfg.boot_mode_explicit = user_set_boot;
     cfg.disk.scheme_explicit = user_set_scheme or blk: {
         const d = doc.root.get("disk") orelse break :blk false;
-        break :blk d == .table and d.table.get("scheme") != null;
+        if (d != .table) break :blk false;
+        const sv = d.table.get("scheme") orelse break :blk false;
+        if (sv != .string) break :blk false;
+        break :blk std.mem.eql(u8, sv.string, "alongside") or std.mem.eql(u8, sv.string, "manual");
     };
 
     // Always probe the live env for run/plan/validate — it fills the
@@ -335,18 +340,19 @@ pub fn main(init: std.process.Init) !void {
     });
 }
 
-const JsonLine = struct { op: ?[]const u8, req: ?u64, version: ?u64, malformed: bool };
+const JsonLine = struct { op: ?[]const u8, req: ?u64, version: ?u64, version_bad: bool, malformed: bool };
 
 /// Parse one NDJSON request line; op must be a string, req a non-negative
 /// integer. Non-object or invalid JSON reports `malformed`.
 fn parseLine(alloc: std.mem.Allocator, line: []const u8) JsonLine {
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch
-        return .{ .op = null, .req = null, .version = null, .malformed = true };
-    if (parsed.value != .object) return .{ .op = null, .req = null, .version = null, .malformed = true };
+        return .{ .op = null, .req = null, .version = null, .version_bad = false, .malformed = true };
+    if (parsed.value != .object) return .{ .op = null, .req = null, .version = null, .version_bad = false, .malformed = true };
     const obj = parsed.value.object;
     var op: ?[]const u8 = null;
     var req: ?u64 = null;
     var version: ?u64 = null;
+    var version_bad = false;
     if (obj.get("op")) |ov| {
         if (ov == .string) op = ov.string;
     }
@@ -354,9 +360,12 @@ fn parseLine(alloc: std.mem.Allocator, line: []const u8) JsonLine {
         if (rv == .integer and rv.integer >= 0) req = @intCast(rv.integer);
     }
     if (obj.get("version")) |vv| {
-        if (vv == .integer and vv.integer >= 0) version = @intCast(vv.integer);
+        if (vv == .integer and vv.integer >= 0)
+            version = @intCast(vv.integer)
+        else
+            version_bad = true; // present but not a non-negative int
     }
-    return .{ .op = op, .req = req, .version = version, .malformed = false };
+    return .{ .op = op, .req = req, .version = version, .version_bad = version_bad, .malformed = false };
 }
 
 fn fatal(w: *std.Io.Writer, msg: []const u8) noreturn {
@@ -417,7 +426,7 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
         };
         if (std.mem.eql(u8, op, "hello")) {
             // the hello reply doubles as ready, per docs/protocol.md
-            if (jl.version != null and jl.version.? != 1) {
+            if (jl.version_bad or (jl.version != null and jl.version.? != 1)) {
                 try writeErr(out, req, "unsupported protocol version (server speaks 1)");
             } else {
                 try out.writeAll("{\"ev\":\"hello\",");

@@ -524,14 +524,14 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
         // chpasswd -e lines are `name:hash` — a ':' or newline in the
         // hash would forge extra account lines.
         if (u.password_hash) |h|
-            if (!pwHashOk(h)) try errs.append(alloc, fmt(alloc, "password_hash for '{s}' is not crypt-hash charset", .{u.name}));
+            if (!pwHashOk(h)) try errs.append(alloc, fmt(alloc, "password_hash for '{s}' must be a $id$ crypt hash (sha512/yescrypt/...)", .{u.name}));
         for (u.groups) |g|
             if (hasCtl(g)) try errs.append(alloc, fmt(alloc, "group '{s}' has control characters", .{g}));
         for (u.ssh_authorized_keys) |k|
             if (hasCtl(k)) try errs.append(alloc, fmt(alloc, "ssh key for '{s}' has control characters", .{u.name}));
     }
     if (cfg.root.password_hash) |h|
-        if (!pwHashOk(h)) try errs.append(alloc, "root.password_hash is not crypt-hash charset");
+        if (!pwHashOk(h)) try errs.append(alloc, "root.password_hash must be a $id$ crypt hash (sha512/yescrypt/...)");
     // Timezone lands verbatim in /etc/timezone — zone names only.
     if (!tzOk(cfg.system.timezone))
         try errs.append(alloc, fmt(alloc, "timezone '{s}' is not a valid zone name", .{cfg.system.timezone}));
@@ -776,10 +776,11 @@ fn atomOk(v: []const u8) bool {
 
 // crypt(3) hashes: $id$salt$digest over a restricted charset — the
 // string is joined into `name:hash` lines for chpasswd -e, so ':' and
-// whitespace are forbidden.
+// whitespace are forbidden. Contract is $id$ hashes only: '!'/'*' are
+// locked-account markers (no login), and 13-char DES hashes are
+// unsupported — musl has no DES crypt, so accepting one would install
+// an account nobody can log into on musl targets.
 fn pwHashOk(v: []const u8) bool {
-    // Usable crypt hashes start with $id$ — '!'/'*' are locked-account
-    // markers that must not count as login credentials.
     if (v.len == 0 or v.len > 256 or v[0] != '$') return false;
     for (v) |ch| {
         const ok = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
