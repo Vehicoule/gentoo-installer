@@ -1,0 +1,170 @@
+# Wizard pages — field-level spec (v1)
+
+Pages are **data owned by the engine**: each page is a schema (fields,
+defaults, validation rules, visibility conditions) served over the wizard
+protocol. TUI and GUI render the same schema; neither frontend implements
+validation itself. "Expert mode" (`mode=expert`) only unhides fields
+marked `expert:` — it does not add pages.
+
+Field notation: `name: type = default` — `expert` fields are hidden in
+guided mode; `secret` fields are never echoed or persisted.
+
+## P0 — Welcome / mode
+
+Purpose: orient the user, verify the environment is installable, pick the
+interaction mode.
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| locale | enum (preset list) | `en_US.UTF-8` | display language for the wizard itself |
+| mode | enum `guided\|expert` | `guided` | sets field visibility globally |
+| answer_file | path (optional) | — | loads a saved config and jumps to P7 Review |
+
+Env card (read-only, from `detect`): arch, boot mode (UEFI/BIOS), RAM,
+network status, live-media type (minimal ISO vs LiveGUI vs foreign live
+env).
+
+Edge cases: no network → warning banner + `net-setup`/nmtui handoff
+button; non-Gentoo live env → info banner (supported path on arm64/riscv64);
+RAM < 512 MB → warning (emerge will be painful).
+
+## P1 — Disk
+
+Purpose: choose target disk(s) and partition plan. The most consequential
+page — everything downstream depends on it.
+
+| Field | Type | Default | Validation |
+|---|---|---|---|
+| device | enum (detected disks) | — | nonempty; excluded: the disk hosting the live env |
+| scheme | enum `efi-swap-root\|bios-boot-swap-root\|alongside\|manual` | `efi-swap-root` (UEFI) | `bios-*` hidden on UEFI boot; `alongside` requires detected free space or shrinkable partition |
+| wipe | bool | `true` | must be `false` when `scheme=alongside` (VALIDATE) |
+| root_fs | enum `xfs\|ext4\|btrfs\|f2fs` | `xfs` | — |
+| swap_mib | int | 4096 | 0 = none; option `zram` (no swap partition) |
+| esp_mib | int (expert) | 512 | ≥128; ≥512 recommended for UKI/systemd-boot |
+| luks | bool | false | reveals passphrase + `cryptsetup` options (pbkdf argon2id) |
+| luks_passphrase | secret | — | required iff `luks`; min length 8; confirm field |
+| lvm | bool | false | LVM2 vg on root part (or inside LUKS if set) |
+| home_part | bool (expert) | false | separate /home partition |
+| btrfs_subvols | list (expert) | `@,@home,@snapshots` | only when `root_fs=btrfs` |
+| shrink_part | enum (existing partitions) | — | alongside only; fs must be ntfs/ext4/btrfs (xfs/f2fs unshrinkable → need unallocated space) |
+| shrink_mib | int | — | alongside only; ≥ min install size (8 GiB) and ≤ fs free space |
+| manual_plan | partition table editor (expert) | — | free-form: part/fs/mount table; validated like any scheme |
+
+Live preview: engine emits the post-install partition table (the same
+`Cmd` plan the pipeline will run); TUI renders a table, GUI renders a
+disk-bar graphic.
+
+Edge cases: zero eligible disks → hard error page; active swap/LVM/md on
+target → refuse until deactivated; `alongside` reuses the existing ESP —
+never reformats it.
+
+## P2 — Variant
+
+Purpose: the Gentoo-specific choice — init system, stage3 flavor, profile.
+
+| Field | Type | Default | Validation |
+|---|---|---|---|
+| init | enum `openrc\|systemd` (+ expert `runit\|s6\|dinit`) | `systemd` | alt inits show warning: post-stage3 swap, expert path |
+| variant | enum stage3 flavors | `desktop-systemd` | constrained by init (see matrix) and `security.selinux` |
+| profile | enum/string (expert override) | derived | must exist in `eselect profile list` for the variant |
+| binhost | bool | `true` | official binpkg host; signature-verified |
+
+Variant↔init constraints (encoded in the engine, surfaced as disabled
+options): `musl-*` flavors are openrc-only (systemd requires glibc);
+`llvm-*` flavors are openrc-based; `*-systemd` flavors require
+`init=systemd`; `security.selinux=true` forces `hardened-selinux-*`.
+
+Profile preview: show the fully resolved profile name (e.g.
+`default/linux/amd64/23.0/desktop/systemd`) so users see exactly what
+they're getting.
+
+## P3 — Region & input
+
+| Field | Type | Default |
+|---|---|---|
+| timezone | searchable enum (zoneinfo) | `UTC` (or geoip hint if net) |
+| locales | multi-select (locale.gen) | `en_US.UTF-8` |
+| default_locale | enum (⊂ locales) | first selected |
+| keymap | enum (console keymaps) | `us` |
+| xkb_layout | string | derived from keymap |
+| ntp | bool | `true` (chrony / systemd-timesyncd) |
+
+## P4 — Accounts
+
+| Field | Type | Default | Validation |
+|---|---|---|---|
+| root_mode | enum `password\|locked` | `password` | `locked` → `lock_root=true` |
+| root_password | secret | — | required iff root_mode=password; min 8, confirm |
+| users[] | list of records | `[larry]` | username regex, uid auto |
+| user.name / .groups / .shell | str / list / enum | — / `wheel,audio,video` / `/bin/bash` | shell from /etc/shells of stage3 |
+| user.password | secret | — | optional if ssh key present |
+| user.ssh_authorized_keys | textarea | — | ssh pubkey syntax check |
+| privilege | enum `sudo\|doas\|none` | `sudo` | `none` only if root unlocked |
+
+VALIDATE (hard): after all options applied, ≥1 usable login path —
+password on a surviving account, or `sshd=true` + authorized key.
+
+## P5 — System
+
+| Field | Type | Default | Validation |
+|---|---|---|---|
+| hostname | string | `gentoo` | RFC 1123 |
+| kernel | enum `dist-bin\|dist\|manual` | `dist-bin` | `manual` = we mount+chroot, user configures — expert |
+| initramfs | enum `dracut\|ugrd\|none` | `dracut` | `none` unsafe with LUKS/LVM/separate-/usr — VALIDATE warns/blocks |
+| uki | bool | false | implies dracut/ugrd + installkernel[uki] |
+| bootloader | enum `auto\|grub\|systemd-boot\|efistub` | `auto` | auto = systemd-boot on systemd, grub on openrc; `efistub`/`systemd-boot` require UEFI |
+| secure_boot | enum `off\|sbctl\|shim` | `off` | `sbctl` requires uki or signed grub; `shim` for grub only |
+| net_manager | enum `networkmanager\|dhcpcd\|netifrc\|systemd-networkd` | `networkmanager` | `systemd-networkd` needs init=systemd |
+| wifi_fw | bool | detected | `linux-firmware` + `sof-firmware` |
+| microcode | bool | detected (vendor) | intel-microcode / amd via linux-firmware |
+| services.sshd / .logger / .cron | bool | false/true/true | — |
+
+## P6 — Packages & USE (the Gentoo page)
+
+| Field | Type | Default |
+|---|---|---|
+| package_sets | multi-select from preset (`minimal`, `desktop-base`, `cosmic-desktop`, `dev-tools`, `server`) | `minimal` |
+| extra_atoms | list editor | `[]` |
+| use_global | searchable flag editor (tri-state: on/off/unset) with `use.desc` descriptions | profile defaults |
+| use_pkg | per-package `package.use` records (v2; v1 edits a raw table) | `[]` |
+| accept_license | enum + free text | `@FREE` (common toggles: `@BINARY-REDISTRIBUTABLE`, `linux-fw-redistributable`) |
+| cflags | enum `safe\|native\|custom` + text | `native` |
+| jobs / mem_cap | int | auto (nproc, ~2 GiB/job) |
+| video_cards | string | autodetected |
+| cpu_flags | string | autodetected (cpuid2cpuflags equiv.) |
+
+Engine compiles this into `make.conf` + `package.use/*` at the
+`portage-config` step; preview shows the generated make.conf diff.
+
+## P7 — Review
+
+Read-only grouped summary of the whole config (jump-back links per
+section), **print plan** (the exact `Cmd` list — same output as
+`--dry-run`), **export answer file** (writes the `--config` TOML — the
+mass-install artifact), and the safety gate:
+
+| Field | Type | Notes |
+|---|---|---|
+| confirm_wipe | type-the-device-name | required when `wipe=true` |
+| confirm_text | acknowledge checkbox | alongside mode: "existing OS will be modified/shrunk" |
+
+## P8 — Progress
+
+Renders the pipeline's event stream: 16-step checklist with per-step
+status + elapsed, live log tail, journal state line ("resumable through
+step N").
+
+Failure handling: `step_failed` → dialog with `{code, message, hint}` +
+`retry` / `skip` (where safe) / `abort`. `cancel` finishes the current
+step then halts, leaving the journal resumable.
+
+## P9 — Finish
+
+Success: summary card (hostname, users, boot entries), **save answer
+file** (again — last chance), **"enter target chroot"** button (drops a
+shell into the installed system — archinstall-style escape hatch),
+unmount + reboot, install-media removal note.
+
+Failure/abort path: resume instructions (`gentoo-installer --resume`
+same-boot; `detect --repair` after reboot) + copyable log bundle for a
+bug report.
