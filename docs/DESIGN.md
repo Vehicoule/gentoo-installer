@@ -71,9 +71,16 @@ hottest interface for nothing).
   `DryRunner` logs. Nothing in the pipeline touches the OS except through this
   seam — that is what makes `--dry-run`, unit tests, and the QEMU harness work.
 - **Steps are idempotent and checkpointed.** The engine writes a journal
-  (`/mnt/gentoo/var/lib/gentoo-installer/state.json`) after each step; a
-  crashed install resumes from the last completed step, matching the
-  Handbook's "remount and re-chroot" recovery story.
+  after each step at `/var/lib/gentoo-installer/state.json` **in the live
+  env** (tmpfs) — so `detect`/`partition`/`mount` are checkpointed before
+  the target exists — and mirrors it to
+  `/mnt/gentoo/var/lib/gentoo-installer/state.json` once `mount` lands, for
+  forensics. `--resume` reads the live-env journal, re-derives mounts from
+  it (re-mounting target partitions per the recorded disk plan), and
+  re-enters at the last completed step. Like the Handbook's "remount and
+  re-chroot" story, resume is same-boot only: a rebooted live env loses the
+  tmpfs journal, so the engine then offers `detect --repair` (probe disks
+  for a partially-written install) rather than blind replay.
 - **Distro preset = data.** A preset TOML provides: branding (name, logo,
   colors), a default `InstallConfig` overlay (init system, profile, package
   set), optional extra steps (shell snippets with descriptions), and the
@@ -183,7 +190,14 @@ ntp    = true                    # chrony / systemd-timesyncd
 name = "larry"
 groups = ["wheel", "audio", "video"]
 shell = "/bin/bash"
-# passwords are prompted interactively and never stored in the config
+# credentials: TUI/GUI prompt interactively and never persist plaintext.
+# For `--config` (unattended) supply one of:
+password_hash = "$6$rounds=…"       # crypt() hash, e.g. `openssl passwd -6`
+ssh_authorized_keys = ["ssh-ed25519 AAAA…"]
+# a user with neither is created locked (`useradd` + `passwd -l`)
+
+[root]
+password_hash = "$6$…"              # same rule; absent = root stays locked
 
 [extra]
 packages = []                    # additional emerges

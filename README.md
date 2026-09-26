@@ -10,7 +10,7 @@ Multi-arch: amd64, arm64, riscv64. Designed to host distro presets, so a
 Gentoo-based distribution can ship it with its own branding, defaults, and
 extra steps.
 
-Early stage — see [DESIGN.md](DESIGN.md) for the architecture, config model,
+Early stage — see [docs/DESIGN.md](docs/DESIGN.md) for the architecture, config model,
 headless protocol, and roadmap.
 
 ## Status
