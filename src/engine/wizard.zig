@@ -242,6 +242,7 @@ const system_fields = [_]Field{
         .{ .v = "efistub", .label = "efistub (firmware entry)", .visible = isUefi },
         .{ .v = "refind", .label = "rEFInd", .visible = isUefi },
     } },
+    .{ .name = "security.selinux", .ftype = .bool, .label = "SELinux", .help = "policy + toolchain ship in the hardened-selinux stage3 — toggling moves Hardening with it" },
     .{ .name = "security.secure_boot", .ftype = .@"enum", .label = "Secure boot", .options = &.{
         .{ .v = "off", .label = "off" },
         .{ .v = "sbctl", .label = "sbctl (self-signed keys)" },
@@ -293,7 +294,7 @@ pub const pages = [_]Page{
     .{ .id = "variant", .title = "Variant", .essential = false, .fields = &variant_fields, .prefixes = &.{ "stage3.", "system.init", "system.binhost", "security.hardening" } },
     .{ .id = "region", .title = "Region & input", .essential = false, .fields = &region_fields, .prefixes = &.{ "system.timezone", "system.locale", "system.locales", "services.ntp" } },
     .{ .id = "accounts", .title = "Accounts", .essential = true, .fields = &accounts_fields, .prefixes = &.{ "root.", "users", "system.privilege", "login", "privilege" } },
-    .{ .id = "system", .title = "System", .essential = false, .fields = &system_fields, .prefixes = &.{ "system.", "network.", "gpu.", "services.", "security.secure_boot", "bootloader", "uki" } },
+    .{ .id = "system", .title = "System", .essential = false, .fields = &system_fields, .prefixes = &.{ "system.", "network.", "gpu.", "services.", "security.", "bootloader", "uki" } },
     .{ .id = "packages", .title = "Packages & USE", .essential = false, .fields = &packages_fields, .prefixes = &.{ "packages.", "use.", "makeconf." } },
     .{ .id = "review", .title = "Review & install", .essential = true, .prefixes = &.{} },
 };
@@ -571,6 +572,11 @@ pub const Wizard = struct {
                     .uefi => .@"efi-swap-root",
                 };
         }
+        // BIOS Express pins btrfs+limine, and limine can't read btrfs —
+        // the /boot partition toggle is expert-only, so Express must set
+        // it itself or the disk page can never validate on BIOS.
+        if (w.flow == .express and env.boot_mode == .bios)
+            w.cfg.disk.boot_part = true;
     }
 
     /// Merge the attached preset's `[defaults]` under cfg and pin any
@@ -715,7 +721,8 @@ pub const Wizard = struct {
             return;
         }
         if (std.mem.eql(u8, name, "makeconf.cflags_custom")) {
-            w.cfg.makeconf.cflags = .{ .custom = try strOf(v) };
+            // dupe onto w.alloc — the request arena dies after the reply
+            w.cfg.makeconf.cflags = .{ .custom = try dstr(w, v) };
             return;
         }
         return setPath(w, name, v);
@@ -893,7 +900,9 @@ pub const Wizard = struct {
         try out.writeAll("{\"ev\":\"config\",");
         if (req) |r| try out.print("\"req\":{},", .{r});
         try out.writeAll("\"config\":{");
-        try out.writeAll("\"boot_mode\":\"");
+        try out.writeAll("\"arch\":\"");
+        try out.writeAll(@tagName(w.cfg.arch));
+        try out.writeAll("\",\"boot_mode\":\"");
         try out.writeAll(@tagName(w.cfg.boot_mode));
         try out.writeAll("\",\"disk\":{");
         try fieldStr(out, "device", w.cfg.disk.device);
@@ -917,12 +926,22 @@ pub const Wizard = struct {
         try out.writeAll(if (w.cfg.disk.luks_passphrase != null) "true" else "false");
         try out.writeAll("},");
         try fieldBool(out, "lvm", w.cfg.disk.lvm);
+        try out.writeAll(",");
+        try fieldBool(out, "home_part", w.cfg.disk.home_part);
+        try out.writeAll(",");
+        try fieldStr(out, "space_src", @tagName(w.cfg.disk.space_src));
+        try out.writeAll(",");
+        try fieldStr(out, "shrink_part", w.cfg.disk.shrink_part);
+        try out.writeAll(",");
+        try fieldInt(out, "shrink_mib", w.cfg.disk.shrink_mib);
         try out.writeAll("},\"stage3\":{");
         try fieldStr(out, "libc", @tagName(w.cfg.stage3.libc));
         try out.writeAll(",");
         try fieldStr(out, "toolchain", @tagName(w.cfg.stage3.toolchain));
         try out.writeAll(",");
         try fieldStr(out, "variant", w.cfg.stage3.variant);
+        try out.writeAll(",");
+        try fieldStr(out, "mirror", w.cfg.stage3.mirror);
         try out.writeAll("},\"system\":{");
         try fieldStr(out, "init", @tagName(w.cfg.system.init));
         try out.writeAll(",");
@@ -945,7 +964,16 @@ pub const Wizard = struct {
         try fieldStr(out, "locale", w.cfg.system.locale);
         try out.writeAll(",");
         try fieldStr(out, "keymap", w.cfg.system.keymap);
-        try out.writeAll("},\"network\":{");
+        try out.writeAll(",");
+        try fieldInt(out, "keep_kernels", w.cfg.system.keep_kernels);
+        try out.writeAll(",");
+        try fieldStr(out, "snapshots", @tagName(w.cfg.system.snapshots));
+        try out.writeAll(",\"locales\":[");
+        for (w.cfg.system.locales, 0..) |l, i| {
+            if (i > 0) try out.writeAll(",");
+            try jstr(out, l);
+        }
+        try out.writeAll("]},\"network\":{");
         try fieldStr(out, "manager", @tagName(w.cfg.network.manager));
         try out.writeAll(",");
         try fieldBool(out, "wifi", w.cfg.network.wifi);
@@ -980,7 +1008,30 @@ pub const Wizard = struct {
             try out.writeAll(if (u.password_hash != null) "true" else "false");
             try out.writeAll("}}");
         }
-        try out.writeAll("],\"services\":{");
+        try out.writeAll("],\"gpu\":{");
+        try fieldStr(out, "driver", @tagName(w.cfg.gpu.driver));
+        try out.writeAll("},\"makeconf\":{");
+        switch (w.cfg.makeconf.cflags) {
+            .safe => try out.writeAll("\"cflags\":\"safe\""),
+            .native => try out.writeAll("\"cflags\":\"native\""),
+            .custom => |c| {
+                try out.writeAll("\"cflags\":\"custom\",\"cflags_custom\":");
+                try jstr(out, c);
+            },
+        }
+        try out.writeAll(",");
+        try fieldInt(out, "jobs", w.cfg.makeconf.jobs);
+        try out.writeAll(",");
+        try fieldInt(out, "mem_cap_gib", w.cfg.makeconf.mem_cap_gib);
+        try out.writeAll(",");
+        try fieldStr(out, "video_cards", w.cfg.makeconf.video_cards);
+        try out.writeAll(",");
+        try fieldStr(out, "accept_license", w.cfg.makeconf.accept_license);
+        try out.writeAll(",");
+        try fieldStr(out, "mirrors", w.cfg.makeconf.mirrors);
+        try out.writeAll("},\"extra\":{");
+        try fieldBool(out, "update_world", w.cfg.extra.update_world);
+        try out.writeAll("},\"services\":{");
         try fieldBool(out, "sshd", w.cfg.services.sshd);
         try out.writeAll(",");
         try fieldBool(out, "logger", w.cfg.services.logger);
@@ -1044,12 +1095,15 @@ pub const Wizard = struct {
         const o = &aw.writer;
         try o.writeAll("# gentoo-installer answer file\n");
         try o.print("arch = \"{s}\"\nboot_mode = \"{s}\"\n", .{ @tagName(w.cfg.arch), @tagName(w.cfg.boot_mode) });
-        try o.print("[disk]\nscheme = \"{s}\"\nroot_fs = \"{s}\"\nswap = \"{s}\"\nswap_mib = {}\nesp_mib = {}\nboot_part = {}\nluks = {}\nlvm = {}\ndevice = ", .{
-            @tagName(w.cfg.disk.scheme), @tagName(w.cfg.disk.root_fs), @tagName(w.cfg.disk.swap),
-            w.cfg.disk.swap_mib,         w.cfg.disk.esp_mib,           w.cfg.disk.boot_part,
-            w.cfg.disk.luks,             w.cfg.disk.lvm,
+        try o.print("[disk]\nscheme = \"{s}\"\nroot_fs = \"{s}\"\nswap = \"{s}\"\nswap_mib = {}\nesp_mib = {}\nboot_part = {}\nluks = {}\nlvm = {}\nwipe = {}\nhome_part = {}\nspace_src = \"{s}\"\nshrink_mib = {}\ndevice = ", .{
+            @tagName(w.cfg.disk.scheme), @tagName(w.cfg.disk.root_fs),   @tagName(w.cfg.disk.swap),
+            w.cfg.disk.swap_mib,         w.cfg.disk.esp_mib,             w.cfg.disk.boot_part,
+            w.cfg.disk.luks,             w.cfg.disk.lvm,                 w.cfg.disk.wipe,
+            w.cfg.disk.home_part,        @tagName(w.cfg.disk.space_src), w.cfg.disk.shrink_mib,
         });
         try tomlStr(o, w.cfg.disk.device);
+        try o.writeAll("\nshrink_part = ");
+        try tomlStr(o, w.cfg.disk.shrink_part);
         try o.writeAll("\n");
         if (w.cfg.disk.luks)
             try o.writeAll("# luks_passphrase = \"…\"  # plaintext is never exported — set before exec\n");
@@ -1169,6 +1223,7 @@ pub const Wizard = struct {
             try tomlStr(o, h);
             try o.writeAll("\n");
         }
+        try o.print("[extra]\nupdate_world = {}\n", .{w.cfg.extra.update_world});
         const real = try confinedWrite(w, path);
         std.Io.Dir.cwd().writeFile(w.io, .{
             .sub_path = real,
@@ -1451,10 +1506,29 @@ fn setEnum(cfg: *Config, ef: EField, s: []const u8) WizardError!void {
         if (cfg.stage3.libc == .musl and cfg.system.init == .systemd) cfg.system.init = .openrc;
         if (cfg.stage3.libc == .musl and cfg.network.manager == .@"systemd-networkd") cfg.network.manager = .networkmanager;
     }
+    // selinux+ hardening is one decision (the policy/toolchain ships in
+    // the hardened-selinux stage3) — keep the bool in lock-step so the
+    // wizard can't land in a combination config.validate rejects.
+    if (ef.tag == .hardening)
+        cfg.security.selinux = (cfg.security.hardening == .@"hardened-selinux");
+    if (ef.tag == .toolchain and cfg.stage3.toolchain == .llvm and
+        cfg.security.hardening == .@"hardened-selinux" and cfg.stage3.libc == .glibc)
+    {
+        // no glibc+llvm+hardened-selinux stage3 — drop to plain hardened
+        cfg.security.hardening = .hardened;
+        cfg.security.selinux = false;
+    }
 }
 
 const cfg_bool = struct {
     fn set(cfg: *Config, name: []const u8, b: bool) void {
+        // selinux is tied to the hardening axis — toggling it moves
+        // hardening to keep the pair consistent (see setEnum.hardening).
+        if (std.mem.eql(u8, name, "security.selinux")) {
+            cfg.security.selinux = b;
+            cfg.security.hardening = if (b) .@"hardened-selinux" else .hardened;
+            return;
+        }
         const map = .{
             .{ "disk.wipe", &cfg.disk.wipe },
             .{ "disk.boot_part", &cfg.disk.boot_part },
@@ -1468,7 +1542,6 @@ const cfg_bool = struct {
             .{ "services.logger", &cfg.services.logger },
             .{ "services.cron", &cfg.services.cron },
             .{ "services.ntp", &cfg.services.ntp },
-            .{ "security.selinux", &cfg.security.selinux },
         };
         inline for (map) |m| {
             if (std.mem.eql(u8, name, m[0])) {

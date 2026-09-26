@@ -43,6 +43,7 @@ pub const Tui = struct {
     pv: PageView = .{ .page = "", .index = 0, .of = 0, .title = "" },
     focus: usize = 0, // field index; focus == fields.len → actions row
     action_sel: usize = 0,
+    last_h: u16 = 24, // drawn height — scroll math needs it outside draw()
     mode: Mode = .form,
     edit_buf: std.ArrayList(u8) = .empty,
     edit_field: usize = 0,
@@ -124,6 +125,17 @@ pub const Tui = struct {
         }
         t.pv = pv;
         if (t.focus > pv.fields.len) t.focus = pv.fields.len;
+        t.ensureFocusVisible();
+    }
+
+    /// Keep the focused row inside the visible window — short terminals
+    /// must scroll as focus moves, or the user edits invisible fields.
+    fn ensureFocusVisible(t: *Tui) void {
+        const max_rows: usize = t.last_h -| 8;
+        if (max_rows == 0) return;
+        const target = @min(t.focus, t.pv.fields.len); // actions row counts
+        if (target < t.scroll) t.scroll = target;
+        if (target >= t.scroll + max_rows) t.scroll = target - max_rows + 1;
     }
 
     /// Mirror of engine set — translates a text buffer into the json
@@ -433,6 +445,7 @@ fn draw(t: *Tui, win: vaxis.Window) !void {
         }
     }
 
+    t.last_h = h;
     // fields
     var vi: usize = 0; // visible row index (fields + action row)
     const max_rows = h -| 8;
@@ -466,7 +479,9 @@ fn draw(t: *Tui, win: vaxis.Window) !void {
         var col: u16 = 2;
         for (t.pv.actions, 0..) |a, i| {
             const is_focus = (t.focus == t.pv.fields.len) and t.action_sel == i;
-            const label = try std.fmt.allocPrint(t.alloc, "[ {s} ]", .{a});
+            // the TUI's install is a dry-run preview — label it so.
+            const shown = if (std.mem.eql(u8, a, "install")) "preview install (dry-run)" else a;
+            const label = try std.fmt.allocPrint(t.alloc, "[ {s} ]", .{shown});
             _ = win.print(&.{.{ .text = label, .style = if (is_focus) sel else accent }}, .{ .row_offset = act_row, .col_offset = col });
             col += @intCast(label.len + 1);
         }
@@ -639,8 +654,10 @@ pub fn runTui(init: std.process.Init, alloc: Allocator, io: std.Io, preset: ?*co
                             // wrap to action row
                             t.focus = t.pv.fields.len;
                         }
+                        t.ensureFocusVisible();
                     } else if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
                         t.focus = @min(t.focus + 1, t.pv.fields.len);
+                        t.ensureFocusVisible();
                     } else if (key.matches(vaxis.Key.left, .{}) or key.matches('h', .{})) {
                         if (t.focus == t.pv.fields.len) {
                             if (t.action_sel > 0) t.action_sel -= 1;
@@ -666,6 +683,7 @@ pub fn runTui(init: std.process.Init, alloc: Allocator, io: std.Io, preset: ?*co
                     } else if (key.matches(vaxis.Key.page_up, .{})) {
                         t.wiz.back();
                         t.focus = 0;
+                        t.scroll = 0;
                         try t.refreshPage();
                     }
                 }

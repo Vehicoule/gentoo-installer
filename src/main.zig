@@ -866,5 +866,7 @@ fn doInstall(io: std.Io, alloc: std.mem.Allocator, wiz: *engine.wizard.Wizard, o
     };
     try out.writeAll("{\"ev\":\"done\",");
     try writeReq(out, req);
-    try out.writeAll("\"ok\":true,\"reboot_ready\":true}\n");
+    // reboot_ready is only true for a real exec — a dry-run preview
+    // installed nothing, and frontends key reboot prompts off this.
+    try out.print("\"ok\":true,\"reboot_ready\":{}}}\n", .{!dry});
 }
