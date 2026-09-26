@@ -92,9 +92,11 @@ pub const ResolvedSets = struct {
 };
 
 /// Resolve `packages.sets` names against the preset's [[package_sets]]
-/// (id → atoms + repos, honouring `extends`). Unknown names are a
+/// (id → atoms + repos, honouring `extends`). `names == null` means the
+/// config left `sets` unset → the preset's `default = true` sets apply;
+/// an explicit `sets = []` selects nothing. Unknown names are a
 /// validation-style error list the caller surfaces.
-pub fn resolveSets(alloc: Allocator, preset: ?*const Preset, names: []const []const u8) !struct { resolved: ResolvedSets, errs: [][]const u8 } {
+pub fn resolveSets(alloc: Allocator, preset: ?*const Preset, names: ?[]const []const u8) !struct { resolved: ResolvedSets, errs: [][]const u8 } {
     var atoms: std.ArrayList([]const u8) = .empty;
     var repos: std.ArrayList([]const u8) = .empty;
     // dedupe atoms/repos across extends chains (a child may restate
@@ -107,9 +109,16 @@ pub fn resolveSets(alloc: Allocator, preset: ?*const Preset, names: []const []co
     var seen: std.StringHashMap(void) = .init(alloc);
     defer seen.deinit();
 
-    // No preset → sets are unresolvable by definition; treat as empty
-    // (set ids are preset-defined vocabulary, not engine vocabulary).
-    if (preset == null) return .{ .resolved = .{ .atoms = &.{}, .repos = &.{} }, .errs = errs.items };
+    // No preset → set ids are unresolvable (they're preset-defined
+    // vocabulary). Naming sets without --preset is a config error;
+    // leaving them unset resolves to nothing.
+    if (preset == null) {
+        if (names) |ns| {
+            for (ns) |name|
+                try errs.append(alloc, std.fmt.allocPrint(alloc, "packages.sets: '{s}' needs --preset (set ids are preset-defined)", .{name}) catch @panic("oom"));
+        }
+        return .{ .resolved = .{ .atoms = &.{}, .repos = &.{} }, .errs = errs.items };
+    }
     const sets_table: ?[]toml.Value = blk: {
         const p = preset.?;
         const v = p.doc.root.get("package_sets") orelse break :blk null;
@@ -119,10 +128,10 @@ pub fn resolveSets(alloc: Allocator, preset: ?*const Preset, names: []const []co
         };
     };
 
-    // No sets named in config → pull in the preset's `default = true` sets.
-    var effective = names;
+    // `sets` absent from config → the preset's `default = true` sets
+    // apply. An explicit `sets = []` selects nothing.
     var defaults: std.ArrayList([]const u8) = .empty;
-    if (names.len == 0) {
+    const effective = if (names) |ns| ns else blk: {
         if (sets_table) |arr| {
             for (arr) |v| {
                 if (v != .table) continue;
@@ -132,8 +141,8 @@ pub fn resolveSets(alloc: Allocator, preset: ?*const Preset, names: []const []co
                 if (iv == .string) try defaults.append(alloc, iv.string);
             }
         }
-        effective = defaults.items;
-    }
+        break :blk defaults.items;
+    };
 
     for (effective) |name| {
         var stack: std.ArrayList([]const u8) = .empty;

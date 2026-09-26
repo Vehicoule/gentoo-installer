@@ -211,7 +211,8 @@ pub fn main(init: std.process.Init) !void {
     // Resolve preset package sets → atoms + overlay repos (M1: preset
     // supplies the set table; absent preset = stock gentoo ids only).
     var pkg_sets: engine.plan.Sets = .{};
-    const rs = try engine.preset.resolveSets(alloc, if (preset) |*pp| pp else null, cfg.packages.sets);
+    // sets absent → null → preset defaults; explicit [] → selects none.
+    const rs = try engine.preset.resolveSets(alloc, if (preset) |*pp| pp else null, if (cfg.packages.sets_explicit) cfg.packages.sets else null);
     for (rs.errs) |e| try errw.print("{s}\n", .{e});
     if (rs.errs.len > 0) {
         try errw.flush();
@@ -267,13 +268,17 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
             else => return e,
         };
         const line = std.mem.trim(u8, line_buf.written(), " \r\n\t");
-        if (line.len > 0) {
-            // handled below
-        } else if (r.peekGreedy(1) catch null) |_| {
-            // empty line — consume the leftover delimiter and continue
-            r.toss(1);
+        // Consume the newline streamDelimiter left buffered — on EVERY
+        // path — so a bad line can't be re-read forever. Peek failure
+        // = EOF: process this last line, then the loop breaks.
+        var at_eof = false;
+        if (r.peekGreedy(1)) |avail| {
+            if (avail.len > 0 and avail[0] == '\n') r.toss(1);
+        } else |_| at_eof = true;
+        if (line.len == 0) {
+            if (at_eof) break;
             continue;
-        } else break;
+        }
         const op = opField(line) orelse {
             try writeErr(out, reqField(line), "missing op");
             try out.flush();
@@ -284,7 +289,7 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
             // the hello reply doubles as ready, per docs/protocol.md
             try out.writeAll("{\"ev\":\"hello\",");
             try writeReq(out, req);
-            try out.writeAll("\"engine\":\"0.1.0\",\"version\":1,\"caps\":[\"detect\",\"install\",\"validate\"]}\n");
+            try out.writeAll("\"engine\":\"0.1.0\",\"version\":1,\"caps\":[\"hello\",\"detect\",\"quit\"]}\n");
         } else if (std.mem.eql(u8, op, "detect")) {
             const env = try engine.detect.detect(alloc, io);
             try out.writeAll("{\"ev\":\"env\",");
@@ -305,9 +310,6 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
             try writeErr(out, req, aw.written());
         }
         try out.flush();
-        // consume the delimiter streamDelimiter left buffered; EOF → break
-        const avail = r.peekGreedy(1) catch break;
-        if (avail.len > 0 and avail[0] == '\n') r.toss(1);
     }
 }
 

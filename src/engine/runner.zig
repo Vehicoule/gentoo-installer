@@ -181,12 +181,20 @@ fn execCmd(io: std.Io, alloc: Allocator, e: plan.Exec) !void {
         .stdin = if (e.stdin != null) .pipe else .inherit,
     });
     if (e.stdin) |data| {
-        // Feed the payload, then close so the child sees EOF.
+        // Feed the payload, flush the buffered writer, then close so the
+        // child sees EOF. Closing without flushing would discard bytes
+        // still sitting in wbuf (short passphrases fit entirely).
         var wbuf: [4096]u8 = undefined;
         var fw = child.stdin.?.writer(io, &wbuf);
-        fw.interface.writeAll(data) catch {};
+        var werr: ?anyerror = null;
+        fw.interface.writeAll(data) catch |e2| { werr = e2; };
+        if (werr == null) fw.interface.flush() catch |e2| { werr = e2; };
         child.stdin.?.close(io);
         child.stdin = null;
+        if (werr) |e2| {
+            _ = child.wait(io) catch {};
+            return e2;
+        }
     }
     const term = try child.wait(io);
     switch (term) {

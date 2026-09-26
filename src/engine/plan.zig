@@ -187,6 +187,12 @@ fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) 
         swap_part = partPath(alloc, dev, n);
         try c.append(alloc, argv(alloc, &.{ "sgdisk", s(alloc, "-n{}:0:+{}MiB", .{ n, d.swap_mib }), s(alloc, "-t{}:8200", .{n}), s(alloc, "-c{}:swap", .{n}), dev }, s(alloc, "swap {}MiB at partition {}", .{ d.swap_mib, n })));
     }
+    var boot_part: ?[]const u8 = null;
+    if (d.boot_part) {
+        n += 1;
+        boot_part = partPath(alloc, dev, n);
+        try c.append(alloc, argv(alloc, &.{ "sgdisk", s(alloc, "-n{}:0:+1024MiB", .{n}), s(alloc, "-t{}:8300", .{n}), s(alloc, "-c{}:boot", .{n}), dev }, s(alloc, "boot partition 1GiB at partition {}", .{n})));
+    }
     n += 1;
     const root_part = partPath(alloc, dev, n);
     // 8304 = Linux root DPS GUID (auto-discovery on systemd)
@@ -240,11 +246,15 @@ fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) 
     try mkfs_argv.append(alloc, fs_dev);
     try c.append(alloc, fmtArgv(alloc, s(alloc, "format root as {s}", .{@tagName(d.root_fs)}), mkfs_argv.items));
 
+    if (boot_part) |bp|
+        try c.append(alloc, argv(alloc, &.{ "mkfs.ext4", "-L", "boot", bp }, "format /boot as ext4"));
+
     if (swap_part) |sp|
         try c.append(alloc, argv(alloc, &.{ "mkswap", "-L", "swap", sp }, "format swap"));
 
     if (d.root_fs == .btrfs) {
         // Mount then create the subvol layout + @snapshots dir.
+        try c.append(alloc, argv(alloc, &.{ "mkdir", "-p", "/mnt/gentoo" }, "target mountpoint"));
         try c.append(alloc, argv(alloc, &.{ "mount", fs_dev, "/mnt/gentoo" }, "mount btrfs top-level"));
         for ([_][]const u8{ "@root", "@home", "@snapshots" }) |sv|
             try c.append(alloc, argv(alloc, &.{ "btrfs", "subvolume", "create", s(alloc, "/mnt/gentoo/{s}", .{sv}) }, s(alloc, "subvol {s}", .{sv})));
@@ -268,17 +278,31 @@ pub fn fsDevice(alloc: Allocator, cfg: *const Config) []const u8 {
     // root partition is the last numbered one created
     var n: u32 = 1; // esp (uefi) or biosboot (bios)
     if (cfg.disk.swap == .partition) n += 1;
+    if (cfg.disk.boot_part) n += 1;
     n += 1;
     return partPath(alloc, cfg.disk.device, n);
+}
+
+/// Partition index of the separate /boot partition, if configured.
+fn bootPartIdx(cfg: *const Config) u32 {
+    var n: u32 = 1; // esp/biosboot
+    if (cfg.disk.swap == .partition) n += 1;
+    return n + 1;
 }
 
 fn planMount(alloc: Allocator, cfg: *const Config) !Step {
     var c: std.ArrayList(Cmd) = .empty;
     const root = rootMountArgs(alloc, cfg);
+    try c.append(alloc, argv(alloc, &.{ "mkdir", "-p", "/mnt/gentoo" }, "target mountpoint"));
     if (root.opts.len > 0)
         try c.append(alloc, argv(alloc, &.{ "mount", "-o", root.opts, root.dev, "/mnt/gentoo" }, "mount root"))
     else
         try c.append(alloc, argv(alloc, &.{ "mount", root.dev, "/mnt/gentoo" }, "mount root"));
+
+    if (cfg.disk.boot_part) {
+        try c.append(alloc, argv(alloc, &.{ "mkdir", "-p", "/mnt/gentoo/boot" }, "/boot mountpoint"));
+        try c.append(alloc, argv(alloc, &.{ "mount", partPath(alloc, cfg.disk.device, bootPartIdx(cfg)), "/mnt/gentoo/boot" }, "mount /boot"));
+    }
 
     if (cfg.boot_mode == .uefi) {
         const esp = partPath(alloc, cfg.disk.device, 1);
@@ -585,6 +609,8 @@ fn planFstab(alloc: Allocator, cfg: *const Config) !Step {
         try w.print("{s}\t/efi\tvfat\tdefaults\t0 2\n", .{partPath(alloc, cfg.disk.device, 1)});
     if (cfg.disk.swap == .partition)
         try w.print("{s}\tnone\tswap\tsw\t0 0\n", .{partPath(alloc, cfg.disk.device, 2)});
+    if (cfg.disk.boot_part)
+        try w.print("{s}\t/boot\text4\tdefaults\t0 2\n", .{partPath(alloc, cfg.disk.device, bootPartIdx(cfg))});
     if (cfg.disk.root_fs == .btrfs) {
         try w.print("{s}\t/home\tbtrfs\tsubvol=@home,compress=zstd:1,noatime\t0 2\n", .{root.dev});
         try w.print("{s}\t/.snapshots\tbtrfs\tsubvol=@snapshots,compress=zstd:1,noatime\t0 2\n", .{root.dev});
@@ -698,7 +724,33 @@ fn planServices(alloc: Allocator, cfg: *const Config) !Step {
     switch (cfg.network.manager) {
         .networkmanager => try enables.append(alloc, .{ .name = "NetworkManager", .runlevel = "default" }),
         .dhcpcd => try enables.append(alloc, .{ .name = "dhcpcd", .runlevel = "default" }),
-        else => {},
+        // netifrc: emerge the package, create the net.eth0 symlink, enable.
+        .netifrc => {
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "emerge", "net-misc/netifrc" }),
+                .chroot = true,
+                .desc = "netifrc",
+            } });
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "ln", "-sf", "net.lo", "/etc/init.d/net.eth0" }),
+                .chroot = true,
+                .desc = "netifrc eth0 unit link",
+            } });
+            try enables.append(alloc, .{ .name = "net.eth0", .runlevel = "default" });
+        },
+        // systemd-networkd: enable the daemons + resolved stub resolv.conf.
+        .@"systemd-networkd" => {
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "systemctl", "enable", "systemd-networkd.service", "systemd-resolved.service" }),
+                .chroot = true,
+                .desc = "enable networkd + resolved",
+            } });
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "ln", "-sf", "../run/systemd/resolve/stub-resolv.conf", "/etc/resolv.conf" }),
+                .chroot = true,
+                .desc = "resolved stub resolv.conf",
+            } });
+        },
     }
     if (cfg.services.ntp) try enables.append(alloc, .{ .name = if (init == .systemd) "systemd-timesyncd" else "chronyd", .runlevel = "default" });
     if (cfg.services.cron) try enables.append(alloc, .{ .name = "cronie", .runlevel = "default" });
@@ -781,25 +833,41 @@ fn planBootloader(alloc: Allocator, cfg: *const Config) !Step {
             } else {
                 try c.append(alloc, argv(alloc, &.{ "limine", "bios-install", cfg.disk.device }, "limine BIOS stages"));
             }
-            try c.append(alloc, wf(alloc, "/mnt/gentoo/efi/limine.conf", limineConf(alloc, cfg)));
-            // kernel-install hook: stage kernel+initramfs at the fixed ESP
+            // Limine's boot volume: the ESP under UEFI, /boot under BIOS
+            // (a separate ext4 partition when disk.boot_part, else the
+            // root fs — validation restricts bare-root BIOS to ext4).
+            const stage_dir = if (cfg.boot_mode == .uefi) "/efi" else "/boot";
+            try c.append(alloc, wf(alloc, s(alloc, "/mnt/gentoo{s}/limine.conf", .{stage_dir}), limineConf(alloc, cfg)));
+            // kernel-install hook: stage kernel+initramfs at the fixed
             // paths limine.conf references. installkernel invokes this on
             // every kernel add/remove — upgrades stay seamless.
             try c.append(alloc, .{ .write_file = .{
                 .path = "/mnt/gentoo/etc/kernel/install.d/91-limine.install",
-                .content =
-                \\#!/bin/sh
-                \\# gentoo-installer limine hook (kernel-install): stage
-                \\# kernel + initramfs at the fixed ESP paths limine.conf uses.
-                \\# args: $1=command $2=kver $3=entry_dir_abs $4=kernel_image
-                \\[ "$1" = add ] || exit 0
-                \\esp=/efi
-                \\cp -f "$4" "$esp/vmlinuz" || exit 1
-                \\initrd=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img /boot/initrd-* 2>/dev/null | head -n1)
-                \\[ -n "$initrd" ] && cp -f "$initrd" "$esp/initramfs.img"
-                \\exit 0
-                ,
+                .content = s(alloc,
+                    \\#!/bin/sh
+                    \\# gentoo-installer limine hook (kernel-install): stage
+                    \\# kernel + initramfs at the fixed boot paths limine.conf uses.
+                    \\# args: $1=command $2=kver $3=entry_dir_abs $4=kernel_image
+                    \\[ "$1" = add ] || exit 0
+                    \\esp={s}
+                    \\cp -f "$4" "$esp/vmlinuz" || exit 1
+                    \\initrd=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img /boot/initrd-* 2>/dev/null | head -n1)
+                    \\[ -n "$initrd" ] && cp -f "$initrd" "$esp/initramfs.img"
+                    \\exit 0
+                    , .{stage_dir}),
                 .mode = 0o755,
+            } });
+            // The hook only fires for FUTURE kernel installs — the kernel
+            // emerged earlier this install was never staged. Stage it now.
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc,
+                    "k=$(ls -t /boot/vmlinuz-* 2>/dev/null | head -n1); " ++
+                    "[ -n \"$k\" ] || exit 0; " ++
+                    "cp -f \"$k\" {s}/vmlinuz; " ++
+                    "i=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img 2>/dev/null | head -n1); " ++
+                    "[ -n \"$i\" ] && cp -f \"$i\" {s}/initramfs.img; true", .{ stage_dir, stage_dir }) }),
+                .chroot = true,
+                .desc = "stage current kernel + initramfs for limine",
             } });
         }, 
         .grub => {
@@ -919,10 +987,16 @@ fn limineConf(alloc: Allocator, cfg: *const Config) []const u8 {
     // LUKS: dracut unlocks via crypttab/rd.luks at initramfs time.
     if (cfg.disk.luks)
         root_args = s(alloc, "{s} rd.luks=1", .{root_args});
+    // boot:// resolves on the volume holding limine.conf: ESP root under
+    // UEFI or a dedicated /boot partition; the root fs otherwise, where
+    // staged files live under /boot/.
+    const boot_vol = cfg.boot_mode == .uefi or cfg.disk.boot_part;
+    const kpath = if (boot_vol) "vmlinuz" else "boot/vmlinuz";
+    const ipath = if (boot_vol) "initramfs.img" else "boot/initramfs.img";
     w.print("/Gentoo\n", .{}) catch {};
     w.writeAll("    protocol: linux\n") catch {};
-    w.writeAll("    kernel_path: boot:///vmlinuz\n") catch {};
-    w.writeAll("    module_path: boot:///initramfs.img\n") catch {};
+    w.print("    kernel_path: boot:///{s}\n", .{kpath}) catch {};
+    w.print("    module_path: boot:///{s}\n", .{ipath}) catch {};
     w.print("    cmdline: {s} rootfstype={s}\n", .{ root_args, @tagName(cfg.disk.root_fs) }) catch {};
     w.writeAll("\n# snapshot entries are appended by the kernel-install hook\n") catch {};
     return aw.written();

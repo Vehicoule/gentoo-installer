@@ -126,6 +126,9 @@ pub const Config = struct {
 
     packages: struct {
         sets: []const []const u8 = &.{"minimal"},
+        /// whether `sets` appeared in the document — an explicit `[]`
+        /// means "no sets", not "defaults"
+        sets_explicit: bool = false,
         atoms: []const []const u8 = &.{},
     } = .{},
 
@@ -331,7 +334,10 @@ pub fn decode(alloc: Allocator, doc: toml.Document) DecodeError!Config {
 
     if (doc.root.get("packages")) |v| {
         const t = try tableOf(v, "packages");
-        if (field(t, "sets")) |x| cfg.packages.sets = try strList(alloc, x, "packages.sets");
+        if (field(t, "sets")) |x| {
+            cfg.packages.sets = try strList(alloc, x, "packages.sets");
+            cfg.packages.sets_explicit = true;
+        }
         if (field(t, "atoms")) |x| cfg.packages.atoms = try strList(alloc, x, "packages.atoms");
     }
 
@@ -368,14 +374,16 @@ pub fn resolveBootloader(cfg: *const Config) Bootloader {
 /// init) unless `stage3.variant` pins one explicitly.
 pub fn stage3Stem(alloc: Allocator, cfg: *const Config) ![]const u8 {
     if (!std.mem.eql(u8, cfg.stage3.variant, "auto")) return cfg.stage3.variant;
+    // Stem word order matches Gentoo's published names:
+    // stage3-<arch>[-musl][-hardened[-selinux]][-llvm]-<init>
     var parts: std.ArrayList([]const u8) = .empty;
     if (cfg.stage3.libc == .musl) try parts.append(alloc, "musl");
-    if (cfg.stage3.toolchain == .llvm) try parts.append(alloc, "llvm");
     switch (cfg.security.hardening) {
         .standard => {},
         .hardened => try parts.append(alloc, "hardened"),
         .@"hardened-selinux" => try parts.append(alloc, "hardened-selinux"),
     }
+    if (cfg.stage3.toolchain == .llvm) try parts.append(alloc, "llvm");
     try parts.append(alloc, switch (cfg.system.init) {
         .systemd => "systemd",
         else => "openrc", // non-systemd stage3s ship openrc; alt inits swap later
@@ -427,6 +435,25 @@ pub fn validate(alloc: Allocator, cfg: *const Config, has_nvidia: ?bool) ![][]co
     // Erase-disk schemes always format — wipe=false preserves nothing.
     if (!cfg.disk.wipe and cfg.disk.scheme != .alongside and cfg.disk.scheme != .manual)
         try errs.append(alloc, "disk.wipe=false has no effect on erase schemes — use alongside/manual to preserve data");
+    // Erase scheme must match the firmware boot mode (partition layout
+    // and bootloader paths are mode-specific).
+    if (cfg.disk.scheme == .@"efi-swap-root" and cfg.boot_mode == .bios)
+        try errs.append(alloc, "disk.scheme=efi-swap-root requires boot_mode=uefi — use bios-boot-swap-root");
+    if (cfg.disk.scheme == .@"bios-boot-swap-root" and cfg.boot_mode == .uefi)
+        try errs.append(alloc, "disk.scheme=bios-boot-swap-root requires boot_mode=bios — use efi-swap-root");
+    // BIOS limine reads only ext-family filesystems and cannot unlock
+    // LUKS — a separate /boot is required unless the root is plain ext4.
+    if (cfg.boot_mode == .bios and resolveBootloader(cfg) == .limine) {
+        if (cfg.disk.luks and !cfg.disk.boot_part)
+            try errs.append(alloc, "BIOS + LUKS requires disk.boot_part=true — limine cannot read encrypted roots");
+        if (cfg.disk.root_fs != .ext4 and !cfg.disk.boot_part)
+            try errs.append(alloc, fmt(alloc, "BIOS limine cannot read {s} roots — set disk.boot_part=true (ext4 /boot)", .{@tagName(cfg.disk.root_fs)}));
+    }
+    // Network managers must match init capabilities.
+    if (cfg.network.manager == .netifrc and cfg.system.init != .openrc)
+        try errs.append(alloc, "network.manager=netifrc requires init=openrc");
+    if (cfg.network.manager == .@"systemd-networkd" and cfg.system.init != .systemd)
+        try errs.append(alloc, "network.manager=systemd-networkd requires init=systemd");
     // usernames become filesystem paths (/home/<name>) and useradd args.
     for (cfg.users) |u| {
         if (!posixName(u.name))
