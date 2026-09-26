@@ -49,9 +49,14 @@ offered as a target.
 | `move_part` | — | *v2+ only* — never in v1 alongside |
 | `mount` / `swap_on` / `zram` | target, opts | mount step ops |
 
-Every `create_part`/`format` op stores the expected PARTUUID/fs-uuid
-postconditions so `--resume` and `detect --repair` can distinguish "op
-already applied" from "op needed".
+Every `create_part`/`format` op carries ID postconditions so `--resume`
+and `detect --repair` can distinguish "op already applied" from "op
+needed". IDs are **prescribed where the tool allows** — `sgdisk -u
+<part>:<GUID>` sets the planned PARTUUID, `mkfs.* -U` (btrfs/ext4/f2fs)
+/ `-m uuid=` (xfs) / `-i` (vfat) set the fs uuid — and **captured
+post-op where they can't be** (LUKS container UUID via
+`cryptsetup luksUUID`, md/LVM metadata ids via `blkid` after partprobe).
+Either way the journal records what the disk actually ended up with.
 
 ## Layer stacking (fixed order)
 
@@ -133,7 +138,7 @@ to guided layouts.
 | zram | `size = min(ram/2, 8 GiB)`, `zstd`, `vm.swappiness=180` — see below |
 | min install | root ≥ 8 GiB (stage3 + toolchain + minimal world) |
 | alignment | 1 MiB everywhere; first usable sector 2048 on 512e, native on 4Kn |
-| thin pool | `tank` gets ~all VG free space; root LV virtual size = remainder |
+| thin pool | `tank` gets ~all VG free space; root thin LV virtual size = `tank` size (no overcommit by default — expert can overprovision); snapshots are thin snapshots sharing the pool |
 
 **zram vs zswap:** `swap=zram` (default) — zram device as swap, no disk
 I/O, best on modest RAM. `swap=partition` additionally gets `zswap`
@@ -168,5 +173,8 @@ journal, never `Cmd` serialization (the dry-run log redacts them).
   on-disk.
 - `detect --repair` (post-reboot, journal gone): reprobe, diff observed
   state against a planned `DiskPlan`, classify ops as done/pending/failed.
-- `wipe_table` is the point of no return — P7's type-the-disk gate
-  stands immediately before it in the op stream.
+- The point of no return is the **first mutating op**: `wipe_table` on
+  erase layouts, `resize_fs` on alongside (which has no wipe_table).
+  P7's gate — type-the-disk for `wipe=true`, the "existing OS will be
+  modified/shrunk" acknowledgement for alongside — stands immediately
+  before that op in the stream; every op before it is read-only.
