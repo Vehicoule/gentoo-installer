@@ -112,7 +112,7 @@ password on a surviving account, or `sshd=true` + authorized key.
 | kernel | enum `dist-bin\|dist\|manual` | `dist-bin` | `manual` = we mount+chroot, user configures — expert |
 | initramfs | enum `dracut\|ugrd\|none` | `dracut` | `none` unsafe with LUKS/LVM/separate-/usr — VALIDATE warns/blocks |
 | uki | bool | false | implies dracut/ugrd + installkernel[uki] |
-| bootloader | enum `auto\|grub\|systemd-boot\|efistub` | `auto` | auto = systemd-boot on systemd, grub on openrc; `efistub`/`systemd-boot` require UEFI |
+| bootloader | enum `auto\|grub\|systemd-boot\|efistub` | `auto` | auto resolves **boot mode first**: BIOS ⇒ grub always; UEFI ⇒ systemd-boot on systemd, grub on openrc. Explicit `systemd-boot`/`efistub`/`uki` on BIOS are hard-rejected by VALIDATE |
 | secure_boot | enum `off\|sbctl\|shim` | `off` | `sbctl` requires uki or signed grub; `shim` for grub only |
 | net_manager | enum `networkmanager\|dhcpcd\|netifrc\|systemd-networkd` | `networkmanager` | `systemd-networkd` needs init=systemd |
 | wifi_fw | bool | detected | `linux-firmware` + `sof-firmware` |

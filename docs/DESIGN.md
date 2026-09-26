@@ -376,8 +376,9 @@ GUI is a separate build artifact; the TUI/engine binary stays dependency-free.
 2. Binary naming: `gentoo-installer` (cli+tui+headless) and
    `gentoo-installer-gui`? 
 3. Bootloader default on UEFI: `systemd-boot` (lighter, fits the efficiency
-   ethos) vs `grub` (most familiar)? Proposal: `auto` = systemd-boot on
-   systemd variants, grub on openrc.
+   ethos) vs `grub` (most familiar)? Proposal: `auto` resolves boot mode
+   first — BIOS ⇒ always grub; UEFI ⇒ systemd-boot on systemd variants,
+   grub on openrc. VALIDATE hard-rejects systemd-boot/efistub/uki on BIOS.
 4. Do we ship a `.zigmod`/`zig` version manager pin or rely on distro zig?
 5. First distro preset beyond stock gentoo — defer until M6, but the schema
    should be drafted against a real wish-list (your wayland WM + tools).
