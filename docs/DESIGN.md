@@ -12,9 +12,18 @@ extensibility toward a downstream Gentoo-based distribution.
 - Two frontends on one engine: a **TUI** that runs on the minimal ISO
   (~140 MB RAM, no graphics, possibly no terminfo) and a **GUI** that runs
   on the LiveGUI (KDE/Qt, Wayland).
-- Cover the full matrix Gentoo offers — init systems, stage3 flavors,
-  filesystems, LUKS/LVM/RAID, kernels, bootloaders — and the
-  **amd64 / arm64 / riscv64** architectures.
+- Cover the full matrix Gentoo offers — init systems, stage3 flavors
+  (glibc **and** musl, gcc **and** llvm/clang toolchains, hardened /
+  hardened-selinux), filesystems, LUKS/LVM/RAID, kernels, bootloaders —
+  and the **amd64 / arm64 / riscv64** architectures.
+- **Dual-boot**: detect existing OSes (Windows, other Linux, FreeBSD) and
+  install alongside them — shrink/make room, keep the existing ESP,
+  register both systems in the boot menu.
+- **Secure Boot**: a real signing flow — sbctl-managed keys or shim+MOK —
+  so UKI/GRUB installs boot with SB enabled.
+- **Mass-install automation**: `--config` answer files plus the headless
+  protocol are a first-class product surface — a fleet tool or CI can
+  drive installs without any UI.
 - Be the installer for a future Gentoo-based distro: presets, branding, and
   extra steps are data, not forks.
 - Memory efficiency is a project value: the installer must be a small static
@@ -22,11 +31,10 @@ extensibility toward a downstream Gentoo-based distribution.
 
 ## Non-goals (v1)
 
-- Dual-boot with existing OSes (detect-and-warn only).
-- BIOS/CSM boot on amd64 (UEFI first; BIOS is a later milestone).
-- Split-usr, musl, hardened, SELinux, x32 stage3 flavors (accepted by the
-  config schema, gated behind "expert" until validated).
-- Secure Boot signing flows.
+- BIOS/CSM boot on amd64 (UEFI first; BIOS is a later milestone — dual-boot
+  support targets UEFI systems first).
+- Split-usr and x32 stage3 flavors (accepted by the config schema, gated
+  behind "expert" until validated).
 - Replacing the Handbook for experts — `gentoo-installer --config` gives a
   scriptable path; the wizard targets the guided experience.
 
@@ -98,7 +106,11 @@ sensible):
    equivalent), network reachability, clock sanity (offer `chronyd -q`).
 2. **partition** — guided layouts: `efi+swap+root` (GPT, EF00/8200/8304
    DPS GUIDs) or `bios-boot+swap+root`; LUKS2 container option; LVM option;
-   manual passthrough. `sgdisk`/`wipefs`/`cryptsetup`/`mkfs.*`.
+   `alongside` mode for dual-boot (probe existing OSes via os-prober-style
+   detection + ESP inspection, offer shrink of ntfs/ext4/btrfs —
+   xfs/f2fs cannot shrink, so there we require existing unallocated
+   space — then reuse the existing ESP); manual passthrough.
+   `sgdisk`/`wipefs`/`cryptsetup`/`mkfs.*`/`ntfsresize`/`resize2fs`.
 3. **mount** — root at `/mnt/gentoo`, ESP at `/efi` (or `/boot` for BIOS);
    bind-mounts for chroot.
 4. **stage3** — resolve `latest-stage3-<stem>.txt` pointer on the distfiles
@@ -125,14 +137,20 @@ sensible):
     systemd+DPS+UEFI layouts (auto-discovery).
 13. **system-config** — hostname, `/etc/hosts`, root password, user
     accounts (`useradd -m -G wheel,audio,video,...`), sudo/doas.
-14. **services** — init-appropriate: `rc-update add` vs `systemctl enable`
+14. **services** — init-appropriate: `systemctl enable` / `rc-update add`
+    / runit `ln -s /etc/sv/* /run/runit/service` / s6-rc bundle edits,
     for network (dhcpcd/NetworkManager/netifrc/systemd-networkd), sshd,
     logger (sysklogd on OpenRC), cron (cronie), chrony.
 15. **bootloader** — GRUB (BIOS `grub-install /dev/X`; UEFI
     `grub-install --efi-directory=/efi` + `grub-mkconfig`), systemd-boot
     (`bootctl install`, kernels at `/efi`), or EFI-stub/UKI via
     `installkernel[uki dracut]`; `--removable` fallback offered when efivars
-    are unavailable.
+    are unavailable. **Secure Boot**: sign the boot path — sbctl-generated
+    keys enrolled via firmware setup mode (or shim+MOK for GRUB),
+    `sbctl sign` on UKIs/bootloader binaries, ukify hooks so future kernel
+    installs stay signed. **Dual-boot**: grub `os-prober` output or
+    systemd-boot's auto-discovered ESP entries get merged into the menu;
+    Windows Boot Manager entry preserved.
 16. **finish** — `passwd -l root` when `root.lock_root`, artifact cleanup
     (`/stage3-*`), preset post-install hook, summary + reboot prompt.
 
@@ -147,19 +165,30 @@ boot_mode   = "uefi"             # detected; uefi | bios
 
 [disk]
 device      = "/dev/sda"
-wipe        = true
-scheme      = "efi-swap-root"    # | bios-boot-swap-root | manual
+wipe        = true               # must be false when scheme = "alongside"
+scheme      = "efi-swap-root"    # | bios-boot-swap-root | alongside | manual
 root_fs     = "xfs"              # xfs | ext4 | btrfs | f2fs
 swap_mib    = 4096               # 0 = none
 luks        = false              # LUKS2 on root
 lvm         = false              # LVM2 vg on the raw root part (or on LUKS)
 
+# alongside mode only:
+shrink_part = "/dev/sda3"         # partition to shrink (ntfs/ext4/btrfs)
+shrink_mib  = 61440               # space to free for the new install
+# unattended dual-boot = scheme "alongside" + shrink_* ; omitting them in
+# interactive mode lets the wizard pick the shrink candidate.
+
 [stage3]
-variant     = "desktop-systemd"  # see matrix below
+variant     = "desktop-systemd"  # see matrix below — glibc/musl,
+                               # gcc/llvm, hardened, selinux all flow
+                               # through this one field
 mirror      = "https://distfiles.gentoo.org"
 
 [system]
-init        = "systemd"          # openrc | systemd  (follows variant)
+init        = "systemd"          # openrc | systemd — first-class;
+                               # runit | s6 | dinit accepted under expert
+                               # (no stage3s; installed as a post-stage3
+                               # init swap — see "Init systems" below)
 hostname    = "gentoo"
 timezone    = "UTC"
 locale      = "en_US.UTF-8"
@@ -207,6 +236,10 @@ lock_root = false                   # `passwd -l root` at finish (sudo-only box)
 # root-hash + lock_root with nothing else, are rejected — they would
 # yield a system no one can log into.
 
+[security]
+secure_boot = "off"              # off | sbctl | shim  (uki/bootloader signing)
+selinux     = false              # forces hardened-selinux stage3 + profile
+
 [extra]
 packages = []                    # additional emerges
 update_world = true
@@ -219,8 +252,11 @@ update_world = true
 `musl-hardened-*`, `musl-llvm-*`, `llvm-*`, `openrc-splitusr`, `x32-*`.
 
 v1 guided path offers: `openrc`, `systemd`, `desktop-openrc`,
-`desktop-systemd` (+ `nomultilib-*` under expert). Others parse and install
-but are flagged "untested path" until the QEMU matrix covers them.
+`desktop-systemd`, `musl-*`, `llvm-*` (+ `nomultilib-*`, `hardened-*`,
+`hardened-selinux-*` under expert — promoted goals, each flagged
+"untested path" until the QEMU matrix covers it). `musl-llvm-*` combines
+both axes. selinux additionally requires `security.selinux = true` so the
+profile/policy packages land (sec-policy/*, refpolicy).
 
 arm64/riscv64 differences handled by an `arch table`: stage3 stems
 (`stage3-arm64-openrc`, `stage3-rv64_lp64d-openrc` …), profile names, boot
@@ -229,6 +265,17 @@ live env there), and bootloader choices (grub-efi, systemd-boot, or
 firmware-specific like U-Boot on some riscv boards — v1 amd64 only for
 bootloader writes; arm64/riscv64 installs land the userland + fstab and
 document the firmware step until validated).
+
+### Init systems
+
+`openrc` and `systemd` are the only first-class inits — they are the only
+ones Gentoo ships stage3s and profiles for. `runit`, `s6` (+s6-rc), and
+`dinit` exist as packages (runit/s6 in ::gentoo, dinit via guru) with no
+official stage3 or install path: supporting them means extracting a
+normal stage3 and swapping the init — an `init-backend` engine interface
+(`services`, `logger`, `getty`, `boot` wiring per init) keeps the
+pipeline agnostic so these land as expert-flagged options once validated,
+not as a redesign.
 
 ## Headless protocol (GUI ↔ engine)
 
@@ -304,8 +351,11 @@ GUI is a separate build artifact; the TUI/engine binary stays dependency-free.
 - **M3** — QEMU green: real install boots on amd64 for the happy path.
 - **M4** — libcosmic GUI shell on the headless protocol.
 - **M5** — option matrix: LUKS, LVM, btrfs subvols, nomultilib, manual
-  kernel, custom partitions; arm64 + riscv64 bring-up.
-- **M6** — distro preset layer hardening (branding, extra steps,
+  kernel, custom partitions; musl + llvm + hardened(-selinux) stage3
+  paths; arm64 + riscv64 bring-up.
+- **M6** — secure boot signing flow (sbctl path first), dual-boot
+  alongside-mode + menu merge, runit/s6/dinit init-backend exploration.
+- **M7** — distro preset layer hardening (branding, extra steps,
   post-install hooks), docs, 1.0.
 
 ## Open questions
