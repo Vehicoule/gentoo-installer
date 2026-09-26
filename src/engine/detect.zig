@@ -87,16 +87,19 @@ pub fn detect(alloc: Allocator, io: std.Io) !Env {
     if (readSmall(alloc, io, "/proc/cpuinfo")) |cpuinfo| {
         var lines = std.mem.splitScalar(u8, cpuinfo, '\n');
         var ncpu: u32 = 0;
+        var got_flags = false;
         while (lines.next()) |line| {
             if (std.mem.startsWith(u8, line, "processor")) ncpu += 1;
-            if (std.mem.startsWith(u8, line, "flags") or std.mem.startsWith(u8, line, "Features")) {
+            // flags/Features repeats per-processor — take the first only,
+            // but keep scanning so cpu_count sees every processor stanza.
+            if (!got_flags and (std.mem.startsWith(u8, line, "flags") or std.mem.startsWith(u8, line, "Features"))) {
                 if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
                     var flags: std.ArrayList([]const u8) = .empty;
                     var it = std.mem.tokenizeScalar(u8, line[colon + 1 ..], ' ');
                     while (it.next()) |f| try flags.append(alloc, f);
                     env.cpu_flags = flags.items;
                 }
-                break;
+                got_flags = true;
             }
         }
         if (ncpu > 0) env.cpu_count = ncpu;

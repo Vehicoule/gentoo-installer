@@ -39,10 +39,16 @@ pub fn load(alloc: Allocator, path: []const u8, io: std.Io) LoadError!Preset {
         return e;
     };
     var p: Preset = .{ .doc = doc };
-    if (doc.root.get("id")) |v| {
+    // identity lives in the [preset] table (presets/*.toml); bare-root
+    // id/name accepted for hand-written minimal presets.
+    const ident: *const toml.Value.Table = if (doc.root.get("preset")) |v|
+        (if (v == .table) &v.table else &doc.root)
+    else
+        &doc.root;
+    if (ident.get("id")) |v| {
         if (v == .string) p.id = v.string;
     }
-    if (doc.root.get("name")) |v| {
+    if (ident.get("name")) |v| {
         if (v == .string) p.name = v.string;
     }
     // [locks] fields = ["system.init", ...]
@@ -216,7 +222,15 @@ fn valueEq(a: toml.Value, b: toml.Value) bool {
             for (aa, b.array) |x, y| if (!valueEq(x, y)) break :blk false;
             break :blk true;
         },
-        .table => false,
+        .table => |at| blk: {
+            if (b != .table) break :blk false;
+            const bt = b.table;
+            if (at.count() != bt.count()) break :blk false;
+            var it = at.iterator();
+            while (it.next()) |kv|
+                if (!valueEq(kv.value_ptr.*, bt.get(kv.key_ptr.*) orelse break :blk false)) break :blk false;
+            break :blk true;
+        },
     };
 }
 

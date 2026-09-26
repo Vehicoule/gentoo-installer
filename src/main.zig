@@ -341,9 +341,11 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
             try engine.detect.envFieldsJson(alloc, &env, out);
             try out.writeAll("}\n");
         } else if (std.mem.eql(u8, op, "quit")) {
-            try out.writeAll("{\"ev\":\"result\",");
-            try writeReq(out, req);
-            try out.writeAll("\"ok\":true}\n");
+            // bye has no payload fields — emit req without writeReq's
+            // trailing comma.
+            try out.writeAll("{\"ev\":\"bye\"");
+            if (req) |rq| try out.print(",\"req\":{}", .{rq});
+            try out.writeAll("}\n");
             try out.flush();
             return;
         } else {

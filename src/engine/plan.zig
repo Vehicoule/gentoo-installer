@@ -233,10 +233,13 @@ fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) 
             // -V %FREE is a share of the thin POOL, not the VG: give root
             // 70% when a home LV follows, else the whole pool. Thin
             // overcommit makes both caps soft.
+            // -l %FREE on a thin LV is a share of the thin POOL's free
+            // space — the unambiguous spelling (a %-sized -V is not
+            // accepted by all lvm versions).
             const root_pct = if (d.home_part and d.root_fs != .btrfs) "70%FREE" else "100%FREE";
-            try c.append(alloc, argv(alloc, &.{ "lvcreate", "-V", root_pct, "-T", "vg0/tank", "-n", "root" }, "thin root LV"));
+            try c.append(alloc, argv(alloc, &.{ "lvcreate", "-l", root_pct, "-T", "vg0/tank", "-n", "root" }, "thin root LV"));
             if (d.home_part and d.root_fs != .btrfs) {
-                try c.append(alloc, argv(alloc, &.{ "lvcreate", "-V", "100%FREE", "-T", "vg0/tank", "-n", "home" }, "thin home LV (remaining pool)"));
+                try c.append(alloc, argv(alloc, &.{ "lvcreate", "-l", "100%FREE", "-T", "vg0/tank", "-n", "home" }, "thin home LV (remaining pool)"));
                 try c.append(alloc, argv(alloc, &.{ s(alloc, "mkfs.{s}", .{@tagName(d.root_fs)}), "/dev/vg0/home" }, "format home LV"));
             }
         } else {
@@ -760,7 +763,9 @@ fn planSystemConfig(alloc: Allocator, cfg: *const Config) !Step {
             },
             .openrc => {
                 try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-apps/zram-init" }), .chroot = true, .desc = "zram-init" } });
-                try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/conf.d/zram-init", "num_devices=1\ntype0=swap\nsize0=min(ram / 2, 8192)\ncompr0=zstd\n"));
+                // zram-init sizes use its `lram` expression var (RAM in MiB),
+                // not the zram-generator `ram` spelling.
+                try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/conf.d/zram-init", "num_devices=1\ntype0=swap\nsize0=min(lram / 2, 8192)\ncompr0=zstd\n"));
                 try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "rc-update", "add", "zram-init", "boot" }), .chroot = true, .desc = "enable zram-init" } });
             },
             else => try c.append(alloc, .{ .note = "zram on this init lands with its backend in M6" }),
@@ -780,6 +785,8 @@ fn planServices(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !
     if (cfg.services.ntp) try svc_atoms.append(alloc, "net-misc/chrony");
     if (cfg.services.sshd) try svc_atoms.append(alloc, "net-misc/openssh");
     if (cfg.services.logger and init != .systemd) try svc_atoms.append(alloc, "app-admin/sysklogd");
+    // wifi needs a supplicant — iwd is the lean default backend.
+    if (cfg.network.wifi) try svc_atoms.append(alloc, "net-wireless/iwd");
     if (svc_atoms.items.len > 0)
         try c.append(alloc, .{ .exec = .{
             .argv = try prepend(alloc, "emerge", svc_atoms.items),
@@ -828,6 +835,16 @@ fn planServices(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !
                 .chroot = true,
                 .desc = "resolved stub resolv.conf",
             } });
+            // A .network unit — the daemons alone configure nothing.
+            var netw: std.Io.Writer.Allocating = .init(alloc);
+            try netw.writer.writeAll("[Match]\nName=");
+            if (env != null and env.?.nics.len > 0) {
+                for (env.?.nics) |nic| try netw.writer.print("{s} ", .{nic});
+            } else {
+                try netw.writer.writeAll("*");
+            }
+            try netw.writer.writeAll("\n[Network]\nDHCP=yes\n");
+            try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/systemd/network/20-installer.network", netw.written()));
         },
     }
     if (cfg.services.ntp) try enables.append(alloc, .{ .name = if (init == .systemd) "systemd-timesyncd" else "chronyd", .runlevel = "default" });
@@ -940,10 +957,11 @@ fn planBootloader(alloc: Allocator, cfg: *const Config) !Step {
             try c.append(alloc, .{ .exec = .{
                 .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc,
                     "k=$(ls -t /boot/vmlinuz-* 2>/dev/null | head -n1); " ++
-                    "[ -n \"$k\" ] || exit 0; " ++
-                    "cp -f \"$k\" {s}/vmlinuz; " ++
+                    "[ -n \"$k\" ] || {{ echo 'no kernel to stage' >&2; exit 1; }}; " ++
+                    "cp -f \"$k\" {s}/vmlinuz || exit 1; " ++
                     "i=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img 2>/dev/null | head -n1); " ++
-                    "[ -n \"$i\" ] && cp -f \"$i\" {s}/initramfs.img; true", .{ stage_dir, stage_dir }) }),
+                    "[ -n \"$i\" ] || {{ echo 'no initramfs to stage' >&2; exit 1; }}; " ++
+                    "cp -f \"$i\" {s}/initramfs.img; true", .{ stage_dir, stage_dir }) }),
                 .chroot = true,
                 .desc = "stage current kernel + initramfs for limine",
             } });
@@ -982,10 +1000,11 @@ fn planBootloader(alloc: Allocator, cfg: *const Config) !Step {
             try c.append(alloc, .{ .exec = .{
                 .argv = try alloc.dupe([]const u8, &.{ "sh", "-c",
                     "k=$(ls -t /boot/vmlinuz-* 2>/dev/null | head -n1); " ++
-                    "[ -n \"$k\" ] || exit 0; " ++
-                    "mkdir -p /efi/loader/entries && cp -f \"$k\" /efi/vmlinuz; " ++
+                    "[ -n \"$k\" ] || { echo 'no kernel to stage' >&2; exit 1; }; " ++
+                    "mkdir -p /efi/loader/entries && cp -f \"$k\" /efi/vmlinuz || exit 1; " ++
                     "i=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img 2>/dev/null | head -n1); " ++
-                    "[ -n \"$i\" ] && cp -f \"$i\" /efi/initramfs.img; true" }),
+                    "[ -n \"$i\" ] || { echo 'no initramfs to stage' >&2; exit 1; }; " ++
+                    "cp -f \"$i\" /efi/initramfs.img; true" }),
                 .chroot = true,
                 .desc = "stage kernel + initramfs on the ESP",
             } });
@@ -1008,7 +1027,37 @@ fn planBootloader(alloc: Allocator, cfg: *const Config) !Step {
                 .mode = 0o755,
             } });
         },
-        .efistub => try c.append(alloc, .{ .note = "efistub: kernels boot via firmware NVRAM entries (efibootmgr)" }),
+        // efistub: stage kernel+initramfs on the ESP and register a
+        // firmware NVRAM entry. The ESP's disk/partition are resolved at
+        // runtime via the /efi mount so alongside/reuse layouts work.
+        .efistub => {
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-boot/efibootmgr" }),
+                .chroot = true,
+                .desc = "efibootmgr",
+            } });
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c",
+                    "k=$(ls -t /boot/vmlinuz-* 2>/dev/null | head -n1); " ++
+                    "[ -n \"$k\" ] || { echo 'no kernel to stage' >&2; exit 1; }; " ++
+                    "cp -f \"$k\" /efi/vmlinuz || exit 1; " ++
+                    "i=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img 2>/dev/null | head -n1); " ++
+                    "[ -n \"$i\" ] || { echo 'no initramfs to stage' >&2; exit 1; }; " ++
+                    "cp -f \"$i\" /efi/initramfs.img; true" }),
+                .chroot = true,
+                .desc = "stage kernel + initramfs on the ESP",
+            } });
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc,
+                    "esp=$(findmnt -no SOURCE /efi) || exit 1; " ++
+                    "d=$(lsblk -no PKNAME \"$esp\"); p=$(lsblk -no PARTN \"$esp\"); " ++
+                    "[ -n \"$d\" ] && [ -n \"$p\" ] || exit 1; " ++
+                    "efibootmgr -c -d /dev/$d -p $p -L Gentoo -l '\\vmlinuz' " ++
+                    "-u '{s} initrd=\\initramfs.img'", .{kernelArgs(alloc, cfg)}) }),
+                .chroot = true,
+                .desc = "efibootmgr: create Gentoo NVRAM entry",
+            } });
+        },
         .refind => try c.append(alloc, .{ .exec = .{
             .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-boot/refind" }),
             .chroot = true,

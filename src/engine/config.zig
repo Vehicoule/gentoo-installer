@@ -494,10 +494,42 @@ pub fn validate(alloc: Allocator, cfg: *const Config, has_nvidia: ?bool) ![][]co
     for (cfg.users) |u| {
         if (hasCtl(u.name) or hasCtl(u.shell))
             try errs.append(alloc, fmt(alloc, "user '{s}' has control chars in name/shell", .{u.name}));
+        // The shell is argv to useradd -s and lands in /etc/passwd —
+        // restrict to an absolute-path charset (no spaces/metachars).
+        if (u.shell.len > 0 and !shellOk(u.shell))
+            try errs.append(alloc, fmt(alloc, "shell '{s}' is not a valid absolute shell path", .{u.shell}));
+        // chpasswd -e lines are `name:hash` — a ':' or newline in the
+        // hash would forge extra account lines.
+        if (u.password_hash) |h|
+            if (!pwHashOk(h)) try errs.append(alloc, fmt(alloc, "password_hash for '{s}' is not crypt-hash charset", .{u.name}));
         for (u.groups) |g|
             if (hasCtl(g)) try errs.append(alloc, fmt(alloc, "group '{s}' has control characters", .{g}));
         for (u.ssh_authorized_keys) |k|
             if (hasCtl(k)) try errs.append(alloc, fmt(alloc, "ssh key for '{s}' has control characters", .{u.name}));
+    }
+    if (cfg.root.password_hash) |h|
+        if (!pwHashOk(h)) try errs.append(alloc, "root.password_hash is not crypt-hash charset");
+    // Timezone lands verbatim in /etc/timezone — zone names only.
+    if (!tzOk(cfg.system.timezone))
+        try errs.append(alloc, fmt(alloc, "timezone '{s}' is not a valid zone name", .{cfg.system.timezone}));
+    // Package atoms become emerge argv — a leading '-' would be a
+    // portage flag, whitespace splits into extra args.
+    for (cfg.packages.atoms) |a|
+        if (!atomOk(a)) try errs.append(alloc, fmt(alloc, "packages.atoms entry '{s}' is not a valid atom", .{a}));
+    var pit = cfg.use.pkg.iterator();
+    while (pit.next()) |kv| {
+        if (!atomOk(kv.key_ptr.*))
+            try errs.append(alloc, fmt(alloc, "use.pkg key '{s}' is not a valid atom", .{kv.key_ptr.*}));
+        const flags_str = switch (kv.value_ptr.*) {
+            .string => |fl| fl,
+            else => continue,
+        };
+        var ft = std.mem.tokenizeScalar(u8, flags_str, ' ');
+        while (ft.next()) |f| {
+            const flag = if (f.len > 0 and f[0] == '-') f[1..] else f;
+            if (!useFlagOk(flag))
+                try errs.append(alloc, fmt(alloc, "use.pkg flag '{s}' for '{s}' is not a USE flag", .{ f, kv.key_ptr.* }));
+        }
     }
     var uit = cfg.use.global.iterator();
     while (uit.next()) |kv| {
@@ -643,6 +675,52 @@ fn hostnameOk(v: []const u8) bool {
                 else => return false,
             }
         }
+    }
+    return true;
+}
+
+// tzdata zone names: Area/City, letters + _ - + /, no '..' or ctl.
+fn tzOk(v: []const u8) bool {
+    if (v.len == 0 or v.len > 64) return false;
+    for (v) |ch| {
+        const ok = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+            (ch >= '0' and ch <= '9') or ch == '_' or ch == '-' or ch == '+' or ch == '/';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+// A portage atom passed as emerge argv: no leading '-' (would be a
+// portage option), no whitespace or control chars (would split lines in
+// generated files / extra argv).
+fn atomOk(v: []const u8) bool {
+    if (v.len == 0 or v.len > 128 or v[0] == '-') return false;
+    for (v) |ch| if (ch <= ' ' or ch == 0x7f) return false;
+    return true;
+}
+
+// crypt(3) hashes: $id$salt$digest over a restricted charset — the
+// string is joined into `name:hash` lines for chpasswd -e, so ':' and
+// whitespace are forbidden.
+fn pwHashOk(v: []const u8) bool {
+    if (v.len == 0 or v.len > 256) return false;
+    for (v) |ch| {
+        const ok = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+            (ch >= '0' and ch <= '9') or ch == '$' or ch == '.' or ch == '/' or
+            ch == '=' or ch == ',' or ch == '_' or ch == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+// Login shell: absolute path, no whitespace/metachars (useradd -s arg
+// and /etc/passwd field).
+fn shellOk(v: []const u8) bool {
+    if (v.len < 2 or v.len > 64 or v[0] != '/') return false;
+    for (v) |ch| {
+        const ok = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+            (ch >= '0' and ch <= '9') or ch == '/' or ch == '.' or ch == '_' or ch == '-' or ch == '+';
+        if (!ok) return false;
     }
     return true;
 }
