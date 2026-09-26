@@ -213,7 +213,7 @@ fn findSet(sets: ?[]toml.Value, id: []const u8) ?toml.Value.Table {
     return null;
 }
 
-fn lookup(root: toml.Value.Table, dotted: []const u8) ?toml.Value {
+pub fn lookup(root: toml.Value.Table, dotted: []const u8) ?toml.Value {
     var cur = root;
     var it = std.mem.splitScalar(u8, dotted, '.');
     while (it.next()) |seg| {
@@ -227,7 +227,7 @@ fn lookup(root: toml.Value.Table, dotted: []const u8) ?toml.Value {
     return null;
 }
 
-fn valueEq(a: toml.Value, b: toml.Value) bool {
+pub fn valueEq(a: toml.Value, b: toml.Value) bool {
     return switch (a) {
         .string => |as| b == .string and std.mem.eql(u8, as, b.string),
         .integer => |ai| b == .integer and ai == b.integer,

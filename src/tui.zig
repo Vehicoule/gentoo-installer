@@ -230,8 +230,9 @@ pub const Tui = struct {
         } else if (std.mem.eql(u8, act, "plan")) {
             try t.showPlanPreview();
         } else if (std.mem.eql(u8, act, "export_answer")) {
-            try t.wiz.exportAnswer("/tmp/gentoo-installer-answer.toml");
-            t.status = "answer file → /tmp/gentoo-installer-answer.toml";
+            // cwd-relative — export is confined to the launch dir.
+            try t.wiz.exportAnswer("gentoo-installer-answer.toml");
+            t.status = "answer file → ./gentoo-installer-answer.toml";
         } else if (std.mem.eql(u8, act, "install")) {
             t.mode = .confirm_install;
             t.edit_buf.clearRetainingCapacity();
@@ -456,16 +457,20 @@ fn draw(t: *Tui, win: vaxis.Window) !void {
         row += 1;
     }
 
-    // actions row
-    if (row <= 2 + max_rows) {
-        row += 1;
+    // actions row — a long summary can't be allowed to push actions
+    // offscreen; pin a fallback slot above the error block if the
+    // natural position ran out of room.
+    if (t.pv.actions.len > 0) {
+        const pinned = h -| @as(u16, @intCast(@min(t.errors.items.len + 4, h -| 4)));
+        const act_row: u16 = if (row <= 2 + max_rows) row + 1 else pinned;
         var col: u16 = 2;
         for (t.pv.actions, 0..) |a, i| {
             const is_focus = (t.focus == t.pv.fields.len) and t.action_sel == i;
             const label = try std.fmt.allocPrint(t.alloc, "[ {s} ]", .{a});
-            _ = win.print(&.{.{ .text = label, .style = if (is_focus) sel else accent }}, .{ .row_offset = row, .col_offset = col });
+            _ = win.print(&.{.{ .text = label, .style = if (is_focus) sel else accent }}, .{ .row_offset = act_row, .col_offset = col });
             col += @intCast(label.len + 1);
         }
+        row = act_row + 1;
     }
 
     // errors
@@ -559,6 +564,7 @@ pub fn runTui(init: std.process.Init, alloc: Allocator, io: std.Io, preset: ?*co
 
     var t = Tui.init(alloc, io);
     t.wiz.preset = preset;
+    t.wiz.applyPresetDefaults() catch {};
     defer t.frame_arena.deinit();
 
     // detect → wizard env

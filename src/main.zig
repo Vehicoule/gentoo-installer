@@ -414,6 +414,7 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
 
     var wiz = engine.wizard.Wizard.init(alloc, io, .{});
     wiz.preset = preset;
+    wiz.applyPresetDefaults() catch {};
     var wiz_arena = std.heap.ArenaAllocator.init(alloc);
     defer wiz_arena.deinit();
 
@@ -549,15 +550,25 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
             const errs = engine.config.validate(req_alloc, &wiz.cfg, wizNvidia(&wiz)) catch &.{};
             try writeValidate(out, null, errs);
         } else if (std.mem.eql(u8, op, "set_config")) {
-            // {config:{dotted.path:value,…}} — same as N `set` ops.
+            // {config:{dotted.path:value,…}} — same as N `set` ops; a
+            // field that fails is reported, not silently dropped.
             const cv = jfield(jl, "config");
+            var set_errs: std.Io.Writer.Allocating = .init(req_alloc);
+            var nerr: usize = 0;
             if (cv != null and cv.? == .object) {
                 var it = cv.?.object.iterator();
                 while (it.next()) |kv| {
-                    wiz.setField(kv.key_ptr.*, kv.value_ptr.*) catch {};
+                    wiz.setField(kv.key_ptr.*, kv.value_ptr.*) catch |e| {
+                        if (nerr > 0) set_errs.writer.writeAll("; ") catch {};
+                        set_errs.writer.print("{s}: {s}", .{ kv.key_ptr.*, @errorName(e) }) catch {};
+                        nerr += 1;
+                    };
                 }
             }
-            try writeResult(out, req);
+            if (nerr > 0)
+                try writeErr(out, req, set_errs.written())
+            else
+                try writeResult(out, req);
             const errs = engine.config.validate(req_alloc, &wiz.cfg, wizNvidia(&wiz)) catch &.{};
             try writeValidate(out, null, errs);
         } else if (std.mem.eql(u8, op, "get_config")) {
@@ -740,6 +751,14 @@ fn doInstall(io: std.Io, alloc: std.mem.Allocator, wiz: *engine.wizard.Wizard, o
         if (cfg.boot_mode != env_opt.?.boot_mode) {
             var aw: std.Io.Writer.Allocating = .init(alloc);
             aw.writer.print("config requests {s} but the live env booted {s} — refusing", .{ @tagName(cfg.boot_mode), @tagName(env_opt.?.boot_mode) }) catch {};
+            try writeErr(out, req, aw.written());
+            return;
+        }
+        // Same for arch: cross-arch exec would write a foreign rootfs
+        // (plan/dry-run still preview it).
+        if (cfg.arch != env_opt.?.arch) {
+            var aw: std.Io.Writer.Allocating = .init(alloc);
+            aw.writer.print("config arch {s} does not match detected {s} — refusing to exec a foreign-arch install", .{ @tagName(cfg.arch), @tagName(env_opt.?.arch) }) catch {};
             try writeErr(out, req, aw.written());
             return;
         }

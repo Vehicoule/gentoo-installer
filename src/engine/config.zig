@@ -409,8 +409,12 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
 
     if (cfg.disk.device.len == 0)
         try errs.append(alloc, "disk.device is required (e.g. /dev/vda)");
-    if (cfg.disk.luks and cfg.disk.luks_passphrase == null)
-        try errs.append(alloc, "disk.luks requires disk.luks_passphrase in exec mode (wizard collects it interactively)");
+    if (cfg.disk.luks) {
+        if (cfg.disk.luks_passphrase == null)
+            try errs.append(alloc, "disk.luks requires disk.luks_passphrase in exec mode (wizard collects it interactively)")
+        else if (cfg.disk.luks_passphrase.?.len < 8)
+            try errs.append(alloc, "disk.luks_passphrase needs ≥8 characters");
+    }
 
     // Control chars / newlines in values interpolated into generated
     // files or argv would inject extra directives — reject them all.
@@ -828,6 +832,23 @@ test "validate rejects bios+systemd-boot" {
     const cfg = try decode(doc.arena.allocator(), doc);
     const errs = try validate(doc.arena.allocator(), &cfg, null);
     try std.testing.expect(errs.len > 0);
+}
+
+test "validate rejects a short luks passphrase from a file" {
+    var doc = try toml.parse(std.testing.allocator,
+        \\[disk]
+        \\device = "/dev/sda"
+        \\luks = true
+        \\luks_passphrase = "short"
+    , null);
+    defer doc.deinit();
+    const cfg = try decode(doc.arena.allocator(), doc);
+    const errs = try validate(doc.arena.allocator(), &cfg, null);
+    var seen = false;
+    for (errs) |e| {
+        if (std.mem.indexOf(u8, e, "luks_passphrase") != null) seen = true;
+    }
+    try std.testing.expect(seen);
 }
 
 test "validate login-path proof" {

@@ -28,6 +28,7 @@ pub const WizardError = error{
     BadConfig,
     WriteFailed,
     PathEscape,
+    Locked,
 };
 
 const Opt = struct {
@@ -562,8 +563,45 @@ pub const Wizard = struct {
         if (!w.cfg.boot_mode_explicit) {
             w.cfg.boot_mode = env.boot_mode;
             w.detected_boot = env.boot_mode;
-            if (!w.cfg.disk.scheme_explicit and env.boot_mode == .bios)
-                w.cfg.disk.scheme = .@"bios-boot-swap-root";
+            // an unpinned scheme tracks the firmware either way — a
+            // bios→uefi re-detect must un-apply the bios scheme too.
+            if (!w.cfg.disk.scheme_explicit)
+                w.cfg.disk.scheme = switch (env.boot_mode) {
+                    .bios => .@"bios-boot-swap-root",
+                    .uefi => .@"efi-swap-root",
+                };
+        }
+    }
+
+    /// Merge the attached preset's `[defaults]` under cfg and pin any
+    /// `[locks]` paths to their defaults. Call after `preset` is set.
+    pub fn applyPresetDefaults(w: *Wizard) !void {
+        const p = w.preset orelse return;
+        var doc = toml.parse(w.alloc, "", null) catch return error.OutOfMemory;
+        try preset_mod.mergeDefaults(p, &doc);
+        const fresh = config.decode(w.alloc, doc) catch return error.BadConfig;
+        w.cfg = fresh;
+        w.applyExpressDefaults();
+        // locks fix their preset default — over express choices too.
+        const defs = presetDefaults(p) orelse return;
+        for (p.locks) |path| {
+            if (preset_mod.lookup(defs, path)) |tv| {
+                if (tomlToJson(w.alloc, tv)) |jv| setPath(w, path, jv) catch {};
+            }
+        }
+    }
+
+    /// Does the preset lock this field? A locked field only accepts the
+    /// preset's own default — mirrors checkLocks' doc-level semantics.
+    fn presetLocks(w: *Wizard, name: []const u8, v: std.json.Value) WizardError!void {
+        const p = w.preset orelse return;
+        for (p.locks) |lp| {
+            if (!std.mem.eql(u8, lp, name)) continue;
+            const defs = presetDefaults(p) orelse return;
+            const want = preset_mod.lookup(defs, name) orelse return; // no default → can't pin
+            const jv = jsonToToml(w.alloc, v) orelse return error.Locked;
+            if (!preset_mod.valueEq(jv, want)) return error.Locked;
+            return;
         }
     }
 
@@ -578,6 +616,7 @@ pub const Wizard = struct {
     /// — plaintext never survives in cfg beyond the luks passphrase,
     /// which is protocol-defined as in-memory only.
     pub fn setField(w: *Wizard, name: []const u8, v: std.json.Value) WizardError!void {
+        try w.presetLocks(name, v);
         if (std.mem.eql(u8, name, "flow.mode")) {
             const s = try strOf(v);
             w.flow = std.meta.stringToEnum(Flow, s) orelse return error.BadValue;
@@ -689,6 +728,13 @@ pub const Wizard = struct {
             .stdin = .pipe,
             .stdout = .pipe,
         }) catch return error.HashFailed;
+        // Every post-spawn failure must reap: a headless session hashes
+        // per attempt, and leaked children/fds accumulate.
+        errdefer {
+            if (child.stdin) |f| f.close(w.io);
+            if (child.stdout) |f| f.close(w.io);
+            _ = child.wait(w.io) catch {};
+        }
         var wbuf: [4096]u8 = undefined;
         var fw = child.stdin.?.writer(w.io, &wbuf);
         fw.interface.writeAll(pw) catch return error.HashFailed;
@@ -701,6 +747,8 @@ pub const Wizard = struct {
         var out: std.Io.Writer.Allocating = .init(w.alloc);
         const n = fr.interface.streamRemaining(&out.writer) catch return error.HashFailed;
         _ = n;
+        child.stdout.?.close(w.io);
+        child.stdout = null;
         const term = child.wait(w.io) catch return error.HashFailed;
         switch (term) {
             .exited => |code| if (code != 0) return error.HashFailed,
@@ -759,13 +807,16 @@ pub const Wizard = struct {
             error.OutOfMemory => error.OutOfMemory,
             else => error.InvalidToml,
         };
-        // decode handles explicitness flags itself; keep secrets from
-        // the live session (answer files never carry plaintext).
-        const keep_luks = w.cfg.disk.luks_passphrase;
-        const keep_roothash = w.cfg.root.password_hash;
+        // Preset locks gate the file exactly like a user document — a
+        // locked path may only carry the preset's default value.
+        if (w.preset) |p| {
+            const lerrs = preset_mod.checkLocks(w.alloc, p, &doc) catch return error.OutOfMemory;
+            if (lerrs.len > 0) return error.Locked;
+        }
+        // The file replaces the config wholesale — including secrets.
+        // Keeping a previous session's passphrase/hash across a load
+        // would silently stamp it onto an unrelated install.
         w.cfg = config.decode(w.alloc, doc) catch return error.BadConfig;
-        if (w.cfg.disk.luks_passphrase == null) w.cfg.disk.luks_passphrase = keep_luks;
-        if (w.cfg.root.password_hash == null) w.cfg.root.password_hash = keep_roothash;
         // decode() already set boot_mode_explicit when the doc carries a
         // root-level boot_mode. Scheme pins the same way, plus the CLI's
         // preserve-scheme promotion (main.zig): an answer file that asks
@@ -822,10 +873,8 @@ pub const Wizard = struct {
         }
         // wizard-side requirements the config can't express
         if (std.mem.eql(u8, pg.id, "disk")) {
-            if (w.cfg.disk.luks) {
-                const p = w.cfg.disk.luks_passphrase orelse "";
-                if (p.len < 8) try out.append(alloc, "disk.luks_passphrase needs ≥8 characters");
-            }
+            // length/presence rules live in config.validate — imported
+            // answer files get the same check at plan/install.
         }
         if (std.mem.eql(u8, pg.id, "accounts")) {
             var login = false;
@@ -906,7 +955,80 @@ pub const Wizard = struct {
         try fieldStr(out, "hardening", @tagName(w.cfg.security.hardening));
         try out.writeAll(",");
         try fieldBool(out, "selinux", w.cfg.security.selinux);
-        try out.writeAll("},\"root\":{");
+        try out.writeAll("},\"users\":[");
+        for (w.cfg.users, 0..) |u, i| {
+            if (i > 0) try out.writeAll(",");
+            try out.writeAll("{\"name\":\"");
+            jesc(out, u.name);
+            try out.writeAll("\",\"shell\":\"");
+            jesc(out, u.shell);
+            try out.writeAll("\",\"groups\":[");
+            for (u.groups, 0..) |g, gi| {
+                if (gi > 0) try out.writeAll(",");
+                try out.writeAll("\"");
+                jesc(out, g);
+                try out.writeAll("\"");
+            }
+            try out.writeAll("],\"ssh_authorized_keys\":[");
+            for (u.ssh_authorized_keys, 0..) |k, ki| {
+                if (ki > 0) try out.writeAll(",");
+                try out.writeAll("\"");
+                jesc(out, k);
+                try out.writeAll("\"");
+            }
+            try out.writeAll("],\"password_hash\":{\"secret\":true,\"is_set\":");
+            try out.writeAll(if (u.password_hash != null) "true" else "false");
+            try out.writeAll("}}");
+        }
+        try out.writeAll("],\"services\":{");
+        try fieldBool(out, "sshd", w.cfg.services.sshd);
+        try out.writeAll(",");
+        try fieldBool(out, "logger", w.cfg.services.logger);
+        try out.writeAll(",");
+        try fieldBool(out, "cron", w.cfg.services.cron);
+        try out.writeAll(",");
+        try fieldBool(out, "ntp", w.cfg.services.ntp);
+        try out.writeAll("},\"packages\":{");
+        try fieldBool(out, "sets_explicit", w.cfg.packages.sets_explicit);
+        try out.writeAll(",\"sets\":[");
+        for (w.cfg.packages.sets, 0..) |s, i| {
+            if (i > 0) try out.writeAll(",");
+            try out.writeAll("\"");
+            jesc(out, s);
+            try out.writeAll("\"");
+        }
+        try out.writeAll("],\"atoms\":[");
+        for (w.cfg.packages.atoms, 0..) |a, i| {
+            if (i > 0) try out.writeAll(",");
+            try out.writeAll("\"");
+            jesc(out, a);
+            try out.writeAll("\"");
+        }
+        try out.writeAll("]},\"use\":{\"global\":{");
+        var first = true;
+        var git = w.cfg.use.global.iterator();
+        while (git.next()) |kv| {
+            if (!first) try out.writeAll(",");
+            first = false;
+            try out.writeAll("\"");
+            jesc(out, kv.key_ptr.*);
+            try out.writeAll("\":");
+            try out.writeAll(if (kv.value_ptr.* == .boolean and kv.value_ptr.boolean) "true" else "false");
+        }
+        try out.writeAll("},\"pkg\":{");
+        first = true;
+        var pit = w.cfg.use.pkg.iterator();
+        while (pit.next()) |kv| {
+            if (kv.value_ptr.* != .string) continue;
+            if (!first) try out.writeAll(",");
+            first = false;
+            try out.writeAll("\"");
+            jesc(out, kv.key_ptr.*);
+            try out.writeAll("\":\"");
+            jesc(out, kv.value_ptr.string);
+            try out.writeAll("\"");
+        }
+        try out.writeAll("}},\"root\":{");
         try out.writeAll("\"password_hash\":{\"secret\":true,\"is_set\":");
         try out.writeAll(if (w.cfg.root.password_hash != null) "true" else "false");
         try out.writeAll("},");
@@ -921,54 +1043,83 @@ pub const Wizard = struct {
         defer aw.deinit();
         const o = &aw.writer;
         try o.writeAll("# gentoo-installer answer file\n");
-        try o.print("[disk]\ndevice = \"{s}\"\nscheme = \"{s}\"\nroot_fs = \"{s}\"\nswap = \"{s}\"\nswap_mib = {}\nesp_mib = {}\nboot_part = {}\nluks = {}\nlvm = {}\n", .{
-            w.cfg.disk.device,         @tagName(w.cfg.disk.scheme), @tagName(w.cfg.disk.root_fs),
-            @tagName(w.cfg.disk.swap), w.cfg.disk.swap_mib,         w.cfg.disk.esp_mib,
-            w.cfg.disk.boot_part,      w.cfg.disk.luks,             w.cfg.disk.lvm,
+        try o.print("arch = \"{s}\"\nboot_mode = \"{s}\"\n", .{ @tagName(w.cfg.arch), @tagName(w.cfg.boot_mode) });
+        try o.print("[disk]\nscheme = \"{s}\"\nroot_fs = \"{s}\"\nswap = \"{s}\"\nswap_mib = {}\nesp_mib = {}\nboot_part = {}\nluks = {}\nlvm = {}\ndevice = ", .{
+            @tagName(w.cfg.disk.scheme), @tagName(w.cfg.disk.root_fs), @tagName(w.cfg.disk.swap),
+            w.cfg.disk.swap_mib,         w.cfg.disk.esp_mib,           w.cfg.disk.boot_part,
+            w.cfg.disk.luks,             w.cfg.disk.lvm,
         });
+        try tomlStr(o, w.cfg.disk.device);
+        try o.writeAll("\n");
         if (w.cfg.disk.luks)
             try o.writeAll("# luks_passphrase = \"…\"  # plaintext is never exported — set before exec\n");
-        try o.print("[stage3]\nlibc = \"{s}\"\ntoolchain = \"{s}\"\nvariant = \"{s}\"\nmirror = \"{s}\"\n", .{ @tagName(w.cfg.stage3.libc), @tagName(w.cfg.stage3.toolchain), w.cfg.stage3.variant, w.cfg.stage3.mirror });
-        try o.print("[system]\ninit = \"{s}\"\nhostname = \"{s}\"\nkernel = \"{s}\"\nbootloader = \"{s}\"\ninitramfs = \"{s}\"\nuki = {}\nbinhost = {}\nprivilege = \"{s}\"\ntimezone = \"{s}\"\nlocale = \"{s}\"\nkeymap = \"{s}\"\nkeep_kernels = {}\nsnapshots = \"{s}\"\n", .{
-            @tagName(w.cfg.system.init),       w.cfg.system.hostname,            @tagName(w.cfg.system.kernel),
-            @tagName(w.cfg.system.bootloader), @tagName(w.cfg.system.initramfs), w.cfg.system.uki,
-            w.cfg.system.binhost,              @tagName(w.cfg.system.privilege), w.cfg.system.timezone,
-            w.cfg.system.locale,               w.cfg.system.keymap,              w.cfg.system.keep_kernels,
-            @tagName(w.cfg.system.snapshots),
+        try o.print("[stage3]\nlibc = \"{s}\"\ntoolchain = \"{s}\"\nvariant = ", .{ @tagName(w.cfg.stage3.libc), @tagName(w.cfg.stage3.toolchain) });
+        try tomlStr(o, w.cfg.stage3.variant);
+        try o.writeAll("\nmirror = ");
+        try tomlStr(o, w.cfg.stage3.mirror);
+        try o.writeAll("\n");
+        try o.print("[system]\ninit = \"{s}\"\nkernel = \"{s}\"\nbootloader = \"{s}\"\ninitramfs = \"{s}\"\nuki = {}\nbinhost = {}\nprivilege = \"{s}\"\nkeep_kernels = {}\nsnapshots = \"{s}\"\n", .{
+            @tagName(w.cfg.system.init),      @tagName(w.cfg.system.kernel), @tagName(w.cfg.system.bootloader),
+            @tagName(w.cfg.system.initramfs), w.cfg.system.uki,              w.cfg.system.binhost,
+            @tagName(w.cfg.system.privilege), w.cfg.system.keep_kernels,     @tagName(w.cfg.system.snapshots),
         });
-        try o.writeAll("locales = [");
+        try o.writeAll("hostname = ");
+        try tomlStr(o, w.cfg.system.hostname);
+        try o.writeAll("\ntimezone = ");
+        try tomlStr(o, w.cfg.system.timezone);
+        try o.writeAll("\nlocale = ");
+        try tomlStr(o, w.cfg.system.locale);
+        try o.writeAll("\nkeymap = ");
+        try tomlStr(o, w.cfg.system.keymap);
+        try o.writeAll("\nlocales = [");
         for (w.cfg.system.locales, 0..) |l, i| {
             if (i > 0) try o.writeAll(", ");
-            try o.print("\"{s}\"", .{l});
+            try tomlStr(o, l);
         }
         try o.writeAll("]\n");
         try o.print("[network]\nmanager = \"{s}\"\nwifi = {}\n", .{ @tagName(w.cfg.network.manager), w.cfg.network.wifi });
         try o.print("[services]\nsshd = {}\nlogger = {}\ncron = {}\nntp = {}\n", .{ w.cfg.services.sshd, w.cfg.services.logger, w.cfg.services.cron, w.cfg.services.ntp });
         try o.print("[security]\nsecure_boot = \"{s}\"\nhardening = \"{s}\"\nselinux = {}\n", .{ @tagName(w.cfg.security.secure_boot), @tagName(w.cfg.security.hardening), w.cfg.security.selinux });
         try o.print("[gpu]\ndriver = \"{s}\"\n", .{@tagName(w.cfg.gpu.driver)});
-        try o.print("[makeconf]\ncflags = ", .{});
+        try o.writeAll("[makeconf]\ncflags = ");
         switch (w.cfg.makeconf.cflags) {
             .safe => try o.writeAll("\"safe\""),
             .native => try o.writeAll("\"native\""),
-            .custom => |c| try o.print("\"{s}\"", .{c}),
+            .custom => |c| try tomlStr(o, c),
         }
-        try o.print("\njobs = {}\nmem_cap_gib = {}\nvideo_cards = \"{s}\"\naccept_license = \"{s}\"\nmirrors = \"{s}\"\n", .{ w.cfg.makeconf.jobs, w.cfg.makeconf.mem_cap_gib, w.cfg.makeconf.video_cards, w.cfg.makeconf.accept_license, w.cfg.makeconf.mirrors });
-        try o.writeAll("[packages]\nsets = [");
-        for (w.cfg.packages.sets, 0..) |s, i| {
-            if (i > 0) try o.writeAll(", ");
-            try o.print("\"{s}\"", .{s});
+        try o.print("\njobs = {}\nmem_cap_gib = {}\n", .{ w.cfg.makeconf.jobs, w.cfg.makeconf.mem_cap_gib });
+        try o.writeAll("video_cards = ");
+        try tomlStr(o, w.cfg.makeconf.video_cards);
+        try o.writeAll("\naccept_license = ");
+        try tomlStr(o, w.cfg.makeconf.accept_license);
+        try o.writeAll("\nmirrors = ");
+        try tomlStr(o, w.cfg.makeconf.mirrors);
+        try o.writeAll("\n[packages]\n");
+        if (w.cfg.packages.sets_explicit) {
+            try o.writeAll("sets = [");
+            for (w.cfg.packages.sets, 0..) |s, i| {
+                if (i > 0) try o.writeAll(", ");
+                try tomlStr(o, s);
+            }
+            try o.writeAll("]\n");
+        } else {
+            // omitted = the preset's default sets — serializing the
+            // placeholder list would pin it on reload.
+            try o.writeAll("# sets = […]  # unset → preset default applies\n");
         }
-        try o.writeAll("]\natoms = [");
+        try o.writeAll("atoms = [");
         for (w.cfg.packages.atoms, 0..) |a, i| {
             if (i > 0) try o.writeAll(", ");
-            try o.print("\"{s}\"", .{a});
+            try tomlStr(o, a);
         }
         try o.writeAll("]\n");
         var it = w.cfg.use.global.iterator();
         if (w.cfg.use.global.count() > 0) {
             try o.writeAll("[use.global]\n");
             while (it.next()) |kv| {
-                try o.print("\"{s}\" = {}\n", .{ kv.key_ptr.*, kv.value_ptr.* == .boolean and kv.value_ptr.boolean });
+                try o.writeAll("\"");
+                try tomlStrInner(o, kv.key_ptr.*);
+                try o.print("\" = {}\n", .{kv.value_ptr.* == .boolean and kv.value_ptr.boolean});
             }
         }
         if (w.cfg.use.pkg.count() > 0) {
@@ -976,22 +1127,29 @@ pub const Wizard = struct {
             try o.writeAll("[use.pkg]\n");
             while (pit.next()) |kv| {
                 if (kv.value_ptr.* != .string) continue;
-                try o.print("\"{s}\" = \"", .{kv.key_ptr.*});
-                for (kv.value_ptr.string) |ch| {
-                    if (ch == '"' or ch == '\\') try o.writeByte('\\');
-                    try o.writeByte(ch);
-                }
-                try o.writeAll("\"\n");
+                try o.writeAll("\"");
+                try tomlStrInner(o, kv.key_ptr.*);
+                try o.writeAll("\" = ");
+                try tomlStr(o, kv.value_ptr.string);
+                try o.writeAll("\n");
             }
         }
         for (w.cfg.users) |u| {
-            try o.print("[[users]]\nname = \"{s}\"\nshell = \"{s}\"\n", .{ u.name, u.shell });
-            if (u.password_hash) |h| try o.print("password_hash = \"{s}\"\n", .{h});
+            try o.writeAll("[[users]]\nname = ");
+            try tomlStr(o, u.name);
+            try o.writeAll("\nshell = ");
+            try tomlStr(o, u.shell);
+            try o.writeAll("\n");
+            if (u.password_hash) |h| {
+                try o.writeAll("password_hash = ");
+                try tomlStr(o, h);
+                try o.writeAll("\n");
+            }
             if (u.groups.len > 0) {
                 try o.writeAll("groups = [");
                 for (u.groups, 0..) |g, i| {
                     if (i > 0) try o.writeAll(", ");
-                    try o.print("\"{s}\"", .{g});
+                    try tomlStr(o, g);
                 }
                 try o.writeAll("]\n");
             }
@@ -999,14 +1157,18 @@ pub const Wizard = struct {
                 try o.writeAll("ssh_authorized_keys = [");
                 for (u.ssh_authorized_keys, 0..) |k, i| {
                     if (i > 0) try o.writeAll(", ");
-                    try o.print("\"{s}\"", .{k});
+                    try tomlStr(o, k);
                 }
                 try o.writeAll("]\n");
             }
         }
         try o.writeAll("[root]\nlock_root = ");
         try o.print("{}\n", .{w.cfg.root.lock_root});
-        if (w.cfg.root.password_hash) |h| try o.print("password_hash = \"{s}\"\n", .{h});
+        if (w.cfg.root.password_hash) |h| {
+            try o.writeAll("password_hash = ");
+            try tomlStr(o, h);
+            try o.writeAll("\n");
+        }
         const real = try confinedWrite(w, path);
         std.Io.Dir.cwd().writeFile(w.io, .{
             .sub_path = real,
@@ -1075,6 +1237,65 @@ fn cwdReal(w: *Wizard) WizardError![]const u8 {
     return w.alloc.dupe(u8, buf[0..n]) catch return error.OutOfMemory;
 }
 
+/// The `defaults` table of the attached preset.
+fn presetDefaults(p: *const preset_mod.Preset) ?toml.Value.Table {
+    const v = p.doc.root.get("defaults") orelse return null;
+    return switch (v) {
+        .table => |t| t,
+        else => null,
+    };
+}
+
+fn jsonToToml(alloc: Allocator, v: std.json.Value) ?toml.Value {
+    return switch (v) {
+        .string => |s| .{ .string = alloc.dupe(u8, s) catch return null },
+        .integer => |i| .{ .integer = i },
+        .float => |f| .{ .float = f },
+        .bool => |b| .{ .boolean = b },
+        .array => |a| blk: {
+            const items = alloc.alloc(toml.Value, a.items.len) catch return null;
+            for (a.items, 0..) |it, i| items[i] = jsonToToml(alloc, it) orelse return null;
+            break :blk .{ .array = items };
+        },
+        else => null,
+    };
+}
+
+fn tomlToJson(alloc: Allocator, v: toml.Value) ?std.json.Value {
+    return switch (v) {
+        .string => |s| .{ .string = alloc.dupe(u8, s) catch return null },
+        .integer => |i| .{ .integer = i },
+        .float => |f| .{ .float = f },
+        .boolean => |b| .{ .bool = b },
+        .array => |a| blk: {
+            var arr = std.json.Array.init(alloc);
+            for (a) |it| arr.append(tomlToJson(alloc, it) orelse return null) catch return null;
+            break :blk .{ .array = arr };
+        },
+        else => null,
+    };
+}
+
+/// TOML basic-string escape — every interpolated cfg string goes through
+/// this so a stray quote/backslash/newline can't inject directives into
+/// an exported answer file.
+fn tomlStrInner(o: *std.Io.Writer, s: []const u8) !void {
+    for (s) |ch| {
+        switch (ch) {
+            '"', '\\' => try o.print("\\{c}", .{ch}),
+            '\n' => try o.writeAll("\\n"),
+            '\r' => try o.writeAll("\\r"),
+            '\t' => try o.writeAll("\\t"),
+            else => if (ch < 0x20) try o.print("\\u{x:0>4}", .{ch}) else try o.writeByte(ch),
+        }
+    }
+}
+fn tomlStr(o: *std.Io.Writer, s: []const u8) !void {
+    try o.writeAll("\"");
+    try tomlStrInner(o, s);
+    try o.writeAll("\"");
+}
+
 fn lexicalOk(path: []const u8) bool {
     if (path.len == 0 or std.fs.path.isAbsolute(path)) return false;
     var it = std.mem.tokenizeScalar(u8, path, '/');
@@ -1106,7 +1327,14 @@ fn confinedWrite(w: *Wizard, path: []const u8) WizardError![]const u8 {
     if (!underCwd(real_dir, cwd)) return error.PathEscape;
     const base = std.fs.path.basename(path);
     if (base.len == 0) return error.BadValue;
-    return std.fmt.allocPrint(w.alloc, "{s}/{s}", .{ real_dir, base }) catch return error.OutOfMemory;
+    const real = std.fmt.allocPrint(w.alloc, "{s}/{s}", .{ real_dir, base }) catch return error.OutOfMemory;
+    // The parent is safe, but the leaf itself may be an existing symlink
+    // pointing outside — resolve it and refuse if it doesn't match.
+    var fbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    if (std.Io.Dir.cwd().realPathFile(w.io, real, &fbuf)) |flen| {
+        if (!std.mem.eql(u8, fbuf[0..flen], real)) return error.PathEscape;
+    } else |_| {}
+    return real;
 }
 
 fn setPath(w: *Wizard, name: []const u8, v: std.json.Value) WizardError!void {
@@ -1213,6 +1441,11 @@ fn setEnum(cfg: *Config, ef: EField, s: []const u8) WizardError!void {
     if (ef.tag == .init) {
         // musl ⇒ no systemd; systemd-networkd follows init
         if (cfg.system.init == .systemd and cfg.stage3.libc == .musl) cfg.stage3.libc = .glibc;
+        // leaving systemd while networkd is selected leaves an invalid
+        // pair — move the manager to the default rather than stranding
+        // the user on a validation error from another page.
+        if (cfg.system.init != .systemd and cfg.network.manager == .@"systemd-networkd")
+            cfg.network.manager = .networkmanager;
     }
     if (ef.tag == .libc) {
         if (cfg.stage3.libc == .musl and cfg.system.init == .systemd) cfg.system.init = .openrc;
@@ -1747,4 +1980,78 @@ test "exportAnswer round-trips through loadAnswerFile" {
     try testing.expectEqualStrings("/dev/vda", w2.cfg.disk.device);
     try testing.expectEqualStrings("$6$abc$def", w2.cfg.root.password_hash.?);
     try testing.expectEqualStrings("review", w2.currentPage().id);
+}
+
+test "applyEnv follows firmware both directions" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var w = testWizard();
+    w.alloc = arena.allocator();
+    const e_bios = detect.Env{
+        .arch = .amd64,
+        .boot_mode = .bios,
+        .ram_mib = 8192,
+        .cpu_count = 4,
+        .cpu_vendor = "test",
+        .cpu_flags = &.{},
+        .nics = &.{},
+        .gpus = &.{},
+        .disks = &.{},
+        .net_reachable = false,
+    };
+    var e_uefi = e_bios;
+    e_uefi.boot_mode = .uefi;
+    w.applyEnv(e_bios);
+    try testing.expectEqual(config.Scheme.@"bios-boot-swap-root", w.cfg.disk.scheme);
+    // a later UEFI re-detect must un-apply the BIOS scheme
+    w.applyEnv(e_uefi);
+    try testing.expectEqual(config.Scheme.@"efi-swap-root", w.cfg.disk.scheme);
+    // an explicit scheme survives the flip
+    w.cfg.disk.scheme = .manual;
+    w.cfg.disk.scheme_explicit = true;
+    w.applyEnv(e_bios);
+    try testing.expectEqual(config.Scheme.manual, w.cfg.disk.scheme);
+}
+
+test "preset defaults apply and locks reject divergence" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const doc = try toml.parse(alloc,
+        \\[preset]
+        \\id = "dinit-distro"
+        \\[defaults.system]
+        \\init = "dinit"
+        \\[defaults.disk]
+        \\root_fs = "btrfs"
+        \\[locks]
+        \\fields = ["system.init"]
+    , null);
+    var p = preset_mod.Preset{ .doc = doc, .locks = &.{"system.init"} };
+    var w = testWizard();
+    w.alloc = alloc;
+    w.preset = &p;
+    try w.applyPresetDefaults();
+    try testing.expectEqual(config.Init.dinit, w.cfg.system.init);
+    try testing.expectEqual(config.RootFs.btrfs, w.cfg.disk.root_fs);
+    // locked: only the preset default is accepted
+    try testing.expectError(error.Locked, w.setField("system.init", .{ .string = "systemd" }));
+    try w.setField("system.init", .{ .string = "dinit" });
+    // unlocked fields still set normally
+    try w.setField("system.hostname", .{ .string = "box" });
+    try testing.expectEqualStrings("box", w.cfg.system.hostname);
+}
+
+test "export refuses an existing symlink that escapes cwd" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var w = testWizard();
+    w.alloc = arena.allocator();
+    const dir = ".zig-cache";
+    std.Io.Dir.cwd().createDirPath(testing.io, dir) catch {};
+    const link = ".zig-cache/gi-wizard-test-link.toml";
+    std.Io.Dir.cwd().deleteFile(testing.io, link) catch {};
+    std.Io.Dir.cwd().symLink(testing.io, "/etc/passwd", link, .{}) catch return;
+    defer std.Io.Dir.cwd().deleteFile(testing.io, link) catch {};
+    try testing.expectError(error.PathEscape, w.exportAnswer(link));
 }
