@@ -19,6 +19,8 @@ extensibility toward a downstream Gentoo-based distribution.
 - **Dual-boot**: detect existing OSes (Windows, other Linux, FreeBSD) and
   install alongside them — shrink/make room, keep the existing ESP,
   register both systems in the boot menu.
+- **UEFI and BIOS/CSM** boot paths on amd64 (UEFI primary; BIOS supported
+  for legacy hardware).
 - **Secure Boot**: a real signing flow — sbctl-managed keys or shim+MOK —
   so UKI/GRUB installs boot with SB enabled.
 - **Mass-install automation**: `--config` answer files plus the headless
@@ -31,8 +33,6 @@ extensibility toward a downstream Gentoo-based distribution.
 
 ## Non-goals (v1)
 
-- BIOS/CSM boot on amd64 (UEFI first; BIOS is a later milestone — dual-boot
-  support targets UEFI systems first).
 - Split-usr and x32 stage3 flavors (accepted by the config schema, gated
   behind "expert" until validated).
 - Replacing the Handbook for experts — `gentoo-installer --config` gives a
@@ -240,8 +240,16 @@ lock_root = false                   # `passwd -l root` at finish (sudo-only box)
 secure_boot = "off"              # off | sbctl | shim  (uki/bootloader signing)
 selinux     = false              # forces hardened-selinux stage3 + profile
 
+[packages]
+sets = ["minimal"]               # preset-defined package sets
+atoms = []                       # extra package atoms (world)
+
+[use]
+global = {}                      # "flag" = true|false (unset = profile default)
+[use.pkg]                        # per-package package.use records
+# "sys-kernel/gentoo-kernel" = "dracut uki"
+
 [extra]
-packages = []                    # additional emerges
 update_world = true
 ```
 
@@ -299,7 +307,9 @@ not as a redesign.
 
 Errors carry `{code, message, hint}`; the GUI renders them as dialogs, the
 TUI as an error page. `wizard` commands that need a choice
-(`confirm_wipe`, `ask_retry`) are first-class ops.
+(`confirm_wipe`, `ask_retry`) are first-class ops. Answer-file export
+serializes the current `InstallConfig` to TOML; interactive passwords are
+converted to `password_hash` at export (no plaintext, file mode 0600).
 
 ## Safety
 
@@ -352,7 +362,7 @@ GUI is a separate build artifact; the TUI/engine binary stays dependency-free.
 - **M4** — libcosmic GUI shell on the headless protocol.
 - **M5** — option matrix: LUKS, LVM, btrfs subvols, nomultilib, manual
   kernel, custom partitions; musl + llvm + hardened(-selinux) stage3
-  paths; arm64 + riscv64 bring-up.
+  paths; BIOS/CSM boot path; arm64 + riscv64 bring-up.
 - **M6** — secure boot signing flow (sbctl path first), dual-boot
   alongside-mode + menu merge, runit/s6/dinit init-backend exploration.
 - **M7** — distro preset layer hardening (branding, extra steps,

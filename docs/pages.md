@@ -36,7 +36,7 @@ page — everything downstream depends on it.
 | Field | Type | Default | Validation |
 |---|---|---|---|
 | device | enum (detected disks) | — | nonempty; excluded: the disk hosting the live env |
-| scheme | enum `efi-swap-root\|bios-boot-swap-root\|alongside\|manual` | `efi-swap-root` (UEFI) | `bios-*` hidden on UEFI boot; `alongside` requires detected free space or shrinkable partition |
+| scheme | enum `efi-swap-root\|bios-boot-swap-root\|alongside\|manual` | `efi-swap-root` (UEFI) | `bios-*` shown only when booted via BIOS; `alongside` requires detected free space or shrinkable partition |
 | wipe | bool | `true` | must be `false` when `scheme=alongside` (VALIDATE) |
 | root_fs | enum `xfs\|ext4\|btrfs\|f2fs` | `xfs` | — |
 | swap_mib | int | 4096 | 0 = none; option `zram` (no swap partition) |
@@ -142,6 +142,12 @@ Read-only grouped summary of the whole config (jump-back links per
 section), **print plan** (the exact `Cmd` list — same output as
 `--dry-run`), **export answer file** (writes the `--config` TOML — the
 mass-install artifact), and the safety gate:
+
+Answer-file export and secrets: in-memory passwords are converted to
+crypt `password_hash` values at export, so the file is fully reusable
+for unattended installs **without plaintext** — and because it then
+contains hashes, it is written mode `0600` with a "keep this file
+private" notice. SSH authorized keys are copied verbatim.
 
 | Field | Type | Notes |
 |---|---|---|
