@@ -5,9 +5,9 @@ Drives a real headless install end-to-end — the M3 acceptance test.
 ## Prereqs (host)
 
 - `qemu-system-x86_64` with KVM (`/dev/kvm`), OVMF (`/usr/share/OVMF/OVMF_CODE.fd`), `qemu-img`
-- `pexpect` (`pip install pexpect` or `python3-pexpect`)
-- A Gentoo minimal ISO at `m3/install-amd64-minimal.iso` plus its extracted
-  kernel/initrd at `m3/boot/vmlinuz-live` and `m3/boot/initrd-live`
+- `pexpect` (`pip install pexpect` or `python3-pexpect`) and `blkid` (util-linux — derives the ISO volume label)
+- A Gentoo minimal ISO at `test/qemu/install-amd64-minimal.iso` plus its extracted
+  kernel/initrd at `test/qemu/boot/vmlinuz-live` and `test/qemu/boot/initrd-live`
   (extract: `isoinfo -i iso -x /boot/gentoo` etc., or mount + copy)
 - `python3 -m http.server 8000` running in a dir serving the freshly built
   `zig-out/bin/gentoo-installer` as `gentoo-installer` and the ops file as

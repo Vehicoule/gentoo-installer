@@ -305,6 +305,18 @@ fn rootMountArgs(alloc: Allocator, cfg: *const Config) struct { dev: []const u8,
 /// The device node that carries the root filesystem (through LUKS/LVM).
 /// Kernel command line shared by every bootloader backend.
 ///
+/// kernel-install hook body resolving the initramfs for the kernel version
+/// in $2 — flat and BLS layouts, -t so a regenerated initrd beats a stale
+/// sibling of the same version. Empty when initramfs=none (the hook then
+/// stages the kernel only). Fails the add when a match is required but
+/// absent: copying an unmatched initrd would pair it with the wrong kernel.
+fn hookInitrd(alloc: Allocator, cfg: *const Config, dest: []const u8) []const u8 {
+    if (cfg.system.initramfs == .none) return "";
+    return s(alloc, "initrd=$(ls -t /boot/initramfs-\"$2\".img /boot/initrd-\"$2\".img /boot/initrd-\"$2\" /boot/*/\"$2\"/initrd* 2>/dev/null | head -n1); " ++
+        "[ -n \"$initrd\" ] || {{ echo \"no initramfs for kernel $2\" >&2; exit 1; }}; " ++
+        "cp -f \"$initrd\" {s} || exit 1", .{dest});
+}
+
 /// Shell fragment staging the newest initramfs onto the boot volume,
 /// INCLUDING the leading ';' — empty when initramfs=none. The copy
 /// fails the step (`|| exit 1`); nothing after it may mask the status.
@@ -1077,11 +1089,9 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
                     \\[ "$1" = add ] || exit 0
                     \\esp={s}
                     \\cp -f "$4" "$esp/vmlinuz" || exit 1
-                    \\initrd=$(ls /boot/initramfs-"$2".img /boot/initrd-"$2".img /boot/*/"$2"/initrd* 2>/dev/null | head -n1)
-                    \\[ -n "$initrd" ] || initrd=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img /boot/initrd-* /boot/*/*/initrd* 2>/dev/null | head -n1)
-                    \\[ -n "$initrd" ] && cp -f "$initrd" "$esp/initramfs.img"
+                    \\{s}
                     \\exit 0
-                , .{stage_dir}),
+                , .{ stage_dir, hookInitrd(alloc, cfg, "$esp/initramfs.img") }),
                 .mode = 0o755,
             } });
             // The hook only fires for FUTURE kernel installs — the kernel
@@ -1137,17 +1147,16 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
             // kernel-install hook keeps the entry current on upgrades.
             try c.append(alloc, .{ .write_file = .{
                 .path = "/mnt/gentoo/etc/kernel/install.d/91-sd-boot.install",
-                .content =
-                \\#!/bin/sh
-                \\# gentoo-installer systemd-boot hook: restage kernel+initramfs
-                \\# onto the ESP at the fixed paths the loader entry uses.
-                \\[ "$1" = add ] || exit 0
-                \\cp -f "$4" /efi/vmlinuz || exit 1
-                \\initrd=$(ls /boot/initramfs-"$2".img /boot/initrd-"$2".img /boot/*/"$2"/initrd* 2>/dev/null | head -n1)
-                \\[ -n "$initrd" ] || initrd=$(ls -t /boot/initramfs-*.img /boot/initrd-*.img /boot/*/*/initrd* 2>/dev/null | head -n1)
-                \\[ -n "$initrd" ] && cp -f "$initrd" /efi/initramfs.img
-                \\exit 0
-                ,
+                .content = s(alloc,
+                    \\#!/bin/sh
+                    \\# gentoo-installer systemd-boot hook: restage kernel+initramfs
+                    \\# onto the ESP at the fixed paths the loader entry uses.
+                    \\# args: $1=command $2=kver $3=entry_dir_abs $4=kernel_image
+                    \\[ "$1" = add ] || exit 0
+                    \\cp -f "$4" /efi/vmlinuz || exit 1
+                    \\{s}
+                    \\exit 0
+                , .{hookInitrd(alloc, cfg, "/efi/initramfs.img")}),
                 .mode = 0o755,
             } });
         },
