@@ -188,6 +188,10 @@ fn execCmd(io: std.Io, alloc: Allocator, e: plan.Exec) !void {
     var child = try std.process.spawn(io, .{
         .argv = argv_buf.items,
         .stdin = if (e.stdin != null) .pipe else .inherit,
+        // The headless wire is stdout-only — a child inheriting it would
+        // leak plain text into the event stream. Pipe and forward to
+        // stderr so the console still shows tool output on `run`.
+        .stdout = .pipe,
     });
     if (e.stdin) |data| {
         // Feed the payload, flush the buffered writer, then close so the
@@ -208,6 +212,19 @@ fn execCmd(io: std.Io, alloc: Allocator, e: plan.Exec) !void {
             _ = child.wait(io) catch {};
             return e2;
         }
+    }
+    // Drain stdout BEFORE wait — a verbose child deadlocks on a full
+    // pipe otherwise. Forwarded to stderr: protocol-safe for headless,
+    // still visible on a console for `run`.
+    if (child.stdout) |cs| {
+        var rbuf: [8192]u8 = undefined;
+        var sr = cs.reader(io, &rbuf);
+        var sebuf: [8192]u8 = undefined;
+        var sew = std.Io.File.stderr().writer(io, &sebuf);
+        _ = sr.interface.streamRemaining(&sew.interface) catch {};
+        sew.interface.flush() catch {};
+        cs.close(io);
+        child.stdout = null;
     }
     const term = try child.wait(io);
     switch (term) {

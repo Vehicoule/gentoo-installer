@@ -7,6 +7,8 @@
 const std = @import("std");
 const config = @import("config.zig");
 const detect = @import("detect.zig");
+const plan = @import("plan.zig");
+const preset_mod = @import("preset.zig");
 const toml = @import("toml.zig");
 const Allocator = std.mem.Allocator;
 const Config = config.Config;
@@ -24,6 +26,8 @@ pub const WizardError = error{
     ReadFailed,
     InvalidToml,
     BadConfig,
+    WriteFailed,
+    PathEscape,
 };
 
 const Opt = struct {
@@ -300,6 +304,9 @@ pub const Wizard = struct {
     io: std.Io,
     cfg: Config,
     env: ?Env = null,
+    /// Attached distro preset — package-set resolution for plan/install
+    /// runs through it exactly like the CLI path does.
+    preset: ?*const preset_mod.Preset = null,
     flow: Flow = .express,
     /// index into `pages` (not the filtered flow order — order is
     /// computed by nextInFlow())
@@ -581,6 +588,12 @@ pub const Wizard = struct {
             const s = try strOf(v);
             return w.loadAnswerFile(s);
         }
+        if (std.mem.eql(u8, name, "disk.luks_passphrase")) {
+            const s = try dstr(w, v);
+            if (s.len > 0 and s.len < 8) return error.BadValue;
+            w.cfg.disk.luks_passphrase = if (s.len == 0) null else s;
+            return;
+        }
         if (std.mem.eql(u8, name, "root.password")) {
             const s = try strOf(v);
             if (s.len < 8) return error.BadValue;
@@ -591,16 +604,18 @@ pub const Wizard = struct {
         if (std.mem.eql(u8, name, "user.name")) {
             const s = try dstr(w, v);
             if (s.len == 0) return error.BadValue;
-            const old_hash: ?[]const u8 = if (w.cfg.users.len > 0) w.cfg.users[0].password_hash else null;
-            const u = config.User{
-                .name = s,
-                .groups = @constCast(&.{"wheel"}),
-                .shell = "/bin/bash",
-                .password_hash = old_hash,
-            };
-            const items = try w.alloc.alloc(config.User, 1);
-            items[0] = u;
-            w.cfg.users = items;
+            // Rename users[0] in place — a fresh 1-element slice would
+            // drop extra users and the first user's keys/shell/groups.
+            if (w.cfg.users.len == 0) {
+                const items = try w.alloc.alloc(config.User, 1);
+                items[0] = .{ .name = s, .groups = @constCast(&.{"wheel"}), .shell = "/bin/bash" };
+                w.cfg.users = items;
+            } else {
+                const items = try w.alloc.alloc(config.User, w.cfg.users.len);
+                @memcpy(items, w.cfg.users);
+                items[0].name = s;
+                w.cfg.users = items;
+            }
             return;
         }
         if (std.mem.eql(u8, name, "user.password")) {
@@ -645,6 +660,19 @@ pub const Wizard = struct {
                 else => return error.BadType,
             };
             w.cfg.use.pkg = t;
+            return;
+        }
+        if (std.mem.eql(u8, name, "packages.sets")) {
+            // decode-equivalent semantics: an explicit list — even an
+            // empty one — overrides the preset's default sets.
+            const arr = switch (v) {
+                .array => |a| a,
+                else => return error.BadType,
+            };
+            var items: std.ArrayList([]const u8) = .empty;
+            for (arr.items) |it| try items.append(w.alloc, try dstr(w, it));
+            w.cfg.packages.sets = items.items;
+            w.cfg.packages.sets_explicit = true;
             return;
         }
         if (std.mem.eql(u8, name, "makeconf.cflags_custom")) {
@@ -724,7 +752,8 @@ pub const Wizard = struct {
 
     /// Load an answer file: parse TOML, decode into cfg, jump to review.
     fn loadAnswerFile(w: *Wizard, path: []const u8) WizardError!void {
-        const text = std.Io.Dir.cwd().readFileAlloc(w.io, path, w.alloc, .limited(4 << 20)) catch
+        const real = try confinedRead(w, path);
+        const text = std.Io.Dir.cwd().readFileAlloc(w.io, real, w.alloc, .limited(4 << 20)) catch
             return error.ReadFailed;
         var doc = toml.parse(w.alloc, text, null) catch |e| return switch (e) {
             error.OutOfMemory => error.OutOfMemory,
@@ -737,7 +766,15 @@ pub const Wizard = struct {
         w.cfg = config.decode(w.alloc, doc) catch return error.BadConfig;
         if (w.cfg.disk.luks_passphrase == null) w.cfg.disk.luks_passphrase = keep_luks;
         if (w.cfg.root.password_hash == null) w.cfg.root.password_hash = keep_roothash;
-        w.cfg.boot_mode_explicit = docHas(&doc, "boot", "mode");
+        // decode() already set boot_mode_explicit when the doc carries a
+        // root-level boot_mode. Scheme pins the same way, plus the CLI's
+        // preserve-scheme promotion (main.zig): an answer file that asks
+        // for alongside/manual must keep it when detection re-syncs.
+        w.cfg.disk.scheme_explicit = docHas(&doc, "disk", "scheme") or
+            w.cfg.disk.scheme == .alongside or w.cfg.disk.scheme == .manual;
+        // Re-apply the probed env: implicit boot_mode/scheme follow the
+        // live firmware exactly like they did before the file loaded.
+        if (w.env) |e| w.applyEnv(e);
         // jump to review
         for (pages, 0..) |pg, i| {
             if (std.mem.eql(u8, pg.id, "review")) {
@@ -934,6 +971,19 @@ pub const Wizard = struct {
                 try o.print("\"{s}\" = {}\n", .{ kv.key_ptr.*, kv.value_ptr.* == .boolean and kv.value_ptr.boolean });
             }
         }
+        if (w.cfg.use.pkg.count() > 0) {
+            var pit = w.cfg.use.pkg.iterator();
+            try o.writeAll("[use.pkg]\n");
+            while (pit.next()) |kv| {
+                if (kv.value_ptr.* != .string) continue;
+                try o.print("\"{s}\" = \"", .{kv.key_ptr.*});
+                for (kv.value_ptr.string) |ch| {
+                    if (ch == '"' or ch == '\\') try o.writeByte('\\');
+                    try o.writeByte(ch);
+                }
+                try o.writeAll("\"\n");
+            }
+        }
         for (w.cfg.users) |u| {
             try o.print("[[users]]\nname = \"{s}\"\nshell = \"{s}\"\n", .{ u.name, u.shell });
             if (u.password_hash) |h| try o.print("password_hash = \"{s}\"\n", .{h});
@@ -957,11 +1007,20 @@ pub const Wizard = struct {
         try o.writeAll("[root]\nlock_root = ");
         try o.print("{}\n", .{w.cfg.root.lock_root});
         if (w.cfg.root.password_hash) |h| try o.print("password_hash = \"{s}\"\n", .{h});
-        try std.Io.Dir.cwd().writeFile(w.io, .{
-            .sub_path = path,
+        const real = try confinedWrite(w, path);
+        std.Io.Dir.cwd().writeFile(w.io, .{
+            .sub_path = real,
             .data = aw.written(),
             .flags = .{ .truncate = true, .permissions = .fromMode(0o600) },
-        });
+        }) catch return error.WriteFailed;
+    }
+
+    /// Resolve cfg.packages.sets through the attached preset (or the
+    /// stock gentoo table when none) — same source `run`/`plan` use.
+    /// errs are surfaced verbatim; empty errs means resolution succeeded.
+    pub fn pkgSets(w: *Wizard, alloc: Allocator) !struct { sets: plan.Sets, errs: [][]const u8 } {
+        const rs = try preset_mod.resolveSets(alloc, w.preset, if (w.cfg.packages.sets_explicit) w.cfg.packages.sets else null);
+        return .{ .sets = .{ .atoms = rs.resolved.atoms, .repos = rs.resolved.repos }, .errs = rs.errs };
     }
 };
 
@@ -1001,6 +1060,55 @@ fn docHas(doc: *toml.Document, sec: []const u8, key: []const u8) bool {
     return t.table.get(key) != null;
 }
 
+/// Headless clients may only touch files inside the process working
+/// directory — arbitrary absolute/relative escape paths are refused.
+/// Both helpers return the resolved absolute path (cwd-owned).
+fn underCwd(real_dir: []const u8, cwd: []const u8) bool {
+    if (cwd.len <= 1) return true; // process rooted at / — nothing to escape
+    return std.mem.eql(u8, real_dir, cwd) or
+        (std.mem.startsWith(u8, real_dir, cwd) and real_dir.len > cwd.len and real_dir[cwd.len] == '/');
+}
+
+fn cwdReal(w: *Wizard) WizardError![]const u8 {
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = std.Io.Dir.cwd().realPathFile(w.io, ".", &buf) catch return error.BadValue;
+    return w.alloc.dupe(u8, buf[0..n]) catch return error.OutOfMemory;
+}
+
+fn lexicalOk(path: []const u8) bool {
+    if (path.len == 0 or std.fs.path.isAbsolute(path)) return false;
+    var it = std.mem.tokenizeScalar(u8, path, '/');
+    while (it.next()) |c| if (std.mem.eql(u8, c, "..")) return false;
+    return true;
+}
+
+/// For reading (answer files): the FILE's canonical path must sit
+/// under cwd — refuses absolute paths, `..`, and symlinks pointing out.
+fn confinedRead(w: *Wizard, path: []const u8) WizardError![]const u8 {
+    if (!lexicalOk(path)) return error.PathEscape;
+    const cwd = try cwdReal(w);
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const n = std.Io.Dir.cwd().realPathFile(w.io, path, &buf) catch return error.ReadFailed;
+    const real = buf[0..n];
+    if (!underCwd(real, cwd)) return error.PathEscape;
+    return w.alloc.dupe(u8, real) catch return error.OutOfMemory;
+}
+
+/// For writing (export): the parent directory's canonical path must sit
+/// under cwd; the file itself may not exist yet.
+fn confinedWrite(w: *Wizard, path: []const u8) WizardError![]const u8 {
+    if (!lexicalOk(path)) return error.PathEscape;
+    const cwd = try cwdReal(w);
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_part = std.fs.path.dirname(path) orelse ".";
+    const n = std.Io.Dir.cwd().realPathFile(w.io, dir_part, &buf) catch return error.PathEscape;
+    const real_dir = buf[0..n];
+    if (!underCwd(real_dir, cwd)) return error.PathEscape;
+    const base = std.fs.path.basename(path);
+    if (base.len == 0) return error.BadValue;
+    return std.fmt.allocPrint(w.alloc, "{s}/{s}", .{ real_dir, base }) catch return error.OutOfMemory;
+}
+
 fn setPath(w: *Wizard, name: []const u8, v: std.json.Value) WizardError!void {
     const cfg = &w.cfg;
     // enum fields
@@ -1022,10 +1130,13 @@ fn setPath(w: *Wizard, name: []const u8, v: std.json.Value) WizardError!void {
     }
     inline for (int_fields) |inf| {
         if (std.mem.eql(u8, name, inf)) {
-            cfg_int.set(cfg, inf, switch (v) {
-                .integer => |i| @intCast(i),
+            switch (v) {
+                .integer => |i| {
+                    if (i < 0 or i > std.math.maxInt(u32)) return error.BadValue;
+                    cfg_int.set(cfg, inf, @intCast(i));
+                },
                 else => return error.BadType,
-            });
+            }
             return;
         }
     }
@@ -1090,7 +1201,11 @@ fn setEnum(cfg: *Config, ef: EField, s: []const u8) WizardError!void {
         .netmanager => cfg.network.manager = std.meta.stringToEnum(config.NetManager, s) orelse return error.BadValue,
         .gpu_driver => cfg.gpu.driver = std.meta.stringToEnum(config.GpuDriver, s) orelse return error.BadValue,
         .cflags => {
-            if (std.mem.eql(u8, s, "safe")) cfg.makeconf.cflags = .safe else if (std.mem.eql(u8, s, "native")) cfg.makeconf.cflags = .native else return error.BadValue;
+            if (std.mem.eql(u8, s, "safe")) cfg.makeconf.cflags = .safe else if (std.mem.eql(u8, s, "native")) cfg.makeconf.cflags = .native else if (std.mem.eql(u8, s, "custom")) {
+                // keep any custom string already typed via
+                // makeconf.cflags_custom — cycling to custom re-selects it.
+                if (cfg.makeconf.cflags != .custom) cfg.makeconf.cflags = .{ .custom = "" };
+            } else return error.BadValue;
         },
     }
     // keep derived flags consistent
@@ -1559,6 +1674,62 @@ test "users table set masks password as hash" {
     try testing.expect(std.mem.startsWith(u8, h, "$6$"));
 }
 
+test "user.name renames users[0] without dropping the rest" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var w = testWizard();
+    w.alloc = arena.allocator();
+    var arr = std.json.Array.init(arena.allocator());
+    const o1 = try std.json.ObjectMap.init(arena.allocator(), &.{}, &.{});
+    var jb = std.json.Value{ .object = o1 };
+    try jb.object.put(arena.allocator(), "name", .{ .string = "bob" });
+    try jb.object.put(arena.allocator(), "shell", .{ .string = "/bin/zsh" });
+    const o2 = try std.json.ObjectMap.init(arena.allocator(), &.{}, &.{});
+    var jc = std.json.Value{ .object = o2 };
+    try jc.object.put(arena.allocator(), "name", .{ .string = "carol" });
+    try arr.append(jb);
+    try arr.append(jc);
+    try w.setField("users", .{ .array = arr });
+    try w.setField("user.name", .{ .string = "alice" });
+    try testing.expectEqual(@as(usize, 2), w.cfg.users.len);
+    try testing.expectEqualStrings("alice", w.cfg.users[0].name);
+    try testing.expectEqualStrings("/bin/zsh", w.cfg.users[0].shell);
+    try testing.expectEqualStrings("carol", w.cfg.users[1].name);
+}
+
+test "disk.luks_passphrase sets and clears" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var w = testWizard();
+    w.alloc = arena.allocator();
+    try w.setField("disk.luks_passphrase", .{ .string = "hunter2hunter" });
+    try testing.expectEqualStrings("hunter2hunter", w.cfg.disk.luks_passphrase.?);
+    try testing.expectError(error.BadValue, w.setField("disk.luks_passphrase", .{ .string = "short" }));
+    try w.setField("disk.luks_passphrase", .{ .string = "" });
+    try testing.expect(w.cfg.disk.luks_passphrase == null);
+}
+
+test "int fields reject out-of-range values" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var w = testWizard();
+    w.alloc = arena.allocator();
+    try testing.expectError(error.BadValue, w.setField("disk.esp_mib", .{ .integer = -1 }));
+    try testing.expectError(error.BadValue, w.setField("disk.esp_mib", .{ .integer = 1 << 40 }));
+    try w.setField("disk.esp_mib", .{ .integer = 512 });
+    try testing.expectEqual(@as(u32, 512), w.cfg.disk.esp_mib);
+}
+
+test "answer file and export refuse paths outside cwd" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var w = testWizard();
+    w.alloc = arena.allocator();
+    try testing.expectError(error.PathEscape, w.setField("answer_file", .{ .string = "/etc/hostname" }));
+    try testing.expectError(error.PathEscape, w.setField("answer_file", .{ .string = "../escape.toml" }));
+    try testing.expectError(error.PathEscape, w.exportAnswer("/tmp/out.toml"));
+}
+
 test "exportAnswer round-trips through loadAnswerFile" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1567,7 +1738,8 @@ test "exportAnswer round-trips through loadAnswerFile" {
     w.alloc = alloc;
     w.cfg.disk.device = "/dev/vda";
     w.cfg.root.password_hash = "$6$abc$def";
-    const path = "/tmp/gi-wizard-test-ans.toml";
+    // confined paths: writes/reads live under the process cwd
+    const path = ".zig-cache/gi-wizard-test-ans.toml";
     try w.exportAnswer(path);
     var w2 = testWizard();
     w2.alloc = alloc;

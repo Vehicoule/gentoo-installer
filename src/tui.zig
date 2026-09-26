@@ -239,7 +239,12 @@ pub const Tui = struct {
     }
 
     fn showPlanPreview(t: *Tui) !void {
-        const p = try engine.plan.build(t.alloc, &t.wiz.cfg, if (t.wiz.env) |*e| e else null, .{}, null);
+        const ps = try t.wiz.pkgSets(t.alloc);
+        if (ps.errs.len > 0) {
+            t.status = std.fmt.allocPrint(t.alloc, "set resolution: {s}", .{ps.errs[0]}) catch "set resolution failed";
+            return;
+        }
+        const p = try engine.plan.build(t.alloc, &t.wiz.cfg, if (t.wiz.env) |*e| e else null, ps.sets, null);
         t.plan_lines.clearRetainingCapacity();
         var aw: std.Io.Writer.Allocating = .init(t.alloc);
         try engine.runner.run(t.io, t.alloc, p, .{ .mode = .dry_run, .out = &aw.writer });
@@ -251,7 +256,17 @@ pub const Tui = struct {
     fn runInstall(t: *Tui) !void {
         t.mode = .progress;
         t.prog_lines.clearRetainingCapacity();
-        const p = engine.plan.build(t.alloc, &t.wiz.cfg, if (t.wiz.env) |*e| e else null, .{}, null) catch |e| {
+        const ps = t.wiz.pkgSets(t.alloc) catch |e| {
+            t.status = std.fmt.allocPrint(t.alloc, "set resolution failed: {s}", .{@errorName(e)}) catch "set resolution failed";
+            t.mode = .failed;
+            return;
+        };
+        if (ps.errs.len > 0) {
+            t.status = std.fmt.allocPrint(t.alloc, "set resolution: {s}", .{ps.errs[0]}) catch "set resolution failed";
+            t.mode = .failed;
+            return;
+        }
+        const p = engine.plan.build(t.alloc, &t.wiz.cfg, if (t.wiz.env) |*e| e else null, ps.sets, null) catch |e| {
             t.status = std.fmt.allocPrint(t.alloc, "plan failed: {s}", .{@errorName(e)}) catch "plan failed";
             t.mode = .failed;
             return;
@@ -530,7 +545,7 @@ fn renderValue(w: *std.Io.Writer, f: FieldView, t: *Tui, i: usize) !void {
     }
 }
 
-pub fn runTui(init: std.process.Init, alloc: Allocator, io: std.Io) !void {
+pub fn runTui(init: std.process.Init, alloc: Allocator, io: std.Io, preset: ?*const engine.preset.Preset) !void {
     var tty_buf: [4096]u8 = undefined;
     var tty = try vaxis.tty.Tty.init(io, &tty_buf);
     defer tty.deinit();
@@ -543,6 +558,7 @@ pub fn runTui(init: std.process.Init, alloc: Allocator, io: std.Io) !void {
     defer loop.stop();
 
     var t = Tui.init(alloc, io);
+    t.wiz.preset = preset;
     defer t.frame_arena.deinit();
 
     // detect → wizard env
@@ -587,15 +603,20 @@ pub fn runTui(init: std.process.Init, alloc: Allocator, io: std.Io) !void {
                         const f = t.pv.fields[t.edit_field];
                         if (f.confirm and !t.confirming) {
                             t.confirming = true;
-                            t.edit_confirm = t.edit_buf;
+                            // Deep copy — struct assignment would alias
+                            // the buffer and the re-entry would
+                            // overwrite the stored first entry.
+                            t.edit_confirm.clearRetainingCapacity();
+                            try t.edit_confirm.appendSlice(t.alloc, t.edit_buf.items);
                             t.edit_buf.clearRetainingCapacity();
                         } else if (f.confirm and t.confirming) {
                             if (std.mem.eql(u8, t.edit_buf.items, t.edit_confirm.items)) {
-                                t.edit_buf = t.edit_confirm;
+                                t.edit_confirm.clearRetainingCapacity();
                                 try t.commitEdit();
                             } else {
                                 t.status = "entries differ";
                                 t.confirming = false;
+                                t.edit_confirm.clearRetainingCapacity();
                             }
                         } else try t.commitEdit();
                     } else if (key.matches(vaxis.Key.escape, .{})) {

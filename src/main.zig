@@ -83,7 +83,6 @@ pub fn main(init: std.process.Init) !void {
             try out.flush();
             return;
         },
-        .tui => return @import("tui.zig").runTui(init, alloc, io),
         .detect => {
             const env = try engine.detect.detect(alloc, io);
             try engine.detect.envToJson(alloc, &env, out);
@@ -91,7 +90,26 @@ pub fn main(init: std.process.Init) !void {
             try out.flush();
             return;
         },
-        .headless => return headless(init, alloc, io, out, errw),
+        else => {},
+    }
+
+    // The preset object is needed by every mode that can build a plan —
+    // tui and headless resolve package sets through it just like run/
+    // plan/validate do. Defaults/locks still merge below where a config
+    // document exists.
+    var preset: ?engine.preset.Preset = null;
+    defer if (preset) |*p| p.deinit();
+    if (preset_path) |pp| {
+        preset = engine.preset.load(alloc, pp, io) catch |e| {
+            try errw.print("preset {s}: {s}\n", .{ pp, @errorName(e) });
+            try errw.flush();
+            std.process.exit(2);
+        };
+    }
+
+    switch (cmd) {
+        .tui => return @import("tui.zig").runTui(init, alloc, io, if (preset) |*pp| pp else null),
+        .headless => return headless(init, alloc, io, out, errw, if (preset) |*pp| pp else null),
         else => {},
     }
 
@@ -127,16 +145,9 @@ pub fn main(init: std.process.Init) !void {
         break :blk d == .table and d.table.get("scheme") != null;
     };
 
-    var preset: ?engine.preset.Preset = null;
-    defer if (preset) |*p| p.deinit();
-    if (preset_path) |pp| {
-        preset = engine.preset.load(alloc, pp, io) catch |e| {
-            try errw.print("preset {s}: {s}\n", .{ pp, @errorName(e) });
-            try errw.flush();
-            std.process.exit(2);
-        };
-        try engine.preset.mergeDefaults(&preset.?, &doc);
-        const lock_errs = try engine.preset.checkLocks(alloc, &preset.?, &doc);
+    if (preset) |*pp| {
+        try engine.preset.mergeDefaults(pp, &doc);
+        const lock_errs = try engine.preset.checkLocks(alloc, pp, &doc);
         for (lock_errs) |e| try errw.print("preset: {s}\n", .{e});
         if (lock_errs.len > 0) {
             try errw.flush();
@@ -394,7 +405,7 @@ fn fatal(w: *std.Io.Writer, msg: []const u8) noreturn {
 /// NDJSON protocol surface: hello/detect + the wizard ops (page, set,
 /// next, back, goto, get_config, set_config, validate, plan,
 /// export_answer, install) + quit. See docs/protocol.md.
-fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, errw: *std.Io.Writer) !void {
+fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *std.Io.Writer, errw: *std.Io.Writer, preset: ?*const engine.preset.Preset) !void {
     _ = init;
     _ = errw;
     var stdin_buf: [8192]u8 = undefined;
@@ -402,6 +413,7 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
     const r = &fr.interface;
 
     var wiz = engine.wizard.Wizard.init(alloc, io, .{});
+    wiz.preset = preset;
     var wiz_arena = std.heap.ArenaAllocator.init(alloc);
     defer wiz_arena.deinit();
 
@@ -554,7 +566,28 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
             const errs = engine.config.validate(req_alloc, &wiz.cfg, wizNvidia(&wiz)) catch &.{};
             try writeValidate(out, req, errs);
         } else if (std.mem.eql(u8, op, "plan")) {
-            const p = engine.plan.build(req_alloc, &wiz.cfg, if (wiz.env) |*e| e else null, .{}, null) catch |e| {
+            const ps = wiz.pkgSets(req_alloc) catch |e| {
+                var aw2: std.Io.Writer.Allocating = .init(req_alloc);
+                aw2.writer.print("set resolution failed: {s}", .{@errorName(e)}) catch {};
+                try writeErr(out, req, aw2.written());
+                try out.flush();
+                req_arena.deinit();
+                if (at_eof) break;
+                continue;
+            };
+            if (ps.errs.len > 0) {
+                var aw2: std.Io.Writer.Allocating = .init(req_alloc);
+                for (ps.errs, 0..) |e2, i| {
+                    if (i > 0) aw2.writer.writeAll("; ") catch {};
+                    aw2.writer.writeAll(e2) catch {};
+                }
+                try writeErr(out, req, aw2.written());
+                try out.flush();
+                req_arena.deinit();
+                if (at_eof) break;
+                continue;
+            }
+            const p = engine.plan.build(req_alloc, &wiz.cfg, if (wiz.env) |*e| e else null, ps.sets, null) catch |e| {
                 var aw: std.Io.Writer.Allocating = .init(req_alloc);
                 aw.writer.print("plan build failed: {s}", .{@errorName(e)}) catch {};
                 try writeErr(out, req, aw.written());
@@ -700,6 +733,25 @@ fn doInstall(io: std.Io, alloc: std.mem.Allocator, wiz: *engine.wizard.Wizard, o
             try writeErr(out, req, "install exec requires a prior detect op (no env)");
             return;
         }
+        // Live-boot honesty: an explicit boot_mode (answer file) that
+        // disagrees with the firmware we probed must refuse, not produce
+        // a plan aimed at the wrong firmware. Non-explicit values were
+        // already synced by applyEnv.
+        if (cfg.boot_mode != env_opt.?.boot_mode) {
+            var aw: std.Io.Writer.Allocating = .init(alloc);
+            aw.writer.print("config requests {s} but the live env booted {s} — refusing", .{ @tagName(cfg.boot_mode), @tagName(env_opt.?.boot_mode) }) catch {};
+            try writeErr(out, req, aw.written());
+            return;
+        }
+        // Preservation schemes are plan-only — partition-level detection
+        // and dual-boot are M6; proceeding would mount an unpopulated
+        // plan and format nothing / touch existing data wrongly.
+        if (cfg.disk.scheme == .alongside or cfg.disk.scheme == .manual) {
+            var aw: std.Io.Writer.Allocating = .init(alloc);
+            aw.writer.print("scheme '{s}' is not executable yet (dual-boot lands in M6) — dry_run still previews", .{@tagName(cfg.disk.scheme)}) catch {};
+            try writeErr(out, req, aw.written());
+            return;
+        }
         if (cfg.system.kernel == .manual) {
             try writeErr(out, req, "kernel=manual is a TUI flow — exec support lands in a later milestone");
             return;
@@ -758,7 +810,22 @@ fn doInstall(io: std.Io, alloc: std.mem.Allocator, wiz: *engine.wizard.Wizard, o
             }
         }
     }
-    const p = engine.plan.build(alloc, cfg, if (env_opt) |*e| e else null, .{}, null) catch |e| {
+    const ps = wiz.pkgSets(alloc) catch |e| {
+        var aw: std.Io.Writer.Allocating = .init(alloc);
+        aw.writer.print("set resolution failed: {s}", .{@errorName(e)}) catch {};
+        try writeErr(out, req, aw.written());
+        return;
+    };
+    if (ps.errs.len > 0) {
+        var aw: std.Io.Writer.Allocating = .init(alloc);
+        for (ps.errs, 0..) |e2, i| {
+            if (i > 0) aw.writer.writeAll("; ") catch {};
+            aw.writer.writeAll(e2) catch {};
+        }
+        try writeErr(out, req, aw.written());
+        return;
+    }
+    const p = engine.plan.build(alloc, cfg, if (env_opt) |*e| e else null, ps.sets, null) catch |e| {
         var aw: std.Io.Writer.Allocating = .init(alloc);
         aw.writer.print("plan build failed: {s}", .{@errorName(e)}) catch {};
         try writeErr(out, req, aw.written());
