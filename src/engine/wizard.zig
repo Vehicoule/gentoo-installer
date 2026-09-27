@@ -119,6 +119,10 @@ fn hasNvidia(w: *const Wizard) bool {
 fn systemdInit(w: *const Wizard) bool {
     return w.cfg.system.init == .systemd;
 }
+fn systemdBootOk(w: *const Wizard) bool {
+    // bootctl claims EFI/BOOT/BOOTX64.EFI unconditionally — no shared ESP.
+    return w.cfg.system.init == .systemd and w.cfg.disk.scheme != .alongside;
+}
 fn notSystemd(w: *const Wizard) bool {
     return w.cfg.system.init != .systemd;
 }
@@ -267,7 +271,7 @@ const system_fields = [_]Field{
         .{ .v = "auto", .label = "Automatic (limine)", .help = "recommended — works on BIOS and UEFI" },
         .{ .v = "limine", .label = "Limine" },
         .{ .v = "grub", .label = "GRUB" },
-        .{ .v = "systemd-boot", .label = "systemd-boot", .visible = systemdInit },
+        .{ .v = "systemd-boot", .label = "systemd-boot", .visible = systemdBootOk },
         .{ .v = "efistub", .label = "efistub (firmware entry)", .visible = isUefi },
         .{ .v = "refind", .label = "rEFInd", .visible = isUefi },
     } },

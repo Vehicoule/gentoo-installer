@@ -764,6 +764,10 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier, env: 
             try errs.append(alloc, "disk.scheme=alongside requires UEFI — BIOS chainloading of foreign OSes isn't supported; use a spare disk");
         if (cfg.disk.boot_part)
             try errs.append(alloc, "disk.boot_part is meaningless under alongside — the existing ESP is reused");
+        // bootctl unconditionally writes EFI/BOOT/BOOTX64.EFI — on a
+        // shared ESP that hijacks the firmware's fallback loader.
+        if (cfg.system.bootloader == .@"systemd-boot")
+            try errs.append(alloc, "scheme=alongside + systemd-boot is refused: bootctl always claims EFI/BOOT/BOOTX64.EFI on the shared ESP — pick limine/grub/efistub/rEFInd");
         if (env) |e| blk: {
             const disk = for (e.disks) |*di| {
                 if (std.mem.eql(u8, di.path, cfg.disk.device)) break di;

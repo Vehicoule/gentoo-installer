@@ -251,7 +251,20 @@ fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, 
                     const margin_sectors: u64 = 16 * 2048;
                     const new_end = pp.start_sector + (new_fs_mib << 11) + margin_sectors - 1;
                     const old_end = pp.start_sector + (pp.size_bytes >> 9) - 1;
-                    try c.append(alloc, argv(alloc, &.{ "sgdisk", s(alloc, "-d{}", .{pp.num}), s(alloc, "-n{}:{}:{}", .{ pp.num, pp.start_sector, new_end }), dev }, s(alloc, "shrink partition {} to end at sector {}", .{ pp.num, new_end })));
+                    // sgdisk -d/-n recreates the GPT entry — capture the
+                    // existing partition's identity (type GUID, unique
+                    // GUID, name, attribute bits) first and re-apply it,
+                    // or the foreign OS's boot/mount references keyed to
+                    // PARTUUID or type silently break.
+                    try c.append(alloc, argv(alloc, &.{ "sh", "-c", s(alloc,
+                        "i=$(sgdisk -i{} {s}) && " ++
+                        "t=$(echo \"$i\" | sed -n 's|Partition GUID code: *\\([^ ]*\\).*|\\1|p') && " ++
+                        "u=$(echo \"$i\" | sed -n 's|Partition unique GUID: *||p') && " ++
+                        "m=$(echo \"$i\" | sed -n \"s|Partition name: *'\\(.*\\)'|\\1|p\") && " ++
+                        "a=$(echo \"$i\" | sed -n 's|Attribute flags: *||p') && " ++
+                        "sgdisk -d{} -n{}:{}:{} -t{}:$t -u{}:$u -c{}:\"$m\" -A{}:=:$a {s}",
+                        .{ pp.num, dev, pp.num, pp.num, pp.start_sector, new_end, pp.num, pp.num, pp.num, pp.num, dev }) },
+                        s(alloc, "shrink partition {} to end at sector {} (type/GUID/name/attrs preserved)", .{ pp.num, new_end })));
                     rs = new_end + 1;
                     // The freed gap ends where the partition used to.
                     re = old_end;
@@ -1850,6 +1863,10 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env,
             } });
         },
         .@"systemd-boot" => {
+            // bootctl unconditionally writes EFI/BOOT/BOOTX64.EFI — on a
+            // shared ESP that hijacks the firmware fallback. VALIDATE
+            // refuses alongside+systemd-boot, so this is only reached on
+            // our own ESP.
             try c.append(alloc, .{ .exec = .{
                 .argv = try alloc.dupe([]const u8, &.{ "bootctl", "install" }),
                 .chroot = true,
@@ -1916,9 +1933,15 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env,
             } });
             // refind-install copies the manager + filesystem drivers onto
             // the mounted ESP and creates the NVRAM entry; --alldrivers
-            // lets it read kernels off /boot (btrfs/ext4/xfs).
+            // lets it read kernels off /boot (btrfs/ext4/xfs). On a shared
+            // (alongside) ESP we must NOT pass --usedefault — that would
+            // install rEFInd as EFI/BOOT/BOOTX64.EFI, hijacking whatever
+            // fallback loader already lives there.
             try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "refind-install", "--alldrivers", "--usedefault", espPath(alloc, cfg, env) orelse partPath(alloc, cfg.disk.device, 1) }),
+                .argv = if (cfg.disk.scheme == .alongside)
+                    try alloc.dupe([]const u8, &.{ "refind-install", "--alldrivers", espPath(alloc, cfg, env) orelse partPath(alloc, cfg.disk.device, 1) })
+                else
+                    try alloc.dupe([]const u8, &.{ "refind-install", "--alldrivers", "--usedefault", espPath(alloc, cfg, env) orelse partPath(alloc, cfg.disk.device, 1) }),
                 .chroot = true,
                 .desc = "install rEFInd to ESP + NVRAM entry",
             } });
@@ -2672,9 +2695,15 @@ test "alongside: preserve table, shrink ext4, reuse ESP, menu merge" {
                     }
                     if (std.mem.eql(u8, e.argv[0], "resize2fs") and std.mem.eql(u8, e.argv[1], "/dev/sda2"))
                         saw_resize = true;
+                    // the shrink is a sh -c script: sgdisk -i capture +
+                    // -d/-n recreate + -t/-u/-c/-A re-apply of the identity
+                    if (std.mem.eql(u8, e.argv[0], "sh") and e.argv.len > 2 and
+                        std.mem.indexOf(u8, e.argv[2], "sgdisk -d2") != null and
+                        std.mem.indexOf(u8, e.argv[2], "sgdisk -i2") != null and
+                        std.mem.indexOf(u8, e.argv[2], "-u2:$u") != null)
+                        saw_shrink_sgdisk = true;
                     if (std.mem.eql(u8, e.argv[0], "sgdisk")) {
                         for (e.argv) |a| {
-                            if (std.mem.eql(u8, a, "-d2")) saw_shrink_sgdisk = true;
                             if (std.mem.startsWith(u8, a, "-n3:")) saw_new_root = true;
                         }
                     }
