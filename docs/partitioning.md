@@ -140,9 +140,35 @@ detect OSes ──► space_src?
 
 ### `manual` (expert)
 
-Free-form table editor producing the same `DiskPlan` op list — so
-VALIDATE, preview, and resume work identically. Nothing is type-specific
-to guided layouts.
+Free-form table producing the same plan ops as guided layouts — so
+validate, preview, and exec work identically. The table is a list of
+`[[disk.partitions]]` entries in the answer file:
+
+```toml
+[[disk.partitions]]
+size  = "512MiB"   # <n>MiB | <n>GiB | "rest" ("rest" last only, ≤1)
+type  = "EF00"     # GPT type code (EF00 ESP, EF02 BIOS boot, 8200 swap,
+                   #   8300/8304 Linux)
+name  = "ESP"      # partition label (GPT PARTLABEL)
+fs    = "vfat"     # vfat|ext4|xfs|btrfs|f2fs|bcachefs|swap|none
+                   #   ("none" = leave unformatted)
+mount = "/efi"     # absolute mount point, or "" (unmounted)
+```
+
+In the wizard's text field the same table is one row per entry,
+`size:type:name:fs:mount` colon-separated, `;` or newline between
+entries (`-` = empty name):
+`512MiB:EF00:ESP:vfat:/efi; rest:8304:root:btrfs:/`
+
+Rules the validator enforces: exactly one row mounts `/` with a root
+filesystem; UEFI needs a `type=EF00 fs=vfat` row (its mount is the ESP —
+default `/efi` when omitted); BIOS + GRUB needs a `type=EF02` BIOS-boot
+row and rejects `EF00`; BIOS + limine + LUKS needs a `/boot` row or an
+ext4 root; mounts are deduplicated; an explicit root size below 8 GiB
+is refused; `swap` fs rows take no mount and are swapped on at mount
+time; `lvm` and `swap=partition` are guided-layout features and are
+rejected (express volumes as plain partitions); `luks=on` still wraps
+the `/` row exactly as in guided mode.
 
 ## Sizing rules
 

@@ -76,6 +76,12 @@ fn swapIsPart(w: *const Wizard) bool {
 fn btrfsRoot(w: *const Wizard) bool {
     return w.cfg.disk.root_fs == .btrfs;
 }
+fn isManual(w: *const Wizard) bool {
+    return w.cfg.disk.scheme == .manual;
+}
+fn kernelManual(w: *const Wizard) bool {
+    return w.cfg.system.kernel == .manual;
+}
 fn isAlongside(w: *const Wizard) bool {
     return w.cfg.disk.scheme == .alongside;
 }
@@ -175,6 +181,11 @@ const disk_fields = [_]Field{
     }, .visible = isAlongside },
     .{ .name = "disk.shrink_part", .ftype = .string, .label = "Partition to shrink", .visible = shrinkSrc },
     .{ .name = "disk.shrink_mib", .ftype = .int, .label = "Shrink by (MiB)", .visible = shrinkSrc },
+    // Free-form table for scheme=manual: one row per entry, fields
+    // `size:type:name:fs:mount` (';' or newline separated). size is
+    // <n>MiB|<n>GiB|rest; fs=swap takes no mount; fs=none leaves the
+    // partition unformatted.
+    .{ .name = "disk.partitions", .ftype = .string, .label = "Partition table", .help = "512MiB:EF00:ESP:vfat:/efi; rest:8304:root:btrfs:/", .visible = isManual, .expert = true },
 };
 
 const variant_fields = [_]Field{
@@ -233,6 +244,7 @@ const system_fields = [_]Field{
         .{ .v = "dist", .label = "Compiled with Gentoo defaults", .help = "tunable" },
         .{ .v = "manual", .label = "gentoo-sources — configure it yourself", .help = "expert" },
     } },
+    .{ .name = "system.kernel_config", .ftype = .string, .label = "Kernel .config path", .help = "path to a .config on the live env", .visible = kernelManual, .expert = true },
     .{ .name = "system.initramfs", .ftype = .@"enum", .label = "Initramfs", .options = &.{
         .{ .v = "dracut", .label = "dracut" },
         .{ .v = "ugrd", .label = "ugrd" },
@@ -833,6 +845,17 @@ pub const Wizard = struct {
             w.cfg.makeconf.cflags = .{ .custom = try dstr(w, v) };
             return;
         }
+        if (std.mem.eql(u8, name, "disk.partitions")) {
+            // Two wire shapes: a JSON array of objects (GUI/answer-file
+            // flows) or the compact text rows the TUI field collects —
+            // "size:type:name:fs:mount" entries, ';'/newline separated.
+            w.cfg.disk.partitions = switch (v) {
+                .array => |a| try partitionsFromJson(w, a),
+                .string => |s| try parsePartitions(w.alloc, s),
+                else => return error.BadType,
+            };
+            return;
+        }
         return setPath(w, name, v);
     }
 
@@ -873,6 +896,56 @@ pub const Wizard = struct {
             else => return error.HashFailed,
         }
         return std.mem.trim(u8, out.written(), " \t\r\n");
+    }
+
+    /// `disk.partitions` as a JSON array of
+    /// {"size","type","name","fs","mount"} objects.
+    fn partitionsFromJson(w: *Wizard, arr: std.json.Array) WizardError![]const config.Partition {
+        var out = try std.ArrayList(config.Partition).initCapacity(w.alloc, arr.items.len);
+        for (arr.items) |item| {
+            const o = switch (item) {
+                .object => |o| o,
+                else => return error.BadType,
+            };
+            var p = config.Partition{};
+            if (o.get("size")) |x| p.size = try dstr(w, x);
+            if (o.get("type")) |x| p.ptype = try dstr(w, x);
+            if (o.get("name")) |x| p.name = try dstr(w, x);
+            if (o.get("fs")) |x| p.fs = try dstr(w, x);
+            if (o.get("mount")) |x| p.mount = try dstr(w, x);
+            out.appendAssumeCapacity(p);
+        }
+        return out.items;
+    }
+
+    /// The compact row form the TUI's text field collects:
+    /// `size:type:name:fs:mount` per entry, `;` or newline separated.
+    /// name and mount may be empty; "-" is the empty-name placeholder.
+    fn parsePartitions(alloc: Allocator, text: []const u8) WizardError![]const config.Partition {
+        var out: std.ArrayList(config.Partition) = .empty;
+        var lines = std.mem.tokenizeAny(u8, text, ";\n");
+        while (lines.next()) |row| {
+            const r = std.mem.trim(u8, row, " \t");
+            if (r.len == 0) continue;
+            var f: [5][]const u8 = .{ "", "", "", "", "" };
+            var it = std.mem.splitScalar(u8, r, ':');
+            var n: usize = 0;
+            while (it.next()) |piece| {
+                if (n >= 5) return error.BadValue; // too many fields
+                f[n] = std.mem.trim(u8, piece, " \t");
+                n += 1;
+            }
+            if (n != 5) return error.BadValue;
+            if (f[0].len == 0 or f[3].len == 0) return error.BadValue; // size + fs required
+            try out.append(alloc, .{
+                .size = try alloc.dupe(u8, f[0]),
+                .ptype = if (f[1].len > 0) try alloc.dupe(u8, f[1]) else "8300",
+                .name = if (f[2].len > 0 and !std.mem.eql(u8, f[2], "-")) try alloc.dupe(u8, f[2]) else "",
+                .fs = try alloc.dupe(u8, f[3]),
+                .mount = try alloc.dupe(u8, f[4]),
+            });
+        }
+        return out.items;
     }
 
     fn setUsers(w: *Wizard, v: std.json.Value) WizardError!void {
@@ -1064,6 +1137,8 @@ pub const Wizard = struct {
         try fieldStr(out, "shrink_part", w.cfg.disk.shrink_part);
         try out.writeAll(",");
         try fieldInt(out, "shrink_mib", w.cfg.disk.shrink_mib);
+        try out.writeAll(",\"partitions\":");
+        try emitPartitionsJson(out, w.cfg.disk.partitions);
         try out.writeAll("},\"stage3\":{");
         try fieldStr(out, "libc", @tagName(w.cfg.stage3.libc));
         try out.writeAll(",");
@@ -1098,6 +1173,8 @@ pub const Wizard = struct {
         try fieldInt(out, "keep_kernels", w.cfg.system.keep_kernels);
         try out.writeAll(",");
         try fieldStr(out, "snapshots", @tagName(w.cfg.system.snapshots));
+        try out.writeAll(",");
+        try fieldStr(out, "kernel_config", w.cfg.system.kernel_config);
         try out.writeAll(",\"locales\":[");
         for (w.cfg.system.locales, 0..) |l, i| {
             if (i > 0) try out.writeAll(",");
@@ -1237,6 +1314,19 @@ pub const Wizard = struct {
         try o.writeAll("\n");
         if (w.cfg.disk.luks)
             try o.writeAll("# luks_passphrase = \"…\"  # plaintext is never exported — set before exec\n");
+        for (w.cfg.disk.partitions) |p| {
+            try o.writeAll("[[disk.partitions]]\nsize = ");
+            try tomlStr(o, p.size);
+            try o.writeAll("\ntype = ");
+            try tomlStr(o, p.ptype);
+            try o.writeAll("\nname = ");
+            try tomlStr(o, p.name);
+            try o.writeAll("\nfs = ");
+            try tomlStr(o, p.fs);
+            try o.writeAll("\nmount = ");
+            try tomlStr(o, p.mount);
+            try o.writeAll("\n");
+        }
         try o.print("[stage3]\nlibc = \"{s}\"\ntoolchain = \"{s}\"\nvariant = ", .{ @tagName(w.cfg.stage3.libc), @tagName(w.cfg.stage3.toolchain) });
         try tomlStr(o, w.cfg.stage3.variant);
         try o.writeAll("\nmirror = ");
@@ -1255,6 +1345,10 @@ pub const Wizard = struct {
         try tomlStr(o, w.cfg.system.locale);
         try o.writeAll("\nkeymap = ");
         try tomlStr(o, w.cfg.system.keymap);
+        if (w.cfg.system.kernel_config.len > 0) {
+            try o.writeAll("\nkernel_config = ");
+            try tomlStr(o, w.cfg.system.kernel_config);
+        }
         try o.writeAll("\nlocales = [");
         for (w.cfg.system.locales, 0..) |l, i| {
             if (i > 0) try o.writeAll(", ");
@@ -1732,6 +1826,7 @@ const cfg_str = struct {
             .{ "system.timezone", &cfg.system.timezone },
             .{ "system.locale", &cfg.system.locale },
             .{ "system.keymap", &cfg.system.keymap },
+            .{ "system.kernel_config", &cfg.system.kernel_config },
             .{ "stage3.variant", &cfg.stage3.variant },
             .{ "stage3.mirror", &cfg.stage3.mirror },
             .{ "makeconf.accept_license", &cfg.makeconf.accept_license },
@@ -1746,7 +1841,7 @@ const cfg_str = struct {
         }
     }
 };
-const str_fields = [_][]const u8{ "disk.device", "disk.shrink_part", "system.hostname", "system.timezone", "system.locale", "system.keymap", "stage3.variant", "stage3.mirror", "makeconf.accept_license", "makeconf.video_cards", "makeconf.mirrors" };
+const str_fields = [_][]const u8{ "disk.device", "disk.shrink_part", "system.hostname", "system.timezone", "system.locale", "system.keymap", "system.kernel_config", "stage3.variant", "stage3.mirror", "makeconf.accept_license", "makeconf.video_cards", "makeconf.mirrors" };
 
 const cfg_list = struct {
     fn set(cfg: *Config, name: []const u8, items: []const []const u8) void {
@@ -1783,6 +1878,37 @@ fn jstr(out: *std.Io.Writer, s: []const u8) !void {
     try out.writeAll("\"");
     jesc(out, s);
     try out.writeAll("\"");
+}
+
+/// `[[disk.partitions]]` as a JSON array of objects.
+fn emitPartitionsJson(out: *std.Io.Writer, parts: []const config.Partition) !void {
+    try out.writeAll("[");
+    for (parts, 0..) |p, i| {
+        if (i > 0) try out.writeAll(",");
+        try out.writeAll("{\"size\":");
+        try jstr(out, p.size);
+        try out.writeAll(",\"type\":");
+        try jstr(out, p.ptype);
+        try out.writeAll(",\"name\":");
+        try jstr(out, p.name);
+        try out.writeAll(",\"fs\":");
+        try jstr(out, p.fs);
+        try out.writeAll(",\"mount\":");
+        try jstr(out, p.mount);
+        try out.writeAll("}");
+    }
+    try out.writeAll("]");
+}
+
+/// The compact text form the TUI string field edits — same rows
+/// `parsePartitions` accepts.
+pub fn partitionsToText(alloc: Allocator, parts: []const config.Partition) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    for (parts, 0..) |p, i| {
+        if (i > 0) try out.writer.writeAll("\n");
+        try out.writer.print("{s}:{s}:{s}:{s}:{s}", .{ p.size, p.ptype, if (p.name.len > 0) p.name else "-", p.fs, p.mount });
+    }
+    return out.written();
 }
 
 fn fieldStr(out: *std.Io.Writer, k: []const u8, v: []const u8) !void {
@@ -1827,8 +1953,13 @@ fn emitCfgValue(w: *Wizard, out: *std.Io.Writer, name: []const u8, ftype: FType)
             try out.print("{}", .{v});
         },
         .string, .path => {
-            const v = strVal(cfg, name) orelse "";
-            try jstr(out, v);
+            if (std.mem.eql(u8, name, "disk.partitions")) {
+                // the field is a text editor — emit the compact rows
+                try jstr(out, partitionsToText(w.alloc, cfg.disk.partitions) catch "");
+            } else {
+                const v = strVal(cfg, name) orelse "";
+                try jstr(out, v);
+            }
         },
         .list => {
             const items = listVal(cfg, name) orelse &.{};

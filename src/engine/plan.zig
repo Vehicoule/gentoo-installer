@@ -130,7 +130,7 @@ pub fn build(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, pkg_
     try steps.append(alloc, try planPartition(alloc, cfg, env, seed));
     try steps.append(alloc, try planMount(alloc, cfg));
     try steps.append(alloc, try planStage3(alloc, cfg));
-    try steps.append(alloc, try planPortage(alloc, cfg, env));
+    try steps.append(alloc, try planPortage(alloc, cfg, env, seed));
     try steps.append(alloc, try planChroot(alloc));
     try steps.append(alloc, try planRepoSync(alloc, cfg));
     try steps.append(alloc, try planProfile(alloc, cfg));
@@ -157,8 +157,60 @@ fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, 
 
     switch (d.scheme) {
         .manual => {
-            try c.append(alloc, .{ .note = "manual: use the partition table as found; mount targets must be supplied" });
-            return step(alloc, "partition", "Partition disks", c);
+            // Free-form: every row of disk.partitions becomes a GPT
+            // entry + filesystem in listed order. Validation has already
+            // enforced one "/", ≥1 EF00 on UEFI, rest-last, etc.
+            if (d.wipe)
+                try c.append(alloc, argv(alloc, &.{ "sgdisk", "--zap-all", dev }, s(alloc, "wipe partition table on {s}", .{dev})));
+            for (d.partitions, 0..) |p, i| {
+                const n: u32 = @intCast(i + 1);
+                const size_arg = if (config.parseSizeMiB(p.size) != null)
+                    s(alloc, "-n{}:0:+{s}", .{ n, p.size })
+                else // "rest" — take all remaining space
+                    s(alloc, "-n{}:0:0", .{n});
+                const name_arg = if (p.name.len > 0) s(alloc, "-c{}:{s}", .{ n, p.name }) else s(alloc, "-c{}:part{}", .{ n, n });
+                try c.append(alloc, argv(alloc, &.{ "sgdisk", size_arg, s(alloc, "-t{}:{s}", .{ n, p.ptype }), name_arg, s(alloc, "-u{}:{s}", .{ n, partGuid(alloc, seed, n) }), dev }, s(alloc, "partition {} ({s}, {s})", .{ n, p.size, p.ptype })));
+            }
+            // filesystems — LUKS wraps the "/" partition when enabled.
+            var root_dev: []const u8 = "";
+            for (d.partitions, 0..) |p, i| {
+                const n: u32 = @intCast(i + 1);
+                const pp = partPath(alloc, dev, n);
+                const is_root = std.mem.eql(u8, p.mount, "/");
+                var dev_node = pp;
+                if (is_root and d.luks) {
+                    try c.append(alloc, .{ .exec = .{
+                        .argv = try alloc.dupe([]const u8, &.{ "cryptsetup", "luksFormat", "--type", "luks2", "--pbkdf", "argon2id", "--batch-mode", "--key-file", "-", pp }),
+                        .stdin = cfg.disk.luks_passphrase,
+                        .stdin_label = "<luks passphrase>",
+                        .desc = s(alloc, "LUKS2+argon2id on {s} (passphrase on stdin)", .{pp}),
+                    } });
+                    try c.append(alloc, .{ .exec = .{
+                        .argv = try alloc.dupe([]const u8, &.{ "cryptsetup", "open", "--key-file", "-", pp, "cryptroot" }),
+                        .stdin = cfg.disk.luks_passphrase,
+                        .stdin_label = "<luks passphrase>",
+                        .desc = "open LUKS container",
+                    } });
+                    dev_node = "/dev/mapper/cryptroot";
+                    root_dev = dev_node;
+                } else if (is_root) root_dev = pp;
+                if (std.mem.eql(u8, p.fs, "vfat"))
+                    try c.append(alloc, argv(alloc, &.{ "mkfs.vfat", "-F32", "-n", if (p.name.len > 0) p.name else "ESP", pp }, s(alloc, "format {s} as FAT32", .{pp})))
+                else if (std.mem.eql(u8, p.fs, "swap"))
+                    try c.append(alloc, argv(alloc, &.{ "mkswap", "-L", if (p.name.len > 0) p.name else "swap", pp }, s(alloc, "format {s} as swap", .{pp})))
+                else if (p.fs.len > 0 and !std.mem.eql(u8, p.fs, "none"))
+                    try c.append(alloc, argv(alloc, &.{ s(alloc, "mkfs.{s}", .{p.fs}), dev_node }, s(alloc, "format {s} as {s}", .{ dev_node, p.fs })));
+            }
+            // btrfs root gets the standard subvol layout (rollback is a
+            // distro invariant — manual partitions don't opt out).
+            if (rootFsOf(cfg) == .btrfs) {
+                try c.append(alloc, argv(alloc, &.{ "mkdir", "-p", "/mnt/gentoo" }, "target mountpoint"));
+                try c.append(alloc, argv(alloc, &.{ "mount", root_dev, "/mnt/gentoo" }, "mount btrfs top-level"));
+                for ([_][]const u8{ "@root", "@home", "@snapshots" }) |sv|
+                    try c.append(alloc, argv(alloc, &.{ "btrfs", "subvolume", "create", s(alloc, "/mnt/gentoo/{s}", .{sv}) }, s(alloc, "subvol {s}", .{sv})));
+                try c.append(alloc, argv(alloc, &.{ "umount", "/mnt/gentoo" }, "unmount after subvol creation"));
+            }
+            return step(alloc, "partition", "Partition disks (manual)", c);
         },
         .alongside => {
             try c.append(alloc, .{ .note = "alongside mode: preserve existing OS partitions; reuse existing ESP" });
@@ -297,7 +349,7 @@ fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, 
 /// The mount point where the root filesystem lands — subvol-aware.
 fn rootMountArgs(alloc: Allocator, cfg: *const Config) struct { dev: []const u8, opts: []const u8 } {
     const dev = fsDevice(alloc, cfg);
-    if (cfg.disk.root_fs == .btrfs)
+    if (rootFsOf(cfg) == .btrfs)
         return .{ .dev = dev, .opts = "subvol=@root,compress=zstd:1,noatime" };
     return .{ .dev = dev, .opts = "" };
 }
@@ -350,12 +402,47 @@ fn partIdent(alloc: Allocator, seed: u128, n: u32) []const u8 {
     return s(alloc, "PARTUUID={s}", .{partGuid(alloc, seed, n)});
 }
 
-/// The partition index the root filesystem lands on (plain layouts).
+/// The partition index the root filesystem lands on (plain layouts;
+/// scheme=manual resolves it from the "/" row of disk.partitions).
 fn rootPartIdx(cfg: *const Config) u32 {
+    if (cfg.disk.scheme == .manual)
+        return config.manualRootPart(cfg) orelse 1;
     var n: u32 = 1; // esp (uefi) or biosboot (bios)
     if (cfg.disk.swap == .partition) n += 1;
     if (cfg.disk.boot_part) n += 1;
     return n + 1;
+}
+
+/// Root filesystem for mkfs/fstab/rootfstype — under scheme=manual it
+/// is the "/" row's fs; everywhere else it is disk.root_fs.
+fn rootFsOf(cfg: *const Config) config.RootFs {
+    if (cfg.disk.scheme == .manual)
+        return config.manualRootFs(cfg) orelse cfg.disk.root_fs;
+    return cfg.disk.root_fs;
+}
+
+/// Partition number of the ESP — index 1 on guided UEFI layouts; under
+/// scheme=manual the row whose type is EF00 (any position).
+fn espPartIdx(cfg: *const Config) ?u32 {
+    if (cfg.disk.scheme == .manual) {
+        for (cfg.disk.partitions, 0..) |p, i|
+            if (std.ascii.eqlIgnoreCase(p.ptype, "EF00")) return @intCast(i + 1);
+        return null;
+    }
+    return if (cfg.boot_mode == .uefi) 1 else null;
+}
+
+/// Mount point of the ESP inside the target.
+fn espMountPoint(alloc: Allocator, cfg: *const Config) []const u8 {
+    if (cfg.disk.scheme == .manual)
+        return s(alloc, "/mnt/gentoo{s}", .{config.manualEspMount(cfg)});
+    return "/mnt/gentoo/efi";
+}
+
+/// The ESP's path from inside the chroot (bootloader/signing steps).
+fn espInTarget(cfg: *const Config) []const u8 {
+    if (cfg.disk.scheme == .manual) return config.manualEspMount(cfg);
+    return "/efi";
 }
 
 /// Persistent root identifier for root= and fstab: mapper/LV names are
@@ -369,12 +456,12 @@ pub fn rootIdent(alloc: Allocator, cfg: *const Config, seed: u128) []const u8 {
 fn kernelArgs(alloc: Allocator, cfg: *const Config, seed: u128) []const u8 {
     var r = s(alloc, "root={s}", .{rootIdent(alloc, cfg, seed)});
     // btrfs: install mounted subvol=@root — boot must select it too.
-    if (cfg.disk.root_fs == .btrfs)
+    if (rootFsOf(cfg) == .btrfs)
         r = s(alloc, "{s} rootflags=subvol=@root", .{r});
     // LUKS: dracut unlocks via crypttab/rd.luks at initramfs time.
     if (cfg.disk.luks)
         r = s(alloc, "{s} rd.luks=1", .{r});
-    return s(alloc, "{s} rootfstype={s}", .{ r, @tagName(cfg.disk.root_fs) });
+    return s(alloc, "{s} rootfstype={s}", .{ r, @tagName(rootFsOf(cfg)) });
 }
 
 pub fn fsDevice(alloc: Allocator, cfg: *const Config) []const u8 {
@@ -390,6 +477,12 @@ fn bootPartIdx(cfg: *const Config) u32 {
     return n + 1;
 }
 
+/// Count of '/' in a mount path — the mount ordering key (parents
+/// before nested children like /boot then /boot/efi).
+fn mountDepth(path: []const u8) usize {
+    return std.mem.count(u8, path, "/");
+}
+
 fn planMount(alloc: Allocator, cfg: *const Config) !Step {
     var c: std.ArrayList(Cmd) = .empty;
     const root = rootMountArgs(alloc, cfg);
@@ -399,14 +492,41 @@ fn planMount(alloc: Allocator, cfg: *const Config) !Step {
     else
         try c.append(alloc, argv(alloc, &.{ "mount", root.dev, "/mnt/gentoo" }, "mount root"));
 
+    if (cfg.disk.scheme == .manual) {
+        // Non-root mounts in path-depth order so parents mount first
+        // (/boot before /boot/efi).
+        const parts = cfg.disk.partitions;
+        var idxs: std.ArrayList(u32) = .empty;
+        for (parts, 0..) |p, i| {
+            if (p.mount.len > 0 and !std.mem.eql(u8, p.mount, "/"))
+                try idxs.append(alloc, @intCast(i));
+        }
+        std.mem.sort(u32, idxs.items, parts, struct {
+            fn lt(ps: []const config.Partition, a: u32, b: u32) bool {
+                return mountDepth(ps[a].mount) < mountDepth(ps[b].mount);
+            }
+        }.lt);
+        for (idxs.items) |i| {
+            const p = parts[i];
+            const target = s(alloc, "/mnt/gentoo{s}", .{p.mount});
+            try c.append(alloc, argv(alloc, &.{ "mkdir", "-p", target }, s(alloc, "{s} mountpoint", .{p.mount})));
+            try c.append(alloc, argv(alloc, &.{ "mount", partPath(alloc, cfg.disk.device, i + 1), target }, s(alloc, "mount {s}", .{p.mount})));
+        }
+        for (parts, 0..) |p, i|
+            if (std.mem.eql(u8, p.fs, "swap"))
+                try c.append(alloc, argv(alloc, &.{ "swapon", partPath(alloc, cfg.disk.device, @intCast(i + 1)) }, "enable swap"));
+        try c.append(alloc, .{ .note = "bind mounts (/proc /sys /dev /run) happen at enter-chroot" });
+        return step(alloc, "mount", "Mount target", c);
+    }
+
     if (cfg.disk.boot_part) {
         try c.append(alloc, argv(alloc, &.{ "mkdir", "-p", "/mnt/gentoo/boot" }, "/boot mountpoint"));
         try c.append(alloc, argv(alloc, &.{ "mount", partPath(alloc, cfg.disk.device, bootPartIdx(cfg)), "/mnt/gentoo/boot" }, "mount /boot"));
     }
 
-    if (cfg.boot_mode == .uefi) {
-        const esp = partPath(alloc, cfg.disk.device, 1);
-        const esp_target = if (cfg.system.uki or config.resolveBootloader(cfg) == .@"systemd-boot") "/mnt/gentoo/efi" else "/mnt/gentoo/efi";
+    if (espPartIdx(cfg)) |esp_n| {
+        const esp = partPath(alloc, cfg.disk.device, esp_n);
+        const esp_target = espMountPoint(alloc, cfg);
         try c.append(alloc, argv(alloc, &.{ "mkdir", "-p", esp_target }, "ESP mountpoint"));
         try c.append(alloc, argv(alloc, &.{ "mount", esp, esp_target }, "mount ESP"));
     }
@@ -415,12 +535,12 @@ fn planMount(alloc: Allocator, cfg: *const Config) !Step {
         try c.append(alloc, argv(alloc, &.{ "swapon", partPath(alloc, cfg.disk.device, swap_n) }, "enable swap"));
     }
     // LVM thin home LV (non-btrfs roots only).
-    if (cfg.disk.lvm and cfg.disk.home_part and cfg.disk.root_fs != .btrfs) {
+    if (cfg.disk.lvm and cfg.disk.home_part and rootFsOf(cfg) != .btrfs) {
         try c.append(alloc, argv(alloc, &.{ "mkdir", "-p", "/mnt/gentoo/home" }, "/home mountpoint"));
         try c.append(alloc, argv(alloc, &.{ "mount", "/dev/vg0/home", "/mnt/gentoo/home" }, "mount home LV"));
     }
     // btrfs: mount the home + snapshots subvolumes created earlier.
-    if (cfg.disk.root_fs == .btrfs) {
+    if (rootFsOf(cfg) == .btrfs) {
         const dev = root.dev;
         try c.append(alloc, argv(alloc, &.{ "mkdir", "-p", "/mnt/gentoo/home", "/mnt/gentoo/.snapshots" }, "subvol mountpoints"));
         try c.append(alloc, argv(alloc, &.{ "mount", "-o", "subvol=@home,compress=zstd:1,noatime", dev, "/mnt/gentoo/home" }, "mount @home"));
@@ -590,7 +710,7 @@ fn packageUse(alloc: Allocator, cfg: *const Config) ![]const u8 {
     return aw.written();
 }
 
-fn planPortage(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !Step {
+fn planPortage(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, seed: u128) !Step {
     var c: std.ArrayList(Cmd) = .empty;
     try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/make.conf", try makeConf(alloc, cfg, env)));
     try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/package.use/installer", try packageUse(alloc, cfg)));
@@ -630,11 +750,13 @@ fn planPortage(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !S
             try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/binrepos.conf/gentoobinhost.conf", s(alloc, "[gentoobinhost]\npriority = 9999\nsync-uri = https://distfiles.gentoo.org/releases/{s}/binpackages/23.0/{s}/\n", .{ @tagName(cfg.arch), abi_dir })));
         }
     }
-    // LUKS root: crypttab names the GPT partlabel (-cN:root). Written here
-    // — before the kernel emerge — so installkernel's initramfs generation
-    // (dracut --hostonly) picks it up.
+    // LUKS root: crypttab names the partition by the PARTUUID we assign
+    // at sgdisk time (manual-layout rows carry user-chosen partlabels,
+    // so -cN:root can't be relied on). Written here — before the kernel
+    // emerge — so installkernel's initramfs generation (dracut
+    // --hostonly) picks it up.
     if (cfg.disk.luks)
-        try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/crypttab", "cryptroot /dev/disk/by-partlabel/root none luks\n"));
+        try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/crypttab", s(alloc, "cryptroot /dev/disk/by-partuuid/{s} none luks\n", .{partGuid(alloc, seed, rootPartIdx(cfg))})));
     return step(alloc, "portage-config", "Generate portage config", c);
 }
 
@@ -746,7 +868,23 @@ fn planKernel(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !St
             .chroot = true,
             .desc = "dist kernel (compiled)",
         } }),
-        .manual => try c.append(alloc, .{ .note = "manual kernel: emerge gentoo-sources + user config (expert flow)" }),
+        .manual => {
+            // gentoo-sources + the user's .config — the install at the
+            // end runs installkernel, whose dracut hook generates the
+            // initramfs and whose staging hook lands it on the boot
+            // volume like any other kernel.
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-kernel/gentoo-sources", "sys-devel/bc", "sys-devel/bison", "sys-devel/flex", "dev-libs/elfutils", "dev-libs/openssl" }),
+                .chroot = true,
+                .desc = "gentoo-sources + kernel build deps",
+            } });
+            try c.append(alloc, argv(alloc, &.{ "cp", cfg.system.kernel_config, "/mnt/gentoo/tmp/kernel.config" }, "stage .config into target"));
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", "eselect kernel set 1 && cp /tmp/kernel.config \"$(readlink -f /usr/src/linux)/.config\" && make -C /usr/src/linux olddefconfig && make -C /usr/src/linux -j\"$(nproc)\" && make -C /usr/src/linux modules_install && make -C /usr/src/linux install" }),
+                .chroot = true,
+                .desc = "build + install kernel from kernel_config (olddefconfig → make → install)",
+            } });
+        },
     }
     // GPU driver packages — resolve `auto` the same way make.conf's
     // VIDEO_CARDS / ACCEPT_LICENSE do (Turing+ → nvidia-open).
@@ -803,6 +941,31 @@ fn planFstab(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
     // kernel /dev/sdX names can shift across renumbering.
     const root_ident = rootIdent(alloc, cfg, seed);
     try w.writeAll("# generated by gentoo-installer (persistent ids)\n");
+    if (cfg.disk.scheme == .manual) {
+        // Every listed row maps to its assigned PARTUUID; root uses the
+        // mapper name under LUKS.
+        for (cfg.disk.partitions, 0..) |p, i| {
+            const n: u32 = @intCast(i + 1);
+            if (std.mem.eql(u8, p.fs, "swap"))
+                try w.print("{s}\tnone\tswap\tsw\t0 0\n", .{partIdent(alloc, seed, n)});
+            if (p.mount.len == 0) continue;
+            const ident = if (std.mem.eql(u8, p.mount, "/")) root_ident else partIdent(alloc, seed, n);
+            const opts = if (std.mem.eql(u8, p.mount, "/") and root.opts.len > 0)
+                s(alloc, "{s},defaults", .{root.opts})
+            else
+                "defaults";
+            try w.print("{s}\t{s}\t{s}\t{s}\t0 {s}\n", .{ ident, p.mount, p.fs, opts, if (std.mem.eql(u8, p.mount, "/")) "1" else "2" });
+        }
+        // btrfs root: the subvol mounts are part of the invariant layout.
+        if (rootFsOf(cfg) == .btrfs) {
+            try w.print("{s}\t/home\tbtrfs\tsubvol=@home,compress=zstd:1,noatime\t0 2\n", .{root_ident});
+            try w.print("{s}\t/.snapshots\tbtrfs\tsubvol=@snapshots,compress=zstd:1,noatime\t0 2\n", .{root_ident});
+        }
+        if (cfg.disk.swap == .zram)
+            try w.writeAll("# zram swap configured via /etc/systemd/zram-generator.conf or OpenRC zram service\n");
+        try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/fstab", aw.written()));
+        return step(alloc, "fstab", "Generate fstab", c);
+    }
     try w.print("{s}\t/\t{s}\t{s}defaults\t0 1\n", .{ root_ident, @tagName(cfg.disk.root_fs), if (root.opts.len > 0) s(alloc, "{s},", .{root.opts}) else "" });
     if (cfg.boot_mode == .uefi)
         try w.print("{s}\t/efi\tvfat\tdefaults\t0 2\n", .{partIdent(alloc, seed, 1)});
@@ -1053,12 +1216,12 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
             } });
             if (cfg.boot_mode == .uefi) {
                 try c.append(alloc, .{ .exec = .{
-                    .argv = try alloc.dupe([]const u8, &.{ "mkdir", "-p", "/efi/EFI/BOOT" }),
+                    .argv = try alloc.dupe([]const u8, &.{ "mkdir", "-p", s(alloc, "{s}/EFI/BOOT", .{espInTarget(cfg)}) }),
                     .chroot = true,
                     .desc = "ESP layout",
                 } });
                 try c.append(alloc, .{ .exec = .{
-                    .argv = try alloc.dupe([]const u8, &.{ "cp", s(alloc, "/usr/share/limine/{s}", .{efiBootFile(cfg)}), "/efi/EFI/BOOT/" }),
+                    .argv = try alloc.dupe([]const u8, &.{ "cp", s(alloc, "/usr/share/limine/{s}", .{efiBootFile(cfg)}), s(alloc, "{s}/EFI/BOOT/", .{espInTarget(cfg)}) }),
                     .chroot = true,
                     .desc = s(alloc, "limine EFI binary ({s})", .{efiBootFile(cfg)}),
                 } });
@@ -1074,7 +1237,7 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
             // Limine's boot volume: the ESP under UEFI, /boot under BIOS
             // (a separate ext4 partition when disk.boot_part, else the
             // root fs — validation restricts bare-root BIOS to ext4).
-            const stage_dir = if (cfg.boot_mode == .uefi) "/efi" else "/boot";
+            const stage_dir = if (cfg.boot_mode == .uefi) espInTarget(cfg) else "/boot";
             try c.append(alloc, wf(alloc, s(alloc, "/mnt/gentoo{s}/limine.conf", .{stage_dir}), limineConf(alloc, cfg, seed)));
             // kernel-install hook: stage kernel+initramfs at the fixed
             // paths limine.conf references. installkernel invokes this on
@@ -1111,7 +1274,7 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
             const target = if (cfg.boot_mode == .uefi) grubEfiTarget(cfg) else "i386-pc";
             if (cfg.boot_mode == .uefi)
                 try c.append(alloc, .{ .exec = .{
-                    .argv = try alloc.dupe([]const u8, &.{ "grub-install", s(alloc, "--target={s}", .{grubEfiTarget(cfg)}), "--efi-directory=/efi" }),
+                    .argv = try alloc.dupe([]const u8, &.{ "grub-install", s(alloc, "--target={s}", .{grubEfiTarget(cfg)}), s(alloc, "--efi-directory={s}", .{espInTarget(cfg)}) }),
                     .chroot = true,
                     .desc = "grub-install UEFI",
                 } })
@@ -1138,12 +1301,12 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
             try c.append(alloc, .{ .exec = .{
                 .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "k=$(ls -t /boot/vmlinuz-* /boot/kernel-* /boot/*/*/vmlinuz /boot/*/*/linux 2>/dev/null | head -n1); " ++
                     "[ -n \"$k\" ] || {{ echo 'no kernel to stage' >&2; exit 1; }}; " ++
-                    "mkdir -p /efi/loader/entries && cp -f \"$k\" /efi/vmlinuz || exit 1{s}", .{initrdStage(alloc, cfg, "/efi")}) }),
+                    "mkdir -p {s}/loader/entries && cp -f \"$k\" {s}/vmlinuz || exit 1{s}", .{ espInTarget(cfg), espInTarget(cfg), initrdStage(alloc, cfg, espInTarget(cfg)) }) }),
                 .chroot = true,
                 .desc = "stage kernel + initramfs on the ESP",
             } });
-            try c.append(alloc, wf(alloc, "/mnt/gentoo/efi/loader/loader.conf", "default gentoo.conf\ntimeout 4\n"));
-            try c.append(alloc, wf(alloc, "/mnt/gentoo/efi/loader/entries/gentoo.conf", s(alloc, "title   Gentoo Linux\nlinux   /vmlinuz\n{s}options {s}\n", .{ if (cfg.system.initramfs == .none) "" else "initrd  /initramfs.img\n", kernelArgs(alloc, cfg, seed) })));
+            try c.append(alloc, wf(alloc, s(alloc, "/mnt/gentoo{s}/loader/loader.conf", .{espInTarget(cfg)}), "default gentoo.conf\ntimeout 4\n"));
+            try c.append(alloc, wf(alloc, s(alloc, "/mnt/gentoo{s}/loader/entries/gentoo.conf", .{espInTarget(cfg)}), s(alloc, "title   Gentoo Linux\nlinux   /vmlinuz\n{s}options {s}\n", .{ if (cfg.system.initramfs == .none) "" else "initrd  /initramfs.img\n", kernelArgs(alloc, cfg, seed) })));
             // kernel-install hook keeps the entry current on upgrades.
             try c.append(alloc, .{ .write_file = .{
                 .path = "/mnt/gentoo/etc/kernel/install.d/91-sd-boot.install",
@@ -1153,10 +1316,10 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
                     \\# onto the ESP at the fixed paths the loader entry uses.
                     \\# args: $1=command $2=kver $3=entry_dir_abs $4=kernel_image
                     \\[ "$1" = add ] || exit 0
-                    \\cp -f "$4" /efi/vmlinuz || exit 1
+                    \\cp -f "$4" {s}/vmlinuz || exit 1
                     \\{s}
                     \\exit 0
-                , .{hookInitrd(alloc, cfg, "/efi/initramfs.img")}),
+                , .{ espInTarget(cfg), hookInitrd(alloc, cfg, s(alloc, "{s}/initramfs.img", .{espInTarget(cfg)})) }),
                 .mode = 0o755,
             } });
         },
@@ -1172,16 +1335,16 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
             try c.append(alloc, .{ .exec = .{
                 .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "k=$(ls -t /boot/vmlinuz-* /boot/kernel-* /boot/*/*/vmlinuz /boot/*/*/linux 2>/dev/null | head -n1); " ++
                     "[ -n \"$k\" ] || {{ echo 'no kernel to stage' >&2; exit 1; }}; " ++
-                    "cp -f \"$k\" /efi/vmlinuz || exit 1{s}", .{initrdStage(alloc, cfg, "/efi")}) }),
+                    "cp -f \"$k\" {s}/vmlinuz || exit 1{s}", .{ espInTarget(cfg), initrdStage(alloc, cfg, espInTarget(cfg)) }) }),
                 .chroot = true,
                 .desc = "stage kernel + initramfs on the ESP",
             } });
             try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "esp=$(findmnt -no SOURCE /efi) || exit 1; " ++
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "esp=$(findmnt -no SOURCE {s}) || exit 1; " ++
                     "d=$(lsblk -no PKNAME \"$esp\"); p=$(lsblk -no PARTN \"$esp\"); " ++
                     "[ -n \"$d\" ] && [ -n \"$p\" ] || exit 1; " ++
                     "efibootmgr -c -d /dev/$d -p $p -L Gentoo -l '\\vmlinuz' " ++
-                    "-u '{s}{s}'", .{ kernelArgs(alloc, cfg, seed), if (cfg.system.initramfs == .none) "" else " initrd=\\initramfs.img" }) }),
+                    "-u '{s}{s}'", .{ espInTarget(cfg), kernelArgs(alloc, cfg, seed), if (cfg.system.initramfs == .none) "" else " initrd=\\initramfs.img" }) }),
                 .chroot = true,
                 .desc = "efibootmgr: create Gentoo NVRAM entry",
             } });
@@ -1196,7 +1359,7 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
             // the mounted ESP and creates the NVRAM entry; --alldrivers
             // lets it read kernels off /boot (btrfs/ext4/xfs).
             try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "refind-install", "--alldrivers", "--usedefault", s(alloc, "{s}", .{partPath(alloc, cfg.disk.device, 1)}) }),
+                .argv = try alloc.dupe([]const u8, &.{ "refind-install", "--alldrivers", "--usedefault", partPath(alloc, cfg.disk.device, espPartIdx(cfg) orelse 1) }),
                 .chroot = true,
                 .desc = "install rEFInd to ESP + NVRAM entry",
             } });
@@ -1226,7 +1389,7 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
             try c.append(alloc, .{
                 .exec = .{
                     // missing globs skip silently; a FAILED sign propagates.
-                    .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", "rc=0; for f in /efi/EFI/BOOT/*.EFI /efi/vmlinuz /efi/EFI/Linux/*.efi; do [ -f \"$f\" ] || continue; sbctl sign -s \"$f\" || rc=1; done; exit $rc" }),
+                    .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "rc=0; for f in {s}/EFI/BOOT/*.EFI {s}/vmlinuz {s}/EFI/Linux/*.efi; do [ -f \"$f\" ] || continue; sbctl sign -s \"$f\" || rc=1; done; exit $rc", .{ espInTarget(cfg), espInTarget(cfg), espInTarget(cfg) }) }),
                     .chroot = true,
                     .desc = "sign bootloader + kernels (sbctl)",
                 },
