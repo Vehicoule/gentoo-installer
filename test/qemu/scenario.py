@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """M5 scenario harness — drive variant installs end-to-end under QEMU.
 
-Usage: scenario.py <luks|bios|musl|dinit|runit|alongside> [phase-a|phase-b]   (default: both phases)
+Usage: scenario.py <luks|bios|musl|dinit|runit|alongside|shim> [phase-a|phase-b]   (default: both phases)
 
   luks — UEFI install with disk.luks=true; phase B expects the dracut
          passphrase prompt on serial, enters it, reaches login.
@@ -17,6 +17,12 @@ Usage: scenario.py <luks|bios|musl|dinit|runit|alongside> [phase-a|phase-b]   (d
          Boot Manager + EFI/BOOT fallback and an ext4 data partition;
          the install shrinks the ext4, appends a Gentoo root, and must
          leave every existing ESP file and the shrunk fs's data intact.
+  shim — UEFI install with secure_boot=shim + grub: phase A verifies
+         the MOK chain (shimx64/mmx64/signed grubx64 on the ESP, mok.der
+         generated, mokutil --import queued) then CANCELS the queued
+         enrollment — MokManager's enroll UI is graphical and -nographic
+         can't drive it; OVMF's secure boot is off anyway, so phase B
+         still proves shim→grub→kernel boots to login.
 """
 import os, secrets, shutil, subprocess, sys
 import pexpect
@@ -33,6 +39,7 @@ LUKS_PASS = os.environ.get("GI_LUKS_PASS") or secrets.token_urlsafe(12)
 USER = os.environ.get("GI_USER", "gentoo")
 USER_PW = os.environ.get("GI_USER_PASS") or secrets.token_urlsafe(12)
 ROOT_PW = os.environ.get("GI_ROOT_PASS") or secrets.token_urlsafe(12)
+MOK_PASS = os.environ.get("GI_MOK_PASS") or secrets.token_urlsafe(12)
 
 def iso_label():
     return subprocess.check_output(
@@ -80,7 +87,8 @@ def phase_a(scn, disk):
     # holds a real password.
     ops_txt = open(os.path.join(HERE, "ops-%s.jsonl" % scn)).read()
     for k, v in {"@USER@": USER, "@USER_PASS@": USER_PW,
-                 "@ROOT_PASS@": ROOT_PW, "@LUKS_PASS@": LUKS_PASS}.items():
+                 "@ROOT_PASS@": ROOT_PW, "@LUKS_PASS@": LUKS_PASS,
+                 "@MOK_PASS@": MOK_PASS}.items():
         ops_txt = ops_txt.replace(k, v)
     with open(os.path.join(WWW, "ops-%s.jsonl" % scn), "w") as f:
         f.write(ops_txt)
@@ -114,6 +122,12 @@ def phase_a(scn, disk):
           "[ -f \"$f\" ] || continue; grep -q ttyS0 \"$f\" || "
           "sed -i 's|^\\s*cmdline:|    cmdline: console=ttyS0,115200|' \"$f\"; done; "
           "grep -rn cmdline /mnt/gentoo/efi/limine.conf /mnt/gentoo/boot/limine.conf 2>/dev/null", timeout=60)
+    # grub's menu renders to gfxterm (VGA) and its kernel lines carry no
+    # serial console — patch both grub.cfg copies for -nographic boots.
+    sh(c, "for f in /mnt/gentoo/boot/grub/grub.cfg /mnt/gentoo/efi/EFI/gentoo/grub.cfg; do "
+          "[ -f \"$f\" ] || continue; grep -q ttyS0 \"$f\" || "
+          "sed -i 's|root=[^ ]*|& console=ttyS0,115200|' \"$f\"; done; "
+          "echo ZZ-GOT-0", pat=DONE, timeout=30)
     # openrc stage3s ship the serial getty commented out — enable a
     # 115200 ttyS0 agetty so phase B sees a login prompt (harmless on
     # systemd, which has no inittab to match).
@@ -130,6 +144,19 @@ def phase_a(scn, disk):
           "> /mnt/gentoo/etc/dinit.d/ttyS0 && "
           "ln -sf ../ttyS0 /mnt/gentoo/etc/dinit.d/boot.d/ttyS0; }; "
           "echo ZZ-GOT-0", pat=DONE, timeout=30)
+    # shim: verify the staged chain + the queued enrollment, then drop
+    # the pending MokNew var — MokManager renders to the graphics
+    # console, which -nographic cannot reach; OVMF SB is off anyway.
+    if scn == "shim":
+        sh(c, "ls /mnt/gentoo/efi/EFI/gentoo/shimx64.efi /mnt/gentoo/efi/EFI/gentoo/mmx64.efi "
+              "/mnt/gentoo/efi/EFI/gentoo/grubx64.efi /mnt/gentoo/etc/shim/mok.der && "
+              "sbverify --list /mnt/gentoo/efi/EFI/gentoo/grubx64.efi 2>/dev/null | head -4; "
+              # prove the enrollment queued, then revoke it — MokManager
+              # renders to the VGA console which -nographic can't reach.
+              "chroot /mnt/gentoo mokutil --list-new | grep -q . && "
+              "chroot /mnt/gentoo mokutil --revoke-import && "
+              "! chroot /mnt/gentoo mokutil --list-new | grep -q .; "
+              "echo ZZ-GOT-$?", pat=DONE, timeout=120)
     # runit likewise — a supervised agetty on ttyS0 under runsvdir.
     sh(c, "[ -d /mnt/gentoo/etc/sv ] && { "
           "mkdir -p /mnt/gentoo/etc/sv/agetty-ttyS0 && "
@@ -175,6 +202,15 @@ def phase_b(scn, disk):
                      b"echo DATA-OK-$?; "
                      b"df -m /tmp/osd | tail -1; efibootmgr | grep -i gentoo; "
                      b"echo NVRAM-$?; ")
+    if scn == "shim":
+        # The booted chain went shim→grubx64→kernel; the 'Gentoo (shim)'
+        # NVRAM entry + staged ESP files + mok.der must all be there.
+        su_checks = (b"efibootmgr | grep -i shim; echo NVRAM-$?; "
+                     b"ls /efi/EFI/gentoo/shimx64.efi /efi/EFI/gentoo/mmx64.efi "
+                     b"/efi/EFI/gentoo/grubx64.efi /etc/shim/mok.der >/dev/null; "
+                     b"echo SHIMFILES-$?; "
+                     # the enrollment was cancelled in phase A — nothing pending
+                     b"mokutil --list-new 2>/dev/null | grep -q . ; [ $? -eq 1 ]; echo MOKDONE-$?; ")
     # runit/dinit don't answer util-linux poweroff (no sysvinit compat
     # ioctl chain by default) — sysrq 'o' powers off regardless of PID1.
     c.sendline(b"su - root -c 'echo SU-OK; " + su_checks +
@@ -190,6 +226,13 @@ def phase_b(scn, disk):
         print("== shrunk fs data intact")
         c.expect(b"NVRAM-0", timeout=20)
         print("== efibootmgr entry present")
+    if scn == "shim":
+        c.expect(b"NVRAM-0", timeout=20)
+        print("== shim NVRAM entry")
+        c.expect(b"SHIMFILES-0", timeout=20)
+        print("== shim chain files staged")
+        c.expect(b"MOKDONE-0", timeout=20)
+        print("== no pending MOK enrollment")
     c.expect(pexpect.EOF, timeout=60)
     log.close()
     print("== PHASE B PASS — %s scenario verified" % scn)

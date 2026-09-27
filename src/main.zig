@@ -191,14 +191,6 @@ pub fn main(init: std.process.Init) !void {
         try errw.flush();
         std.process.exit(2);
     }
-    // shim needs the MOK-enroll + signed-grub chain — not built in M1.
-    // (sbctl's create/enroll/sign sequence is complete and fails loudly
-    // when the firmware isn't in Setup Mode.)
-    if (cmd == .run and !dry_run and cfg.security.secure_boot == .shim) {
-        try errw.print("secure_boot=shim is not executable yet — the shim/MOK flow lands in M6; use sbctl or --dry-run to preview\n", .{});
-        try errw.flush();
-        std.process.exit(2);
-    }
     // Secrets are exec gates, not plan gates — an exported answer file
     // previews fine but can't run until the passphrase is provided.
     if (cmd == .run and !dry_run) if (engine.config.execPrechecks(&cfg)) |e| {
@@ -817,10 +809,6 @@ fn doInstall(io: std.Io, alloc: std.mem.Allocator, wiz: *engine.wizard.Wizard, o
         }
         if (cfg.system.init == .s6) {
             try writeErr(out, req, "init=s6 is not executable yet — s6-linux-init backend lands in a later milestone");
-            return;
-        }
-        if (cfg.security.secure_boot == .shim) {
-            try writeErr(out, req, "secure_boot=shim is not executable yet — M6");
             return;
         }
         if (engine.config.execPrechecks(cfg)) |e| {

@@ -879,15 +879,21 @@ fn makeConf(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) ![]co
         if (on) try w.print(" {s}", .{flag}) else try w.print(" -{s}", .{flag});
     }
     // Secure boot + out-of-tree modules: linux-mod-r1 signs at merge
-    // time when modules-sign is on and the sbctl db key is wired up.
-    const sign_mods = cfg.security.secure_boot == .sbctl and switch (resolveGpuDriver(cfg, env)) {
+    // time when modules-sign is on and the db (sbctl) or MOK (shim)
+    // key is wired up.
+    const sign_mods = cfg.security.secure_boot != .off and switch (resolveGpuDriver(cfg, env)) {
         .@"nvidia-open", .@"nvidia-drivers" => true,
         else => false,
     };
     if (sign_mods) try w.writeAll(" modules-sign");
     try w.writeAll("\"\n");
-    if (sign_mods)
-        try w.writeAll("MODULES_SIGN_KEY=\"/var/lib/sbctl/keys/db/db.key\"\nMODULES_SIGN_CERT=\"/var/lib/sbctl/keys/db/db.pem\"\nMODULES_SIGN_HASH=\"sha512\"\n");
+    if (sign_mods) {
+        const key_path: []const u8 = switch (cfg.security.secure_boot) {
+            .shim => "/etc/shim/mok",
+            else => "/var/lib/sbctl/keys/db/db",
+        };
+        try w.print("MODULES_SIGN_KEY=\"{s}.key\"\nMODULES_SIGN_CERT=\"{s}.pem\"\nMODULES_SIGN_HASH=\"sha512\"\n", .{ key_path, key_path });
+    }
     return aw.written();
 }
 
@@ -933,6 +939,10 @@ fn packageUse(alloc: Allocator, cfg: *const Config) ![]const u8 {
     if (cfg.system.initramfs == .none)
         try w.writeAll("sys-kernel/gentoo-kernel-bin -initramfs\nsys-kernel/gentoo-kernel -initramfs\n");
     if (cfg.system.uki) try w.writeAll("sys-kernel/installkernel uki\n");
+    // shim chain loads a signed standalone grub — the ebuild only ships
+    // grub-<arch>.efi.signed under USE=secureboot.
+    if (cfg.security.secure_boot == .shim)
+        try w.writeAll("sys-boot/grub secureboot\n");
     // LUKS unlock in a systemd initramfs runs through systemd-cryptsetup,
     // which Gentoo only builds under USE=cryptsetup — stage3s ship without
     // it, so the flag must be set and systemd rebuilt before dracut runs.
@@ -1818,7 +1828,12 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env,
             const target = if (cfg.boot_mode == .uefi) grubEfiTarget(cfg) else "i386-pc";
             if (cfg.boot_mode == .uefi)
                 try c.append(alloc, .{ .exec = .{
-                    .argv = try alloc.dupe([]const u8, &.{ "grub-install", s(alloc, "--target={s}", .{grubEfiTarget(cfg)}), s(alloc, "--efi-directory={s}", .{espInTarget(cfg)}) }),
+                    // shim owns the NVRAM entry — under --no-nvram
+                    // grub-install only lays modules + boot files.
+                    .argv = if (cfg.security.secure_boot == .shim)
+                        try alloc.dupe([]const u8, &.{ "grub-install", s(alloc, "--target={s}", .{grubEfiTarget(cfg)}), s(alloc, "--efi-directory={s}", .{espInTarget(cfg)}), "--no-nvram" })
+                    else
+                        try alloc.dupe([]const u8, &.{ "grub-install", s(alloc, "--target={s}", .{grubEfiTarget(cfg)}), s(alloc, "--efi-directory={s}", .{espInTarget(cfg)}) }),
                     .chroot = true,
                     .desc = "grub-install UEFI",
                 } })
@@ -1943,11 +1958,117 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env,
                 },
             });
         },
-        .shim => try c.append(alloc, .{ .exec = .{
-            .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-boot/shim", "app-crypt/sbsigntools" }),
-            .chroot = true,
-            .desc = "shim + sbsigntools (secure boot)",
-        } }),
+        // shim+MOK (grub only — validation gates it): the MS-signed
+        // shim + MokManager stage on the ESP; grub[secureboot]'s signed
+        // standalone lands as grubx64.efi (shim's hardcoded second stage);
+        // a generated MOK key signs it and every staged kernel; mokutil
+        // queues the cert so MokManager can enroll it at first boot.
+        .shim => {
+            const dir = s(alloc, "{s}/EFI/gentoo", .{espInTarget(cfg)});
+            const arm64 = cfg.arch == .arm64;
+            const shim_src: []const u8 = if (arm64) "BOOTAA64.EFI" else "BOOTX64.EFI";
+            const mm_src: []const u8 = if (arm64) "mmaa64.efi" else "mmx64.efi";
+            const shim_dst: []const u8 = if (arm64) "shimaa64.efi" else "shimx64.efi";
+            const grub_src: []const u8 = if (arm64) "grub-arm64.efi.signed" else "grub-x86_64.efi.signed";
+            const grub_dst: []const u8 = if (arm64) "grubaa64.efi" else "grubx64.efi";
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-boot/shim", "sys-boot/mokutil", "app-crypt/sbsigntools", "sys-boot/efibootmgr" }),
+                .chroot = true,
+                .desc = "shim + mokutil + sbsigntools",
+            } });
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c",
+                    "umask 077 && mkdir -p /etc/shim && " ++
+                    "openssl req -new -x509 -newkey rsa:2048 -keyout /etc/shim/mok.key " ++
+                    "-out /etc/shim/mok.pem -days 3650 -nodes -subj '/CN=gentoo-installer-mok/' && " ++
+                    "openssl x509 -in /etc/shim/mok.pem -outform der -out /etc/shim/mok.der" }),
+                .chroot = true,
+                .desc = "generate the MOK key pair",
+            } });
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc,
+                    // Gentoo's prebuilt grub carries its own signature
+                    // that nothing trusts yet — sbsign adds ours (MOK)
+                    // on top; shim accepts any verifiable signature.
+                    "mkdir -p {s} && cp /usr/share/shim/{s} {s}/{s} && cp /usr/share/shim/{s} {s}/{s} && " ++
+                    "sbsign --key /etc/shim/mok.key --cert /etc/shim/mok.pem --output {s}/{s} /usr/lib/grub/{s}",
+                    .{ dir, shim_src, dir, shim_dst, mm_src, dir, mm_src, dir, grub_dst, grub_src }) }),
+                .chroot = true,
+                .desc = "stage shim + MokManager + signed grub on the ESP",
+            } });
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc,
+                    // grub's linux loader verifies the PE signature via
+                    // shim — sign every staged kernel copy in place.
+                    "rc=0; for f in {s}/vmlinuz /boot/vmlinuz-* /boot/kernel-* /boot/*/*/vmlinuz /boot/*/*/linux; do " ++
+                    "[ -f \"$f\" ] || continue; sbsign --key /etc/shim/mok.key --cert /etc/shim/mok.pem " ++
+                    "--output \"$f.signed\" \"$f\" && mv -f \"$f.signed\" \"$f\" || rc=1; done; exit $rc",
+                    .{ espInTarget(cfg) }) }),
+                .chroot = true,
+                .desc = "sign kernels with the MOK key",
+            } });
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "esp=$(findmnt -no SOURCE {s}) || exit 1; " ++
+                    "d=$(lsblk -no PKNAME \"$esp\"); p=$(lsblk -no PARTN \"$esp\"); " ++
+                    "[ -n \"$d\" ] && [ -n \"$p\" ] || exit 1; " ++
+                    "efibootmgr -c -d /dev/$d -p $p -L 'Gentoo (shim)' -l '\\EFI\\gentoo\\{s}'", .{ espInTarget(cfg), shim_dst }) }),
+                .chroot = true,
+                .desc = "efibootmgr: shim NVRAM entry",
+            } });
+            try c.append(alloc, .{ .exec = .{
+                // --root-pw uses the root password as the one-time
+                // enrollment credential — headless-safe (mokutil has no
+                // --password-file) and the user already knows it.
+                // The queued request MUST be visible afterwards —
+                // without it MokManager never enrolls the cert and the
+                // signed grub is refused under real secure boot.
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c",
+                    "mokutil --import /etc/shim/mok.der --root-pw && " ++
+                    "mokutil --list-new 2>/dev/null | grep -q ." }),
+                .chroot = true,
+                .desc = "mokutil: queue MOK enrollment for first boot",
+            } });
+            // The prebuilt standalone grub resolves $prefix to the dir
+            // it loaded from — it needs grub.cfg next to grubx64.efi.
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "cp", "-f", "/boot/grub/grub.cfg", s(alloc, "{s}/grub.cfg", .{dir}) }),
+                .chroot = true,
+                .desc = "grub.cfg onto the ESP (shim grub reads $prefix/grub.cfg)",
+            } });
+            // kernel-install hook: future kernels must carry a MOK
+            // signature or shim's grub refuses them.
+            try c.append(alloc, .{ .write_file = .{
+                .path = "/mnt/gentoo/etc/kernel/install.d/90-mok-sign.install",
+                .content =
+                \\#!/bin/sh
+                \\# gentoo-installer shim hook: sign new kernels with the
+                \\# MOK key so the shim-chain grub verifies them.
+                \\# args: $1=command $2=kver $3=entry_dir_abs $4=kernel_image
+                \\[ "$1" = add ] || exit 0
+                \\[ -f /etc/shim/mok.key ] || exit 0
+                \\sbsign --key /etc/shim/mok.key --cert /etc/shim/mok.pem --output "$4.signed" "$4" && mv -f "$4.signed" "$4" || exit 1
+                \\exit 0
+                ,
+                .mode = 0o755,
+            } });
+            // grub.cfg lives at /boot/grub but the standalone shim grub
+            // reads $prefix/grub.cfg on the ESP — keep them in sync on
+            // every kernel add/remove (the file may change then).
+            try c.append(alloc, .{ .write_file = .{
+                .path = "/mnt/gentoo/etc/kernel/install.d/91-shim-grubcfg.install",
+                .content = s(alloc,
+                    \\#!/bin/sh
+                    \\# gentoo-installer shim hook: grub.cfg updates (new
+                    \\# kernel entries) must reach the ESP copy the
+                    \\# standalone grub actually reads.
+                    \\[ "$1" = add ] || [ "$1" = remove ] || exit 0
+                    \\cp -f /boot/grub/grub.cfg {s}/grub.cfg 2>/dev/null || true
+                    \\exit 0
+                , .{dir}),
+                .mode = 0o755,
+            } });
+            try c.append(alloc, .{ .note = "secure_boot=shim: at the first boot MokManager runs — Enroll MOK → Continue → Yes → enter the ROOT password — then the signed chain boots" });
+        },
         .off => {},
     }
     return step(alloc, "bootloader", "Install bootloader", c);

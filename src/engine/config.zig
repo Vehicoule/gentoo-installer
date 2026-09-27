@@ -870,6 +870,12 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier, env: 
 
     if (cfg.security.secure_boot == .shim and resolveBootloader(cfg) != .grub)
         try errs.append(alloc, "secure_boot=shim is only supported with grub");
+    if (cfg.security.secure_boot == .shim and cfg.arch == .riscv64)
+        try errs.append(alloc, "secure_boot=shim needs a shim-signed arch — riscv64 has none; use secure_boot=sbctl");
+    // mokutil --root-pw enrolls with the root password — shim needs
+    // root to have one (a locked/hashless root has no enrollment cred).
+    if (cfg.security.secure_boot == .shim and (cfg.root.password_hash == null or cfg.root.lock_root))
+        try errs.append(alloc, "secure_boot=shim requires root.password — mokutil --root-pw uses it as the MOK enrollment password");
 
     if (cfg.system.privilege == .none and cfg.root.lock_root)
         try errs.append(alloc, "privilege=none with lock_root leaves no admin path");

@@ -1,0 +1,10 @@
+{"op":"detect","req":0}
+{"op":"set","field":"disk.device","value":"/dev/vda","req":1}
+{"op":"set","field":"system.bootloader","value":"grub","req":2}
+{"op":"set","field":"security.secure_boot","value":"shim","req":3}
+{"op":"set","field":"root.password","value":"@ROOT_PASS@","req":5}
+{"op":"set","field":"user.name","value":"@USER@","req":6}
+{"op":"set","field":"user.password","value":"@USER_PASS@","req":7}
+{"op":"validate","req":8}
+{"op":"install","dry_run":false,"confirm":"vda","req":9}
+{"op":"quit"}

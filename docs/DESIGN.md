@@ -309,7 +309,13 @@ lock_root = false                   # `passwd -l root` at finish (sudo-only box)
 # yield a system no one can log into.
 
 [security]
-secure_boot = "off"              # off | sbctl | shim — UEFI only
+secure_boot = "off"              # off | sbctl | shim — UEFI only;
+                               # shim = grub only, amd64/arm64 — stages
+                               # MS-signed shim + mm + MOK-signed
+                               # grubx64.efi, enrolls the MOK cert at
+                               # first boot via MokManager — the
+                               # enrollment password IS the root password
+                               # (mokutil --root-pw)
 hardening   = "hardened-selinux" # standard | hardened | hardened-selinux
                                # default ON per project direction; selects
                                # the hardened-* stage3 stem (toolchain is
