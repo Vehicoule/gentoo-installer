@@ -122,6 +122,8 @@ pub fn run(io: std.Io, alloc: Allocator, p: plan.Plan, opts: Options) !void {
         }
         if (opts.on_step) |cb| cb(opts.ctx, i + 1, p.steps.len, step.id, "started");
         try out.print("[{d:0>2}] {s}  ({s})\n", .{ i + 1, step.title, step.id });
+        var skipped_fail = false;
+        var staged: std.ArrayList([]const u8) = .empty;
         for (step.cmds) |cmd| {
             switch (cmd) {
                 .note => |n| try out.print("     note: {s}\n", .{n}),
@@ -130,9 +132,15 @@ pub fn run(io: std.Io, alloc: Allocator, p: plan.Plan, opts: Options) !void {
                     if (opts.mode == .exec) {
                         if (writeFile(io, w.path, w.content, w.mode)) {
                             journal.cmdWriteFile(step.id, w, "ok");
+                            staged.append(alloc, w.path) catch {};
                         } else |err| {
                             journal.cmdWriteFile(step.id, w, "fail");
                             if (opts.on_step) |cb| cb(opts.ctx, i + 1, p.steps.len, step.id, "failed");
+                            if (step.skippable) {
+                                try out.print("     warning: skippable step failed — continuing\n", .{});
+                                skipped_fail = true;
+                                break;
+                            }
                             return err;
                         }
                     }
@@ -156,12 +164,27 @@ pub fn run(io: std.Io, alloc: Allocator, p: plan.Plan, opts: Options) !void {
                             ew.interface.print("command failed ({s}): {s}\n", .{ e.desc, @errorName(err) }) catch {};
                             ew.interface.flush() catch {};
                             if (opts.on_step) |cb| cb(opts.ctx, i + 1, p.steps.len, step.id, "failed");
+                            if (step.skippable) {
+                                try out.print("     warning: skippable step failed — continuing\n", .{});
+                                skipped_fail = true;
+                                break;
+                            }
                             return err;
                         };
                         journal.cmdExec(step.id, e, "ok");
                     }
                 },
             }
+        }
+        if (skipped_fail) {
+            // best-effort: drop staged scripts the dead step left behind
+            for (staged.items) |sp|
+                std.Io.Dir.cwd().deleteFile(io, sp) catch {};
+            // failed skippable step is not a success — journal + observers
+            // see it as skipped, and the install continues.
+            journal.stepDone(step.id, true);
+            if (opts.on_step) |cb| cb(opts.ctx, i + 1, p.steps.len, step.id, "skipped");
+            continue;
         }
         journal.stepDone(step.id, false);
         if (opts.on_step) |cb| cb(opts.ctx, i + 1, p.steps.len, step.id, "done");

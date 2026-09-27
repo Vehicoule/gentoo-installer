@@ -39,7 +39,7 @@ pub fn main(init: std.process.Init) !void {
     const alloc = init.arena.allocator();
     const io = init.io;
 
-    var cmd: enum { none, tui, headless, run, plan, validate, detect, help } = .none;
+    var cmd: enum { none, tui, headless, run, plan, validate, detect, help, version } = .none;
     var config_path: ?[]const u8 = null;
     var preset_path: ?[]const u8 = null;
     var journal_path: []const u8 = "/tmp/gentoo-installer.journal";
@@ -68,6 +68,8 @@ pub fn main(init: std.process.Init) !void {
             const list = it.next() orelse return fatal(errw, "--skip needs a,b");
             var parts = std.mem.splitScalar(u8, list, ',');
             while (parts.next()) |p| try skips.append(alloc, p);
+        } else if (std.mem.eql(u8, arg, "--version")) {
+            cmd = .version;
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "help")) {
             cmd = .help;
         } else {
@@ -78,6 +80,11 @@ pub fn main(init: std.process.Init) !void {
     }
 
     switch (cmd) {
+        .version => {
+            try out.print("{s}\n", .{engine.version});
+            try out.flush();
+            return;
+        },
         .help, .none => {
             try out.writeAll(usage);
             try out.flush();
@@ -105,6 +112,13 @@ pub fn main(init: std.process.Init) !void {
             try errw.flush();
             std.process.exit(2);
         };
+        if (preset.?.engine_min) |min| {
+            if (engine.preset.versionLt(engine.version, min)) {
+                try errw.print("preset '{s}' needs engine >= {s} (running {s})\n", .{ preset.?.id, min, engine.version });
+                try errw.flush();
+                std.process.exit(2);
+            }
+        }
     }
 
     switch (cmd) {
@@ -294,7 +308,11 @@ pub fn main(init: std.process.Init) !void {
     }
     pkg_sets = .{ .atoms = rs.resolved.atoms, .repos = rs.resolved.repos };
 
-    const p = try engine.plan.build(alloc, &cfg, if (env_opt) |*e| e else null, pkg_sets, null);
+    const p = engine.plan.build(alloc, &cfg, if (env_opt) |*e| e else null, pkg_sets, if (preset) |*pp| pp else null, null) catch |e| {
+        try errw.print("plan build failed: {s}\n", .{@errorName(e)});
+        try errw.flush();
+        std.process.exit(1);
+    };
     try engine.runner.run(io, alloc, p, .{
         .mode = if (dry_run or cmd == .plan) .dry_run else .exec,
         .journal_path = if (cmd == .run and !dry_run) journal_path else null,
@@ -639,7 +657,7 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
                 if (at_eof) break;
                 continue;
             }
-            const p = engine.plan.build(req_alloc, &wiz.cfg, if (wiz.env) |*e| e else null, ps.sets, null) catch |e| {
+            const p = engine.plan.build(req_alloc, &wiz.cfg, if (wiz.env) |*e| e else null, ps.sets, wiz.preset, null) catch |e| {
                 var aw: std.Io.Writer.Allocating = .init(req_alloc);
                 aw.writer.print("plan build failed: {s}", .{@errorName(e)}) catch {};
                 try writeErr(out, req, aw.written());
@@ -889,7 +907,7 @@ fn doInstall(io: std.Io, alloc: std.mem.Allocator, wiz: *engine.wizard.Wizard, o
         try writeErr(out, req, aw.written());
         return;
     }
-    const p = engine.plan.build(alloc, cfg, if (env_opt) |*e| e else null, ps.sets, null) catch |e| {
+    const p = engine.plan.build(alloc, cfg, if (env_opt) |*e| e else null, ps.sets, wiz.preset, null) catch |e| {
         var aw: std.Io.Writer.Allocating = .init(alloc);
         aw.writer.print("plan build failed: {s}", .{@errorName(e)}) catch {};
         try writeErr(out, req, aw.written());

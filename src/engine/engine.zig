@@ -1,3 +1,6 @@
+/// Engine version — presets' engine_min compares against this.
+pub const version = "1.0.0";
+
 pub const toml = @import("toml.zig");
 pub const config = @import("config.zig");
 pub const detect = @import("detect.zig");
