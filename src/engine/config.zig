@@ -502,7 +502,7 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
         try errs.append(alloc, "makeconf.mirrors contains characters outside URL charset");
     // Erase-disk schemes always format — wipe=false preserves nothing.
     if (!cfg.disk.wipe and cfg.disk.scheme != .alongside and cfg.disk.scheme != .manual)
-        try errs.append(alloc, "disk.wipe=false has no effect on erase schemes — use alongside/manual to preserve data");
+        try errs.append(alloc, "disk.wipe=false has no effect on erase schemes — use alongside to preserve data");
     // Erase scheme must match the firmware boot mode (partition layout
     // and bootloader paths are mode-specific).
     if (cfg.disk.scheme == .@"efi-swap-root" and cfg.boot_mode == .bios)
@@ -545,6 +545,8 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
             try errs.append(alloc, "disk.partitions exceeds GPT's 128-entry limit");
         if (cfg.disk.lvm)
             try errs.append(alloc, "disk.lvm is a guided-layout feature — express volumes as partitions under scheme=manual");
+        if (!cfg.disk.wipe)
+            try errs.append(alloc, "disk.wipe=false is unsupported under scheme=manual — rows are always created at fixed indices and formatted; use scheme=alongside to preserve an existing install");
         if (cfg.disk.swap == .partition)
             try errs.append(alloc, "disk.swap=partition is guided-only — under manual, list a fs=\"swap\" partition");
         var root_count: u32 = 0;
@@ -563,6 +565,8 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
                 try errs.append(alloc, fmt(alloc, "disk.partitions[{}].type '{s}' is not a GPT type code (hex/short code like EF00, 8304)", .{ row, p.ptype }));
             if (hasCtl(p.name) or std.mem.indexOfScalar(u8, p.name, '"') != null)
                 try errs.append(alloc, fmt(alloc, "disk.partitions[{}].name has characters sgdisk -c can't carry", .{row}));
+            if (p.name.len > 0 and p.name[0] == '-')
+                try errs.append(alloc, fmt(alloc, "disk.partitions[{}].name can't start with '-' — it lands after -n/-L in mkfs calls", .{row}));
             if (!manualFsOk(p.fs))
                 try errs.append(alloc, fmt(alloc, "disk.partitions[{}].fs '{s}' — expected vfat|ext4|xfs|btrfs|f2fs|bcachefs|swap|none", .{ row, p.fs }));
             if (std.mem.eql(u8, p.fs, "swap") and p.mount.len > 0)
@@ -588,6 +592,18 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
                 if (q_eff.len > 0 and std.mem.eql(u8, q_eff, eff_mount))
                     try errs.append(alloc, fmt(alloc, "disk.partitions[{}].mount '{s}' duplicates an earlier entry", .{ row, eff_mount }));
             }
+            // fs="none" means unformatted — a mount would fail mid-install.
+            if (std.mem.eql(u8, p.fs, "none") and eff_mount.len > 0)
+                try errs.append(alloc, fmt(alloc, "disk.partitions[{}]: fs=\"none\" takes no mount point", .{row}));
+            // EF02 is a bootloader embed target — never a filesystem,
+            // and "rest" here would swallow the remainder of the disk.
+            if (std.ascii.eqlIgnoreCase(p.ptype, "EF02")) {
+                if (!std.mem.eql(u8, p.fs, "none") or p.mount.len > 0)
+                    try errs.append(alloc, fmt(alloc, "disk.partitions[{}]: EF02 biosboot must be fs=\"none\" mount=\"\" — bios-install embeds stage2 there, corrupting any filesystem", .{row}));
+                const sz = parseSizeMiB(p.size);
+                if (sz == null or sz.? > 8192)
+                    try errs.append(alloc, fmt(alloc, "disk.partitions[{}]: EF02 needs an explicit small size (1–8192 MiB), not \"{s}\"", .{ row, p.size }));
+            }
             if (std.ascii.eqlIgnoreCase(p.ptype, "EF00")) esp_count += 1;
             if (std.ascii.eqlIgnoreCase(p.ptype, "EF02")) biosboot_count += 1;
         }
@@ -596,12 +612,17 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
         if (rest_count > 1)
             try errs.append(alloc, "disk.partitions: at most one size=\"rest\" entry");
         if (cfg.boot_mode == .uefi) {
+            // Exactly one ESP — the planner (espPartIdx/manualEspMount)
+            // picks the first EF00 row, so multiples would bootload the
+            // wrong partition.
+            if (esp_count != 1)
+                try errs.append(alloc, "scheme=manual on UEFI needs exactly one type=\"EF00\" partition (the ESP)");
             var esp_ok = false;
             for (cfg.disk.partitions) |p| {
                 if (std.ascii.eqlIgnoreCase(p.ptype, "EF00") and std.mem.eql(u8, p.fs, "vfat")) esp_ok = true;
             }
-            if (!esp_ok)
-                try errs.append(alloc, "scheme=manual on UEFI needs a type=\"EF00\" fs=\"vfat\" partition (the ESP)");
+            if (esp_count == 1 and !esp_ok)
+                try errs.append(alloc, "the EF00 ESP row needs fs=\"vfat\"");
         } else {
             if (esp_count > 0)
                 try errs.append(alloc, "disk.partitions lists an EF00 ESP under BIOS boot — ESPs are UEFI-only");
@@ -622,6 +643,8 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
         try errs.append(alloc, "system.kernel_config only applies to kernel=manual");
     if (hasCtl(cfg.system.kernel_config))
         try errs.append(alloc, "system.kernel_config contains control characters");
+    if (cfg.system.kernel_config.len > 0 and cfg.system.kernel_config[0] != '/')
+        try errs.append(alloc, "system.kernel_config must be an absolute path on the live env");
     // Keymaps land in shell-sourced conf.d files under OpenRC — pin to
     // the keymap-name charset.
     if (!keymapOk(cfg.system.keymap))
@@ -862,7 +885,7 @@ pub fn parseSizeMiB(s: []const u8) ?u64 {
         if (std.mem.endsWith(u8, s, u.suf)) {
             const n = std.fmt.parseInt(u64, s[0 .. s.len - u.suf.len], 10) catch return null;
             if (n == 0) return null;
-            return n * u.mul;
+            return std.math.mul(u64, n, u.mul) catch null;
         }
     }
     return null;

@@ -251,18 +251,18 @@ pub fn main(init: std.process.Init) !void {
             var root_is_rest = false;
             for (cfg.disk.partitions) |p| {
                 if (engine.config.parseSizeMiB(p.size)) |n|
-                    need_mib += n
+                    need_mib +|= n
                 else if (std.mem.eql(u8, p.mount, "/"))
                     root_is_rest = true;
             }
-            if (root_is_rest) need_mib += 8192;
-            if (cfg.disk.luks) need_mib += 32;
+            if (root_is_rest) need_mib +|= 8192;
+            if (cfg.disk.luks) need_mib +|= 32;
         } else {
-            if (cfg.boot_mode == .uefi) need_mib += cfg.disk.esp_mib else need_mib += 2;
-            if (cfg.disk.swap == .partition) need_mib += cfg.disk.swap_mib;
-            if (cfg.disk.boot_part) need_mib += 1024;
-            if (cfg.disk.luks or cfg.disk.lvm) need_mib += 32;
-            need_mib += if (cfg.disk.lvm)
+            if (cfg.boot_mode == .uefi) need_mib +|= cfg.disk.esp_mib else need_mib +|= 2;
+            if (cfg.disk.swap == .partition) need_mib +|= cfg.disk.swap_mib;
+            if (cfg.disk.boot_part) need_mib +|= 1024;
+            if (cfg.disk.luks or cfg.disk.lvm) need_mib +|= 32;
+            need_mib +|= if (cfg.disk.lvm)
                 (if (cfg.system.snapshots == .auto) (8192 * 100 + 94) / 95 else (8192 * 10 + 6) / 7)
             else
                 8192;

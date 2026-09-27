@@ -968,6 +968,13 @@ fn planKernel(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !St
                 .chroot = true,
                 .desc = "gentoo-sources + kernel build deps",
             } });
+            // The path is arbitrary live-env input — confirm it smells
+            // like a .config before copying so a bad answer file can't
+            // exfiltrate an unrelated host file into the target.
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", "[ -f \"$1\" ] && head -c 65536 \"$1\" | grep -q CONFIG_", "kcfg", cfg.system.kernel_config }),
+                .desc = "verify kernel_config is a regular file containing CONFIG_",
+            } });
             try c.append(alloc, argv(alloc, &.{ "cp", cfg.system.kernel_config, "/mnt/gentoo/tmp/kernel.config" }, "stage .config into target"));
             try c.append(alloc, .{ .exec = .{
                 .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", "eselect kernel set 1 && cp /tmp/kernel.config \"$(readlink -f /usr/src/linux)/.config\" && make -C /usr/src/linux olddefconfig && make -C /usr/src/linux -j\"$(nproc)\" && make -C /usr/src/linux modules_install && make -C /usr/src/linux install" }),
