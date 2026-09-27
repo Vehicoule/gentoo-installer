@@ -557,7 +557,7 @@ pub const Wizard = struct {
                         try out.writeAll("\",\"label\":\"");
                         const base = std.fs.path.basename(p.path);
                         jesc(out, base);
-                        try out.print(" · {s} · {} GiB free\"}}", .{ p.fs, p.fs_free_bytes >> 20 });
+                        try out.print(" · {s} · {} GiB free\"}}", .{ p.fs, p.fs_free_bytes >> 30 });
                     }
                 }
             }

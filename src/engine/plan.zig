@@ -1210,6 +1210,20 @@ fn planKernel(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !St
             .desc = "generate secure boot keys (before module builds)",
         } });
     }
+    if (cfg.security.secure_boot == .shim) {
+        // make.conf points MODULES_SIGN_KEY at /etc/shim/mok.key — the
+        // pair must exist before any module build (nvidia emerge below)
+        // or linux-mod-r1 signs with a nonexistent key.
+        try c.append(alloc, .{ .exec = .{
+            .argv = try alloc.dupe([]const u8, &.{ "sh", "-c",
+                "umask 077 && mkdir -p /etc/shim && " ++
+                "openssl req -new -x509 -newkey rsa:2048 -keyout /etc/shim/mok.key " ++
+                "-out /etc/shim/mok.pem -days 3650 -nodes -subj '/CN=gentoo-installer-mok/' && " ++
+                "openssl x509 -in /etc/shim/mok.pem -outform der -out /etc/shim/mok.der" }),
+            .chroot = true,
+            .desc = "generate the MOK key pair (before module builds)",
+        } });
+    }
     switch (resolveGpuDriver(cfg, env)) {
         .@"nvidia-open" => try c.append(alloc, .{ .exec = .{
             .argv = try alloc.dupe([]const u8, &.{ "emerge", "x11-drivers/nvidia-drivers[kernel-open]" }),
@@ -1554,7 +1568,13 @@ fn planServices(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !
             try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "--unmerge", "sys-apps/sysvinit" }), .chroot = true, .desc = "unmerge sysvinit (dinit takes PID1)" } });
             try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-apps/dinit" }), .chroot = true, .desc = "dinit (PID1 + service manager)" } });
         },
-        .runit => try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-process/runit" }), .chroot = true, .desc = "runit (PID1 + runsvdir)" } }),
+        .runit => {
+            try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-process/runit" }), .chroot = true, .desc = "runit (PID1 + runsvdir)" } });
+            // sysvinit's /sbin/{poweroff,halt,shutdown,reboot} talk to an
+            // initctl fifo nobody serves under runit PID1 — drop the
+            // package so the runit wrappers installed below stand alone.
+            try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "--unmerge", "sys-apps/sysvinit" }), .chroot = true, .desc = "unmerge sysvinit (runit takes PID1)" } });
+        },
         .s6 => try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-apps/s6", "sys-apps/s6-rc" }), .chroot = true, .desc = "s6 + s6-rc packages" } }),
         else => {},
     }
@@ -1585,6 +1605,53 @@ fn planServices(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !
                 try c.append(alloc, argv(alloc, &.{ "ln", "-sf", s(alloc, "../{s}", .{name}), s(alloc, "/mnt/gentoo/etc/dinit.d/boot.d/{s}", .{name}) }, s(alloc, "boot.d {s}", .{name})));
             }
             try c.append(alloc, argv(alloc, &.{ "ln", "-sf", "../sysinit", "/mnt/gentoo/etc/dinit.d/boot.d/sysinit" }, "boot.d sysinit"));
+            // Gentoo's dinit ebuild ships no shutdown utility, but PID1
+            // execs `/usr/sbin/shutdown --system <-h|-r|-p>` once services
+            // stop (and immediately on SIGQUIT). That process IS init —
+            // it must reboot(2) itself and never exit, so a compiled
+            // binary is required (a shell script's exit panics the
+            // kernel, and sysrq 'o' needs a live usermode-helper).
+            // dinitctl can only request HALT, so -h maps to power off.
+            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/usr/src/gi-shutdown.c", .mode = 0o644,
+                .content =
+                \\/* gentoo-installer dinit shutdown — dual role:
+                \\ * `shutdown --system -X` (exec'd by dinit PID1 after
+                \\ *   services stop): sync + reboot(2), never return.
+                \\ * `shutdown` (user): forward to dinitctl shutdown. */
+                \\#include <string.h>
+                \\#include <sys/reboot.h>
+                \\#include <unistd.h>
+                \\int main(int argc, char **argv)
+                \\{
+                \\    int sys = 0, cmd = RB_POWER_OFF;
+                \\    for (int i = 1; i < argc; i++) {
+                \\        if (!strcmp(argv[i], "--system")) sys = 1;
+                \\        if (!strcmp(argv[i], "-r") || !strcmp(argv[i], "-k") ||
+                \\            !strcmp(argv[i], "-s")) cmd = RB_AUTOBOOT;
+                \\    }
+                \\    if (!sys) {
+                \\        execl("/sbin/dinitctl", "dinitctl", "shutdown", (char *)0);
+                \\        _exit(1);
+                \\    }
+                \\    sync();
+                \\    reboot(cmd);
+                \\    for (;;) pause();
+                \\}
+                ,
+            } });
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c",
+                    "cc -O2 -o /usr/sbin/shutdown /usr/src/gi-shutdown.c || " ++
+                    "gcc -O2 -o /usr/sbin/shutdown /usr/src/gi-shutdown.c || " ++
+                    "clang -O2 -o /usr/sbin/shutdown /usr/src/gi-shutdown.c" }),
+                .chroot = true,
+                .desc = "build the dinit shutdown binary",
+            } });
+            for ([_][]const u8{ "poweroff", "halt" }) |name|
+                try c.append(alloc, .{ .write_file = .{ .path = s(alloc, "/mnt/gentoo/sbin/{s}", .{name}), .mode = 0o755,
+                    .content = "#!/bin/sh\nexec /usr/sbin/shutdown\n" } });
+            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/sbin/reboot", .mode = 0o755,
+                .content = "#!/bin/sh\nkill -INT 1\n" } });
         },
         .runit => {
             // runit-init runs /etc/runit/{1,2,3}: sysinit via openrc,
@@ -1596,6 +1663,13 @@ fn planServices(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !
                 .content = "#!/bin/sh\nexec /usr/bin/runsvdir -P /etc/runit/runsvdir/default\n" } });
             try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/etc/runit/3", .mode = 0o755,
                 .content = "#!/bin/sh\nexec /sbin/openrc shutdown\n" } });
+            // Shutdown commands: `runit-init 0` signals PID1 to end
+            // stage2, run stage3, then power off; `6` reboots.
+            for ([_][]const u8{ "poweroff", "halt", "shutdown" }) |name|
+                try c.append(alloc, .{ .write_file = .{ .path = s(alloc, "/mnt/gentoo/sbin/{s}", .{name}), .mode = 0o755,
+                    .content = "#!/bin/sh\nexec /sbin/runit-init 0\n" } });
+            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/sbin/reboot", .mode = 0o755,
+                .content = "#!/bin/sh\nexec /sbin/runit-init 6\n" } });
         },
         else => {},
     }
@@ -2001,15 +2075,6 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env,
                 .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-boot/shim", "sys-boot/mokutil", "app-crypt/sbsigntools", "sys-boot/efibootmgr" }),
                 .chroot = true,
                 .desc = "shim + mokutil + sbsigntools",
-            } });
-            try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c",
-                    "umask 077 && mkdir -p /etc/shim && " ++
-                    "openssl req -new -x509 -newkey rsa:2048 -keyout /etc/shim/mok.key " ++
-                    "-out /etc/shim/mok.pem -days 3650 -nodes -subj '/CN=gentoo-installer-mok/' && " ++
-                    "openssl x509 -in /etc/shim/mok.pem -outform der -out /etc/shim/mok.der" }),
-                .chroot = true,
-                .desc = "generate the MOK key pair",
             } });
             try c.append(alloc, .{ .exec = .{
                 .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc,
