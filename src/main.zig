@@ -221,8 +221,10 @@ pub fn main(init: std.process.Init) !void {
 
     // Destructive exec runs require --confirm <device> matching the
     // configured disk — an answer file alone must never wipe a disk.
+    // manual is always destructive: every listed row is partitioned
+    // and formatted whether or not the table gets wiped first.
     const destructive = cfg.disk.scheme == .@"efi-swap-root" or cfg.disk.scheme == .@"bios-boot-swap-root" or
-        (cfg.disk.scheme == .manual and cfg.disk.wipe);
+        cfg.disk.scheme == .manual;
     if (cmd == .run and !dry_run and destructive) {
         const cd = confirm_dev orelse {
             try errw.print("refusing to run without --confirm {s} (this will wipe the target disk)\n", .{cfg.disk.device});
@@ -843,7 +845,7 @@ fn doInstall(io: std.Io, alloc: std.mem.Allocator, wiz: *engine.wizard.Wizard, o
             return;
         }
         const destructive = cfg.disk.scheme == .@"efi-swap-root" or cfg.disk.scheme == .@"bios-boot-swap-root" or
-            (cfg.disk.scheme == .manual and cfg.disk.wipe);
+            cfg.disk.scheme == .manual;
         if (destructive) {
             const confirm = jstr(jl, "confirm") orelse {
                 try writeErr(out, req, "destructive install needs confirm=<disk basename>");

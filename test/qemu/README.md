@@ -40,6 +40,12 @@ Each takes `ops-<scenario>.jsonl` next to this script and logs to
 `<scenario>-a.log` / `<scenario>-b.log`. `bios` drops OVMF so SeaBIOS is
 the firmware on both phases.
 
+Ops files carry `@USER@`/`@USER_PASS@`/`@ROOT_PASS@`/`@LUKS_PASS@`
+placeholders — scenario.py substitutes per-run random credentials
+(pin them with `GI_USER`/`GI_USER_PASS`/`GI_ROOT_PASS`/`GI_LUKS_PASS`,
+serve dir override `GI_WWW`) and writes the resolved file to the
+served dir before the guest curls it.
+
 Pexpect note: never expect a bare marker the typed command also contains
 (`echo GOT` echoes `GOT` into the stream and matches early). Emit
 `echo MARK-$?` and expect `MARK-0` instead.

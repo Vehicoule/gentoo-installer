@@ -164,8 +164,10 @@ fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, 
                 try c.append(alloc, argv(alloc, &.{ "sgdisk", "--zap-all", dev }, s(alloc, "wipe partition table on {s}", .{dev})));
             for (d.partitions, 0..) |p, i| {
                 const n: u32 = @intCast(i + 1);
-                const size_arg = if (config.parseSizeMiB(p.size) != null)
-                    s(alloc, "-n{}:0:+{s}", .{ n, p.size })
+                // sgdisk takes +<n>M for MiB — our MiB/GiB spec units
+                // aren't literals it accepts, so convert via MiB.
+                const size_arg = if (config.parseSizeMiB(p.size)) |mib|
+                    s(alloc, "-n{}:0:+{}M", .{ n, mib })
                 else // "rest" — take all remaining space
                     s(alloc, "-n{}:0:0", .{n});
                 const name_arg = if (p.name.len > 0) s(alloc, "-c{}:{s}", .{ n, p.name }) else s(alloc, "-c{}:part{}", .{ n, n });
@@ -510,6 +512,15 @@ fn mountDepth(path: []const u8) usize {
     return std.mem.count(u8, path, "/");
 }
 
+/// A manual row's effective mount inside the target: its own mount,
+/// or the /efi default for an EF00 ESP row that left mount blank
+/// (mirrors config.manualEspMount).
+fn rowMount(p: config.Partition) []const u8 {
+    if (p.mount.len > 0) return p.mount;
+    if (std.ascii.eqlIgnoreCase(p.ptype, "EF00")) return "/efi";
+    return "";
+}
+
 fn planMount(alloc: Allocator, cfg: *const Config) !Step {
     var c: std.ArrayList(Cmd) = .empty;
     const root = rootMountArgs(alloc, cfg);
@@ -525,23 +536,38 @@ fn planMount(alloc: Allocator, cfg: *const Config) !Step {
         const parts = cfg.disk.partitions;
         var idxs: std.ArrayList(u32) = .empty;
         for (parts, 0..) |p, i| {
-            if (p.mount.len > 0 and !std.mem.eql(u8, p.mount, "/"))
+            const m = rowMount(p);
+            if (m.len > 0 and !std.mem.eql(u8, m, "/"))
                 try idxs.append(alloc, @intCast(i));
         }
         std.mem.sort(u32, idxs.items, parts, struct {
             fn lt(ps: []const config.Partition, a: u32, b: u32) bool {
-                return mountDepth(ps[a].mount) < mountDepth(ps[b].mount);
+                return mountDepth(rowMount(ps[a])) < mountDepth(rowMount(ps[b]));
             }
         }.lt);
         for (idxs.items) |i| {
             const p = parts[i];
-            const target = s(alloc, "/mnt/gentoo{s}", .{p.mount});
-            try c.append(alloc, argv(alloc, &.{ "mkdir", "-p", target }, s(alloc, "{s} mountpoint", .{p.mount})));
-            try c.append(alloc, argv(alloc, &.{ "mount", partPath(alloc, cfg.disk.device, i + 1), target }, s(alloc, "mount {s}", .{p.mount})));
+            const m = rowMount(p);
+            const target = s(alloc, "/mnt/gentoo{s}", .{m});
+            try c.append(alloc, argv(alloc, &.{ "mkdir", "-p", target }, s(alloc, "{s} mountpoint", .{m})));
+            try c.append(alloc, argv(alloc, &.{ "mount", partPath(alloc, cfg.disk.device, i + 1), target }, s(alloc, "mount {s}", .{m})));
         }
         for (parts, 0..) |p, i|
             if (std.mem.eql(u8, p.fs, "swap"))
                 try c.append(alloc, argv(alloc, &.{ "swapon", partPath(alloc, cfg.disk.device, @intCast(i + 1)) }, "enable swap"));
+        // btrfs root: the standard subvol mounts are part of the
+        // invariant layout — skipped only when a row claims the
+        // mountpoint itself (fstab below mirrors this).
+        if (rootFsOf(cfg) == .btrfs) {
+            if (config.manualMountPart(cfg, "/home") == null) {
+                try c.append(alloc, argv(alloc, &.{ "mkdir", "-p", "/mnt/gentoo/home" }, "/home mountpoint"));
+                try c.append(alloc, argv(alloc, &.{ "mount", "-o", "subvol=@home,compress=zstd:1,noatime", root.dev, "/mnt/gentoo/home" }, "mount @home"));
+            }
+            if (config.manualMountPart(cfg, "/.snapshots") == null) {
+                try c.append(alloc, argv(alloc, &.{ "mkdir", "-p", "/mnt/gentoo/.snapshots" }, "/.snapshots mountpoint"));
+                try c.append(alloc, argv(alloc, &.{ "mount", "-o", "subvol=@snapshots,compress=zstd:1,noatime", root.dev, "/mnt/gentoo/.snapshots" }, "mount @snapshots"));
+            }
+        }
         try c.append(alloc, .{ .note = "bind mounts (/proc /sys /dev /run) happen at enter-chroot" });
         return step(alloc, "mount", "Mount target", c);
     }
@@ -1012,18 +1038,22 @@ fn planFstab(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
             const n: u32 = @intCast(i + 1);
             if (std.mem.eql(u8, p.fs, "swap"))
                 try w.print("{s}\tnone\tswap\tsw\t0 0\n", .{partIdent(alloc, seed, n)});
-            if (p.mount.len == 0) continue;
-            const ident = if (std.mem.eql(u8, p.mount, "/")) root_ident else partIdent(alloc, seed, n);
-            const opts = if (std.mem.eql(u8, p.mount, "/") and root.opts.len > 0)
+            const m = rowMount(p);
+            if (m.len == 0) continue;
+            const ident = if (std.mem.eql(u8, m, "/")) root_ident else partIdent(alloc, seed, n);
+            const opts = if (std.mem.eql(u8, m, "/") and root.opts.len > 0)
                 s(alloc, "{s},defaults", .{root.opts})
             else
                 "defaults";
-            try w.print("{s}\t{s}\t{s}\t{s}\t0 {s}\n", .{ ident, p.mount, p.fs, opts, if (std.mem.eql(u8, p.mount, "/")) "1" else "2" });
+            try w.print("{s}\t{s}\t{s}\t{s}\t0 {s}\n", .{ ident, m, p.fs, opts, if (std.mem.eql(u8, m, "/")) "1" else "2" });
         }
-        // btrfs root: the subvol mounts are part of the invariant layout.
+        // btrfs root: subvol mounts are part of the invariant layout
+        // unless a row claims the mountpoint itself (mounted above).
         if (rootFsOf(cfg) == .btrfs) {
-            try w.print("{s}\t/home\tbtrfs\tsubvol=@home,compress=zstd:1,noatime\t0 2\n", .{root_ident});
-            try w.print("{s}\t/.snapshots\tbtrfs\tsubvol=@snapshots,compress=zstd:1,noatime\t0 2\n", .{root_ident});
+            if (config.manualMountPart(cfg, "/home") == null)
+                try w.print("{s}\t/home\tbtrfs\tsubvol=@home,compress=zstd:1,noatime\t0 2\n", .{root_ident});
+            if (config.manualMountPart(cfg, "/.snapshots") == null)
+                try w.print("{s}\t/.snapshots\tbtrfs\tsubvol=@snapshots,compress=zstd:1,noatime\t0 2\n", .{root_ident});
         }
         if (cfg.disk.swap == .zram)
             try w.writeAll("# zram swap configured via /etc/systemd/zram-generator.conf or OpenRC zram service\n");
@@ -1534,7 +1564,10 @@ fn limineConf(alloc: Allocator, cfg: *const Config, seed: u128) []const u8 {
     // UEFI or a dedicated /boot partition; the root fs otherwise, where
     // staged files live under /boot/. Modern limine path grammar is
     // `resource(arg):/path` — boot():/... (boot:/// is the pre-v9 form).
-    const boot_vol = cfg.boot_mode == .uefi or cfg.disk.boot_part;
+    // boot_part covers guided schemes; a manual /boot row is the same
+    // separate volume from limine's perspective.
+    const boot_vol = cfg.boot_mode == .uefi or cfg.disk.boot_part or
+        config.manualMountPart(cfg, "/boot") != null;
     const kpath = if (boot_vol) "vmlinuz" else "boot/vmlinuz";
     const ipath = if (boot_vol) "initramfs.img" else "boot/initramfs.img";
     w.print("/Gentoo\n", .{}) catch {};

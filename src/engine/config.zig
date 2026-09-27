@@ -106,9 +106,10 @@ pub const Config = struct {
         privilege: Privilege = .doas,
         keep_kernels: u32 = 3,
         snapshots: Snapshots = .auto,
-        /// kernel=manual: path to a .config on the live env fs, copied
-        /// into the target and built with olddefconfig. Required for a
-        /// manual kernel to be executable.
+        /// `system.kernel_config` — kernel=manual only: path to a
+        /// .config on the live env fs, copied into the target and
+        /// built with olddefconfig. Required for a manual kernel to
+        /// be executable.
         kernel_config: []const u8 = "",
     } = .{},
 
@@ -518,8 +519,13 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
         try errs.append(alloc, "BIOS + limine requires disk.boot_part=true — limine reads only FAT filesystems");
     // GRUB reads kernels before the initramfs can unlock LUKS, and we
     // emit no cryptodisk setup — it needs an unencrypted /boot.
-    if (resolveBootloader(cfg) == .grub and cfg.disk.luks and !cfg.disk.boot_part)
-        try errs.append(alloc, "GRUB + LUKS requires disk.boot_part=true — grub cannot read kernels inside the encrypted root");
+    if (resolveBootloader(cfg) == .grub and cfg.disk.luks) {
+        if (cfg.disk.scheme == .manual) {
+            if (manualMountPart(cfg, "/boot") == null)
+                try errs.append(alloc, "GRUB + LUKS under scheme=manual needs a mount=\"/boot\" row — grub cannot read kernels inside the encrypted root");
+        } else if (!cfg.disk.boot_part)
+            try errs.append(alloc, "GRUB + LUKS requires disk.boot_part=true — grub cannot read kernels inside the encrypted root");
+    }
     // Zero-sized partitions produce sgdisk failures AFTER --zap-all has
     // already wiped the table — catch them in validation.
     if (cfg.boot_mode == .uefi and cfg.disk.esp_mib == 0)
@@ -563,7 +569,7 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
                 try errs.append(alloc, fmt(alloc, "disk.partitions[{}]: fs=swap takes no mount point", .{row}));
             if (p.mount.len > 0) {
                 if (!mountOk(p.mount))
-                    try errs.append(alloc, fmt(alloc, "disk.partitions[{}].mount '{s}' must be an absolute path, no spaces/control chars", .{ row, p.mount }));
+                    try errs.append(alloc, fmt(alloc, "disk.partitions[{}].mount '{s}' must be an absolute path in [A-Za-z0-9._/-]", .{ row, p.mount }));
                 if (std.mem.eql(u8, p.mount, "/")) {
                     root_count += 1;
                     if (manualRootFs(cfg) == null)
@@ -573,10 +579,14 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
                             try errs.append(alloc, fmt(alloc, "disk.partitions[{}]: root needs ≥8192 MiB (stage3 + toolchain + world) — or size=\"rest\"", .{row}));
                     }
                 }
-                for (cfg.disk.partitions[0..i]) |q| {
-                    if (std.mem.eql(u8, q.mount, p.mount))
-                        try errs.append(alloc, fmt(alloc, "disk.partitions[{}].mount '{s}' duplicates an earlier entry", .{ row, p.mount }));
-                }
+            }
+            // Dedup on the EFFECTIVE mount — an EF00 row with a blank
+            // mount still lands at /efi (manualEspMount default).
+            const eff_mount: []const u8 = if (p.mount.len > 0) p.mount else if (std.ascii.eqlIgnoreCase(p.ptype, "EF00")) "/efi" else "";
+            for (cfg.disk.partitions[0..i]) |q| {
+                const q_eff: []const u8 = if (q.mount.len > 0) q.mount else if (std.ascii.eqlIgnoreCase(q.ptype, "EF00")) "/efi" else "";
+                if (q_eff.len > 0 and std.mem.eql(u8, q_eff, eff_mount))
+                    try errs.append(alloc, fmt(alloc, "disk.partitions[{}].mount '{s}' duplicates an earlier entry", .{ row, eff_mount }));
             }
             if (std.ascii.eqlIgnoreCase(p.ptype, "EF00")) esp_count += 1;
             if (std.ascii.eqlIgnoreCase(p.ptype, "EF02")) biosboot_count += 1;
@@ -876,16 +886,22 @@ fn manualFsOk(v: []const u8) bool {
     return false;
 }
 
-// Mount points become fstab + mkdir targets under /mnt/gentoo.
+// Mount points become fstab fields + mkdir targets under /mnt/gentoo
+// — a strict charset, not a denylist, so shell meta / fstab
+// comment-syntax / whitespace can't reinterpret the field.
 fn mountOk(v: []const u8) bool {
-    if (v.len == 0 or v.len > 64 or v[0] != '/' or hasCtl(v)) return false;
+    if (v.len == 0 or v.len > 64 or v[0] != '/') return false;
+    if (v.len > 1 and v[v.len - 1] == '/') return false;
     for (v) |ch| {
-        if (ch == ' ' or ch == '"' or ch == '\'' or ch == '\\' or ch == '$' or ch == '`') return false;
+        const ok = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+            (ch >= '0' and ch <= '9') or ch == '/' or ch == '-' or ch == '_' or ch == '.';
+        if (!ok) return false;
     }
-    // no traversal segments
+    // no empty (//) or traversal segments
+    if (std.mem.indexOf(u8, v, "//") != null) return false;
     var it = std.mem.splitScalar(u8, v, '/');
     while (it.next()) |seg| {
-        if (std.mem.eql(u8, seg, "..")) return false;
+        if (std.mem.eql(u8, seg, "..") or std.mem.eql(u8, seg, ".")) return false;
     }
     return true;
 }

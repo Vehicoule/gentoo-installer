@@ -8,14 +8,20 @@ Usage: scenario.py <luks|bios> [phase-a|phase-b]   (default: both phases)
   bios — SeaBIOS install (no OVMF); exercises the BIOS partition layout
          and `limine bios-install`; phase B boots the disk via SeaBIOS.
 """
-import os, subprocess, sys
+import os, secrets, subprocess, sys
 import pexpect
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ISO = os.path.join(HERE, "install-amd64-minimal.iso")
 OVMF = "/usr/share/OVMF/OVMF_CODE.fd"
-LUKS_PASS = "TestLuks#2026"
-USER, USER_PW, ROOT_PW = "gentoo", "TestUser#2026", "TestRoot#2026"
+WWW = os.environ.get("GI_WWW", os.path.expanduser("~/m3/www"))
+# Credentials live only in the throwaway qcow2 — generated per run so
+# the repo carries no reusable test passwords. GI_* env vars pin them
+# when reproducing a specific failure.
+LUKS_PASS = os.environ.get("GI_LUKS_PASS") or secrets.token_urlsafe(12)
+USER = os.environ.get("GI_USER", "gentoo")
+USER_PW = os.environ.get("GI_USER_PASS") or secrets.token_urlsafe(12)
+ROOT_PW = os.environ.get("GI_ROOT_PASS") or secrets.token_urlsafe(12)
 
 def iso_label():
     return subprocess.check_output(
@@ -47,7 +53,15 @@ def sh(c, cmd, pat=rb"livecd.*# ", timeout=120):
 DONE = rb"ZZ-GOT-0"
 
 def phase_a(scn, disk):
-    ops = os.path.join(HERE, "ops-%s.jsonl" % scn)
+    # Substitute the credential placeholders and publish the resolved
+    # ops to the dir the guest curls from — the committed file never
+    # holds a real password.
+    ops_txt = open(os.path.join(HERE, "ops-%s.jsonl" % scn)).read()
+    for k, v in {"@USER@": USER, "@USER_PASS@": USER_PW,
+                 "@ROOT_PASS@": ROOT_PW, "@LUKS_PASS@": LUKS_PASS}.items():
+        ops_txt = ops_txt.replace(k, v)
+    with open(os.path.join(WWW, "ops-%s.jsonl" % scn), "w") as f:
+        f.write(ops_txt)
     log = open(os.path.join(HERE, "%s-a.log" % scn), "wb")
     c = pexpect.spawn(qemu(scn, disk)[0], qemu(scn, disk)[1:] + live_args(),
                       timeout=240, logfile=log, encoding=None)
