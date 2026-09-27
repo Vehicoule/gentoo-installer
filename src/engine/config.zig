@@ -508,14 +508,14 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
         try errs.append(alloc, "disk.scheme=efi-swap-root requires boot_mode=uefi — use bios-boot-swap-root");
     if (cfg.disk.scheme == .@"bios-boot-swap-root" and cfg.boot_mode == .uefi)
         try errs.append(alloc, "disk.scheme=bios-boot-swap-root requires boot_mode=bios — use efi-swap-root");
-    // BIOS limine reads only ext-family filesystems and cannot unlock
-    // LUKS — a separate /boot is required unless the root is plain ext4.
-    if (cfg.boot_mode == .bios and resolveBootloader(cfg) == .limine) {
-        if (cfg.disk.luks and !cfg.disk.boot_part)
-            try errs.append(alloc, "BIOS + LUKS requires disk.boot_part=true — limine cannot read encrypted roots");
-        if (cfg.disk.root_fs != .ext4 and !cfg.disk.boot_part)
-            try errs.append(alloc, fmt(alloc, "BIOS limine cannot read {s} roots — set disk.boot_part=true (ext4 /boot)", .{@tagName(cfg.disk.root_fs)}));
-    }
+    // Limine ≥12 dropped ext support — its BIOS stage reads only
+    // FAT/ISO9660. Kernel, initramfs, limine-bios.sys and limine.conf
+    // must all live on a FAT /boot, so BIOS+limine always needs a
+    // separate boot partition (also covers the LUKS case — the FAT /boot
+    // is unencrypted either way).
+    if (cfg.boot_mode == .bios and resolveBootloader(cfg) == .limine and
+        cfg.disk.scheme == .@"bios-boot-swap-root" and !cfg.disk.boot_part)
+        try errs.append(alloc, "BIOS + limine requires disk.boot_part=true — limine reads only FAT filesystems");
     // GRUB reads kernels before the initramfs can unlock LUKS, and we
     // emit no cryptodisk setup — it needs an unencrypted /boot.
     if (resolveBootloader(cfg) == .grub and cfg.disk.luks and !cfg.disk.boot_part)
@@ -597,8 +597,11 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
                 try errs.append(alloc, "disk.partitions lists an EF00 ESP under BIOS boot — ESPs are UEFI-only");
             if (biosboot_count == 0)
                 try errs.append(alloc, "BIOS boot needs a type=\"EF02\" biosboot partition (grub and limine both embed stage2 there — GPT has no post-MBR gap)");
-            if (cfg.disk.luks and manualBootFs(cfg) == null and manualRootFs(cfg) != .ext4)
-                try errs.append(alloc, "BIOS limine cannot read LUKS or non-ext4 roots — add a separate /boot partition");
+            if (resolveBootloader(cfg) == .limine) {
+                const bf = manualBootFs(cfg);
+                if (bf == null or !std.mem.eql(u8, bf.?, "vfat"))
+                    try errs.append(alloc, "BIOS limine reads only FAT — add a mount=\"/boot\" fs=\"vfat\" partition for kernels + limine-bios.sys");
+            }
         }
     }
     // kernel=manual builds gentoo-sources from a caller-supplied .config

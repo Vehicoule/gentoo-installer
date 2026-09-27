@@ -106,9 +106,11 @@ GPT partitions ──► LUKS2 ──► LVM ──► filesystems
 
 ### `bios-boot-swap-root` (BIOS)
 
-`EF02` BIOS-boot partition (1 MiB, grub core image) instead of ESP;
-`/boot` on rootfs unless `boot_part`. Limine BIOS mode needs only the
-MBR gap it installs into — no EF02 required when bootloader=limine.
+`EF02` BIOS-boot partition (1 MiB) instead of ESP — GPT has no
+post-MBR gap, so both grub's core image and limine's stage2 embed
+there (`limine bios-install <disk> 1`). `boot_part` creates a 1 GiB
+/boot; under limine it is FAT32 because limine ≥12 reads only
+FAT/ISO9660 (ext support was dropped upstream).
 
 ### `alongside`
 
@@ -162,9 +164,11 @@ entries (`-` = empty name):
 
 Rules the validator enforces: exactly one row mounts `/` with a root
 filesystem; UEFI needs a `type=EF00 fs=vfat` row (its mount is the ESP —
-default `/efi` when omitted); BIOS + GRUB needs a `type=EF02` BIOS-boot
-row and rejects `EF00`; BIOS + limine + LUKS needs a `/boot` row or an
-ext4 root; mounts are deduplicated; an explicit root size below 8 GiB
+default `/efi` when omitted); BIOS needs a `type=EF02` BIOS-boot row
+(grub core image / limine stage2 embed target — GPT has no post-MBR
+gap) and rejects `EF00`; BIOS + limine needs a `mount="/boot"
+fs="vfat"` row (limine ≥12 reads only FAT — no ext4, and LUKS roots
+get their kernel+initramfs from the FAT /boot either way); mounts are deduplicated; an explicit root size below 8 GiB
 is refused; `swap` fs rows take no mount and are swapped on at mount
 time; `lvm` and `swap=partition` are guided-layout features and are
 rejected (express volumes as plain partitions); `luks=on` still wraps

@@ -329,8 +329,15 @@ fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, 
     try mkfs_argv.append(alloc, fs_dev);
     try c.append(alloc, fmtArgv(alloc, s(alloc, "format root as {s}", .{@tagName(d.root_fs)}), mkfs_argv.items));
 
-    if (boot_part) |bp|
-        try c.append(alloc, argv(alloc, &.{ "mkfs.ext4", "-L", "boot", bp }, "format /boot as ext4"));
+    if (boot_part) |bp| {
+        // Limine ≥12 reads only FAT/ISO9660 — ext4 /boot is unreadable
+        // to its BIOS stage. grub keeps ext4.
+        if (std.mem.eql(u8, bootPartFs(cfg), "vfat")) {
+            try c.append(alloc, argv(alloc, &.{ "mkfs.vfat", "-F32", "-n", "boot", bp }, "format /boot as FAT32 (limine BIOS)"));
+        } else {
+            try c.append(alloc, argv(alloc, &.{ "mkfs.ext4", "-L", "boot", bp }, "format /boot as ext4"));
+        }
+    }
 
     if (swap_part) |sp|
         try c.append(alloc, argv(alloc, &.{ "mkswap", "-L", "swap", sp }, "format swap"));
@@ -441,6 +448,15 @@ fn biosBootIdx(cfg: *const Config) ?u32 {
         return null;
     }
     return if (cfg.boot_mode == .bios) 1 else null;
+}
+
+/// Filesystem of the guided /boot partition — limine's BIOS stage reads
+/// only FAT/ISO9660 (ext support dropped in limine 12), so BIOS+limine
+/// gets FAT32; everything else keeps ext4.
+fn bootPartFs(cfg: *const Config) []const u8 {
+    if (cfg.boot_mode == .bios and config.resolveBootloader(cfg) == .limine)
+        return "vfat";
+    return "ext4";
 }
 
 /// Mount point of the ESP inside the target.
@@ -1020,7 +1036,7 @@ fn planFstab(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
     if (cfg.disk.swap == .partition)
         try w.print("{s}\tnone\tswap\tsw\t0 0\n", .{partIdent(alloc, seed, 2)}); // swap is always index 2 (after esp/biosboot)
     if (cfg.disk.boot_part)
-        try w.print("{s}\t/boot\text4\tdefaults\t0 2\n", .{partIdent(alloc, seed, bootPartIdx(cfg))});
+        try w.print("{s}\t/boot\t{s}\tdefaults\t0 2\n", .{ partIdent(alloc, seed, bootPartIdx(cfg)), bootPartFs(cfg) });
     if (cfg.disk.lvm and cfg.disk.home_part and cfg.disk.root_fs != .btrfs)
         try w.print("/dev/vg0/home\t/home\t{s}\tdefaults\t0 2\n", .{@tagName(cfg.disk.root_fs)});
     if (cfg.disk.root_fs == .btrfs) {
@@ -1257,8 +1273,13 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
     const bl = config.resolveBootloader(cfg);
     switch (bl) {
         .limine => {
+            const limine_atoms: []const []const u8 =
+                if (cfg.boot_mode == .bios)
+                    &.{ "sys-boot/limine", "sys-fs/dosfstools" } // fsck.vfat for the FAT /boot
+                else
+                    &.{"sys-boot/limine"};
             try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-boot/limine" }),
+                .argv = try prepend(alloc, "emerge", limine_atoms),
                 .chroot = true,
                 .desc = "limine",
             } });
