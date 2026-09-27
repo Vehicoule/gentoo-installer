@@ -1617,7 +1617,9 @@ fn planServices(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !
                 \\/* gentoo-installer dinit shutdown — dual role:
                 \\ * `shutdown --system -X` (exec'd by dinit PID1 after
                 \\ *   services stop): sync + reboot(2), never return.
-                \\ * `shutdown` (user): forward to dinitctl shutdown. */
+                \\ * `shutdown [-r]` (user): reboot asks PID1 directly
+                \\ *   (SIGINT) — dinitctl can only request HALT. */
+                \\#include <signal.h>
                 \\#include <string.h>
                 \\#include <sys/reboot.h>
                 \\#include <unistd.h>
@@ -1630,6 +1632,7 @@ fn planServices(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !
                 \\            !strcmp(argv[i], "-s")) cmd = RB_AUTOBOOT;
                 \\    }
                 \\    if (!sys) {
+                \\        if (cmd == RB_AUTOBOOT) { kill(1, SIGINT); _exit(0); }
                 \\        execl("/sbin/dinitctl", "dinitctl", "shutdown", (char *)0);
                 \\        _exit(1);
                 \\    }
@@ -1665,9 +1668,12 @@ fn planServices(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !
                 .content = "#!/bin/sh\nexec /sbin/openrc shutdown\n" } });
             // Shutdown commands: `runit-init 0` signals PID1 to end
             // stage2, run stage3, then power off; `6` reboots.
-            for ([_][]const u8{ "poweroff", "halt", "shutdown" }) |name|
+            // `shutdown -r` must reboot, so shutdown parses its args.
+            for ([_][]const u8{ "poweroff", "halt" }) |name|
                 try c.append(alloc, .{ .write_file = .{ .path = s(alloc, "/mnt/gentoo/sbin/{s}", .{name}), .mode = 0o755,
                     .content = "#!/bin/sh\nexec /sbin/runit-init 0\n" } });
+            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/sbin/shutdown", .mode = 0o755,
+                .content = "#!/bin/sh\ncase \" $*\" in\n  *\" -r\"*) exec /sbin/runit-init 6 ;;\n  *) exec /sbin/runit-init 0 ;;\nesac\n" } });
             try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/sbin/reboot", .mode = 0o755,
                 .content = "#!/bin/sh\nexec /sbin/runit-init 6\n" } });
         },
