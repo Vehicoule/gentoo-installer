@@ -1939,7 +1939,10 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env,
             // fallback loader already lives there.
             try c.append(alloc, .{ .exec = .{
                 .argv = if (cfg.disk.scheme == .alongside)
-                    try alloc.dupe([]const u8, &.{ "refind-install", "--alldrivers", espPath(alloc, cfg, env) orelse partPath(alloc, cfg.disk.device, 1) })
+                    // no positional device — that operand only pairs with
+                    // --usedefault; without it refind-install discovers
+                    // the already-mounted ESP itself.
+                    try alloc.dupe([]const u8, &.{ "refind-install", "--alldrivers" })
                 else
                     try alloc.dupe([]const u8, &.{ "refind-install", "--alldrivers", "--usedefault", espPath(alloc, cfg, env) orelse partPath(alloc, cfg.disk.device, 1) }),
                 .chroot = true,
