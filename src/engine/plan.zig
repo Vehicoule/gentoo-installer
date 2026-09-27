@@ -128,7 +128,7 @@ pub fn build(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, pkg_
     }));
 
     try steps.append(alloc, try planPartition(alloc, cfg, env, seed));
-    try steps.append(alloc, try planMount(alloc, cfg));
+    try steps.append(alloc, try planMount(alloc, cfg, env));
     try steps.append(alloc, try planStage3(alloc, cfg));
     try steps.append(alloc, try planPortage(alloc, cfg, env, seed));
     try steps.append(alloc, try planChroot(alloc));
@@ -138,7 +138,7 @@ pub fn build(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, pkg_
         try steps.append(alloc, try planWorldUpdate(alloc, cfg));
     try steps.append(alloc, try planBaseConfig(alloc, cfg));
     try steps.append(alloc, try planKernel(alloc, cfg, env));
-    try steps.append(alloc, try planFstab(alloc, cfg, seed));
+    try steps.append(alloc, try planFstab(alloc, cfg, env, seed));
     try steps.append(alloc, try planSystemConfig(alloc, cfg));
     try steps.append(alloc, try planServices(alloc, cfg, env));
     try steps.append(alloc, try planPackages(alloc, cfg, pkg_sets));
@@ -215,18 +215,77 @@ fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, 
             return step(alloc, "partition", "Partition disks (manual)", c);
         },
         .alongside => {
-            try c.append(alloc, .{ .note = "alongside mode: preserve existing OS partitions; reuse existing ESP" });
+            try c.append(alloc, .{ .note = "alongside mode: existing OS partitions + ESP preserved untouched" });
+            const di = diskOf(env, dev) orelse {
+                try c.append(alloc, .{ .note = "no detection data for the target disk — validation reports the error" });
+                return step(alloc, "partition", "Partition disks (alongside)", c);
+            };
+            if (alongsideEsp(di) == null)
+                try c.append(alloc, .{ .note = "no ESP detected — validation blocks the run" });
+            const base = maxPartNum(di);
+            // Region [rs..re] (sectors) the new partitions occupy.
+            var rs: u64 = 0;
+            var re: u64 = 0;
             if (d.space_src == .shrink) {
-                const tool = switch (d.root_fs) {
-                    // shrink tool is chosen by the EXISTING fs, not ours —
-                    // refine when detection reports the partition's fs
-                    else => "ntfsresize/resize2fs (per detected fs)",
-                };
-                try c.append(alloc, argv(alloc, &.{ "shrink", d.shrink_part, s(alloc, "{}MiB", .{d.shrink_mib}) }, s(alloc, "shrink {s} by {} MiB ({s})", .{ d.shrink_part, d.shrink_mib, tool })));
+                const p = for (di.parts) |*pp| {
+                    if (std.mem.eql(u8, pp.path, d.shrink_part)) break pp;
+                } else null;
+                if (p) |pp| {
+                    // fs shrinks first so the fs stays consistent if the
+                    // partition resize fails midway; the partition then
+                    // keeps a small margin over the shrunk fs.
+                    const fs_size_mib = pp.fs_size_bytes >> 20;
+                    const new_fs_mib = fs_size_mib - d.shrink_mib;
+                    if (std.mem.eql(u8, pp.fs, "ntfs")) {
+                        // No --force: a dirty NTFS must refuse loudly —
+                        // docs say chkdsk + full shutdown first.
+                        try c.append(alloc, argv(alloc, &.{ "ntfsresize", "--no-percentage", s(alloc, "-s{}M", .{new_fs_mib}), pp.path }, s(alloc, "ntfsresize {s} → {} MiB", .{ pp.path, new_fs_mib })));
+                    } else if (std.mem.startsWith(u8, pp.fs, "ext")) {
+                        try c.append(alloc, argv(alloc, &.{ "e2fsck", "-f", "-y", pp.path }, s(alloc, "e2fsck {s} (resize2fs needs a clean fs)", .{pp.path})));
+                        try c.append(alloc, argv(alloc, &.{ "resize2fs", pp.path, s(alloc, "{}M", .{new_fs_mib}) }, s(alloc, "resize2fs {s} → {} MiB", .{ pp.path, new_fs_mib })));
+                    } else if (std.mem.eql(u8, pp.fs, "btrfs")) {
+                        // btrfs resizes only while mounted.
+                        try c.append(alloc, argv(alloc, &.{ "sh", "-c", s(alloc, "mkdir -p /tmp/gi-shrink && mount {s} /tmp/gi-shrink && btrfs filesystem resize -{}M /tmp/gi-shrink; rc=$?; umount /tmp/gi-shrink 2>/dev/null; exit $rc", .{ pp.path, d.shrink_mib }) }, s(alloc, "btrfs resize -{} MiB on {s}", .{ d.shrink_mib, pp.path })));
+                    }
+                    // Partition keeps a 16 MiB margin over the shrunk fs.
+                    const margin_sectors: u64 = 16 * 2048;
+                    const new_end = pp.start_sector + (new_fs_mib << 11) + margin_sectors - 1;
+                    const old_end = pp.start_sector + (pp.size_bytes >> 9) - 1;
+                    try c.append(alloc, argv(alloc, &.{ "sgdisk", s(alloc, "-d{}", .{pp.num}), s(alloc, "-n{}:{}:{}", .{ pp.num, pp.start_sector, new_end }), dev }, s(alloc, "shrink partition {} to end at sector {}", .{ pp.num, new_end })));
+                    rs = new_end + 1;
+                    // The freed gap ends where the partition used to.
+                    re = old_end;
+                    // MiB-align the gap start the same way detection does.
+                    rs = (rs + 2047) / 2048 * 2048;
+                } else {
+                    try c.append(alloc, .{ .note = "shrink_part not detected on the target disk — validation reports the error" });
+                }
             } else {
-                try c.append(alloc, .{ .note = "free-space: use largest contiguous unallocated region" });
+                // Largest free region big enough; bounds already MiB-aligned.
+                const need: u64 = (8192 + @as(u64, if (d.swap == .partition) d.swap_mib else 0)) << 20;
+                var best: ?detect.FreeRegion = null;
+                for (di.free_regions) |g| {
+                    const size_b = (g.end_sector - g.start_sector + 1) * 512;
+                    if (size_b >= need and (best == null or size_b > (best.?.end_sector - best.?.start_sector + 1) * 512)) best = g;
+                }
+                if (best) |g| {
+                    rs = g.start_sector;
+                    re = g.end_sector;
+                } else try c.append(alloc, .{ .note = "no free region ≥ the install floor — validation reports the error" });
             }
-            if (env) |e| _ = e;
+            if (re > rs) {
+                var n: u32 = base + 1;
+                if (d.swap == .partition) {
+                    try c.append(alloc, argv(alloc, &.{ "sgdisk", s(alloc, "-n{}:{}:+{}M", .{ n, rs, d.swap_mib }), s(alloc, "-t{}:8200", .{n}), s(alloc, "-c{}:swap", .{n}), s(alloc, "-u{}:{s}", .{ n, partGuid(alloc, seed, n) }), dev }, s(alloc, "swap {}MiB at partition {} (in freed space)", .{ d.swap_mib, n })));
+                    rs += @as(u64, d.swap_mib) * 2048;
+                    n += 1;
+                }
+                try c.append(alloc, argv(alloc, &.{ "sgdisk", s(alloc, "-n{}:{}:{}", .{ n, rs, re }), s(alloc, "-t{}:8304", .{n}), s(alloc, "-c{}:root", .{n}), s(alloc, "-u{}:{s}", .{ n, partGuid(alloc, seed, n) }), dev }, s(alloc, "root partition {} in freed space [{}-{}]", .{ n, rs, re })));
+                try c.append(alloc, argv(alloc, &.{ "partprobe", dev }, "re-read partition table"));
+                const root_part = partPath(alloc, dev, n);
+                const swap_p: ?[]const u8 = if (d.swap == .partition) partPath(alloc, dev, n - 1) else null;
+                try appendFsChain(alloc, &c, cfg, root_part, swap_p);
+            }
             return step(alloc, "partition", "Partition disks (alongside)", c);
         },
         else => {},
@@ -262,13 +321,31 @@ fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, 
     const root_part = partPath(alloc, dev, n);
     // 8304 = Linux root DPS GUID (auto-discovery on systemd)
     try c.append(alloc, argv(alloc, &.{ "sgdisk", s(alloc, "-n{}:0:0", .{n}), s(alloc, "-t{}:8304", .{n}), s(alloc, "-c{}:root", .{n}), s(alloc, "-u{}:{s}", .{ n, partGuid(alloc, seed, n) }), dev }, s(alloc, "root partition {} (rest of disk)", .{n})));
-    // Separate /home is an LVM thin LV (or a btrfs @home subvol), never a
-    // standalone partition — validation enforces that pairing.
-    _ = d.home_part;
 
     // ESP filesystem (never reformatted in alongside mode — not reached here).
     if (esp_part) |esp|
         try c.append(alloc, argv(alloc, &.{ "mkfs.vfat", "-F32", "-n", "ESP", esp }, "format ESP as FAT32"));
+    if (boot_part) |bp| {
+        // Limine ≥12 reads only FAT/ISO9660 — ext4 /boot is unreadable
+        // to its BIOS stage. grub keeps ext4.
+        if (std.mem.eql(u8, bootPartFs(cfg), "vfat")) {
+            try c.append(alloc, argv(alloc, &.{ "mkfs.vfat", "-F32", "-n", "boot", bp }, "format /boot as FAT32 (limine BIOS)"));
+        } else {
+            try c.append(alloc, argv(alloc, &.{ "mkfs.ext4", "-L", "boot", bp }, "format /boot as ext4"));
+        }
+    }
+
+    try appendFsChain(alloc, &c, cfg, root_part, swap_part);
+    return step(alloc, "partition", "Partition disks", c);
+}
+
+/// The shared post-partitioning chain for guided + alongside layouts:
+/// LUKS wrap → LVM → mkfs root → mkswap → btrfs subvols.
+fn appendFsChain(alloc: Allocator, c: *std.ArrayList(Cmd), cfg: *const Config, root_part: []const u8, swap_part: ?[]const u8) !void {
+    const d = cfg.disk;
+    // Separate /home is an LVM thin LV (or a btrfs @home subvol), never a
+    // standalone partition — validation enforces that pairing.
+    _ = d.home_part;
 
     // LUKS on root (container lives on the raw partition).
     var root_dev = root_part;
@@ -331,16 +408,6 @@ fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, 
     try mkfs_argv.append(alloc, fs_dev);
     try c.append(alloc, fmtArgv(alloc, s(alloc, "format root as {s}", .{@tagName(d.root_fs)}), mkfs_argv.items));
 
-    if (boot_part) |bp| {
-        // Limine ≥12 reads only FAT/ISO9660 — ext4 /boot is unreadable
-        // to its BIOS stage. grub keeps ext4.
-        if (std.mem.eql(u8, bootPartFs(cfg), "vfat")) {
-            try c.append(alloc, argv(alloc, &.{ "mkfs.vfat", "-F32", "-n", "boot", bp }, "format /boot as FAT32 (limine BIOS)"));
-        } else {
-            try c.append(alloc, argv(alloc, &.{ "mkfs.ext4", "-L", "boot", bp }, "format /boot as ext4"));
-        }
-    }
-
     if (swap_part) |sp|
         try c.append(alloc, argv(alloc, &.{ "mkswap", "-L", "swap", sp }, "format swap"));
 
@@ -352,12 +419,11 @@ fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, 
             try c.append(alloc, argv(alloc, &.{ "btrfs", "subvolume", "create", s(alloc, "/mnt/gentoo/{s}", .{sv}) }, s(alloc, "subvol {s}", .{sv})));
         try c.append(alloc, argv(alloc, &.{ "umount", "/mnt/gentoo" }, "unmount after subvol creation"));
     }
-    return step(alloc, "partition", "Partition disks", c);
 }
 
 /// The mount point where the root filesystem lands — subvol-aware.
-fn rootMountArgs(alloc: Allocator, cfg: *const Config) struct { dev: []const u8, opts: []const u8 } {
-    const dev = fsDevice(alloc, cfg);
+fn rootMountArgs(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) struct { dev: []const u8, opts: []const u8 } {
+    const dev = fsDevice(alloc, cfg, env);
     if (rootFsOf(cfg) == .btrfs)
         return .{ .dev = dev, .opts = "subvol=@root,compress=zstd:1,noatime" };
     return .{ .dev = dev, .opts = "" };
@@ -412,14 +478,46 @@ fn partIdent(alloc: Allocator, seed: u128, n: u32) []const u8 {
 }
 
 /// The partition index the root filesystem lands on (plain layouts;
-/// scheme=manual resolves it from the "/" row of disk.partitions).
-fn rootPartIdx(cfg: *const Config) u32 {
+/// scheme=manual resolves it from the "/" row of disk.partitions;
+/// alongside appends after the disk's highest existing GPT number).
+fn rootPartIdx(cfg: *const Config, env: ?*const detect.Env) u32 {
     if (cfg.disk.scheme == .manual)
         return config.manualRootPart(cfg) orelse 1;
+    if (cfg.disk.scheme == .alongside) {
+        const base = if (env) |e| blk: {
+            const di = diskOf(e, cfg.disk.device) orelse break :blk 0;
+            break :blk maxPartNum(di);
+        } else 0;
+        var n = base + 1;
+        if (cfg.disk.swap == .partition) n += 1;
+        return n;
+    }
     var n: u32 = 1; // esp (uefi) or biosboot (bios)
     if (cfg.disk.swap == .partition) n += 1;
     if (cfg.disk.boot_part) n += 1;
     return n + 1;
+}
+
+/// Detected disk matching the configured device path.
+fn diskOf(env: ?*const detect.Env, dev: []const u8) ?*const detect.DiskInfo {
+    const e = env orelse return null;
+    for (e.disks) |*d| if (std.mem.eql(u8, d.path, dev)) return d;
+    return null;
+}
+
+/// The detected ESP partition on a populated disk.
+fn alongsideEsp(di: *const detect.DiskInfo) ?*const detect.PartInfo {
+    for (di.parts) |*p| if (p.esp) return p;
+    return null;
+}
+
+/// Highest GPT partition number currently on the disk (0 = empty).
+fn maxPartNum(di: *const detect.DiskInfo) u32 {
+    var m: u32 = 0;
+    for (di.parts) |p| {
+        if (p.num > m) m = p.num;
+    }
+    return m;
 }
 
 /// Root filesystem for mkfs/fstab/rootfstype — under scheme=manual it
@@ -431,14 +529,45 @@ fn rootFsOf(cfg: *const Config) config.RootFs {
 }
 
 /// Partition number of the ESP — index 1 on guided UEFI layouts; under
-/// scheme=manual the row whose type is EF00 (any position).
-fn espPartIdx(cfg: *const Config) ?u32 {
+/// scheme=manual the row whose type is EF00 (any position); under
+/// alongside, the detected existing ESP's GPT number.
+fn espPartIdx(cfg: *const Config, env: ?*const detect.Env) ?u32 {
     if (cfg.disk.scheme == .manual) {
         for (cfg.disk.partitions, 0..) |p, i|
             if (std.ascii.eqlIgnoreCase(p.ptype, "EF00")) return @intCast(i + 1);
         return null;
     }
+    if (cfg.disk.scheme == .alongside) {
+        const di = diskOf(env, cfg.disk.device) orelse return null;
+        const esp = alongsideEsp(di) orelse return null;
+        return esp.num;
+    }
     return if (cfg.boot_mode == .uefi) 1 else null;
+}
+
+/// Device path of the ESP — detected partition for alongside (which
+/// reuses it), sgdisk-created index otherwise.
+fn espPath(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) ?[]const u8 {
+    if (cfg.disk.scheme == .alongside) {
+        const di = diskOf(env, cfg.disk.device) orelse return null;
+        const esp = alongsideEsp(di) orelse return null;
+        return esp.path;
+    }
+    const n = espPartIdx(cfg, env) orelse return null;
+    return partPath(alloc, cfg.disk.device, n);
+}
+
+/// Persistent fstab identifier for the ESP — the detected PARTUUID
+/// under alongside (we didn't create it), our assigned one otherwise.
+fn espIdent(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, seed: u128) ?[]const u8 {
+    if (cfg.disk.scheme == .alongside) {
+        const di = diskOf(env, cfg.disk.device) orelse return null;
+        const esp = alongsideEsp(di) orelse return null;
+        if (esp.partuuid.len == 0) return null;
+        return s(alloc, "PARTUUID={s}", .{esp.partuuid});
+    }
+    const n = espPartIdx(cfg, env) orelse return null;
+    return partIdent(alloc, seed, n);
 }
 
 /// 1-based partition number of the EF02 BIOS-boot partition — index 1
@@ -476,14 +605,14 @@ fn espInTarget(cfg: *const Config) []const u8 {
 
 /// Persistent root identifier for root= and fstab: mapper/LV names are
 /// already stable; plain partitions use their assigned PARTUUID.
-pub fn rootIdent(alloc: Allocator, cfg: *const Config, seed: u128) []const u8 {
+pub fn rootIdent(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, seed: u128) []const u8 {
     if (cfg.disk.lvm) return "/dev/vg0/root";
     if (cfg.disk.luks) return "/dev/mapper/cryptroot";
-    return partIdent(alloc, seed, rootPartIdx(cfg));
+    return partIdent(alloc, seed, rootPartIdx(cfg, env));
 }
 
 fn kernelArgs(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, seed: u128) []const u8 {
-    var r = s(alloc, "root={s}", .{rootIdent(alloc, cfg, seed)});
+    var r = s(alloc, "root={s}", .{rootIdent(alloc, cfg, env, seed)});
     // btrfs: install mounted subvol=@root — boot must select it too.
     if (rootFsOf(cfg) == .btrfs)
         r = s(alloc, "{s} rootflags=subvol=@root", .{r});
@@ -507,10 +636,10 @@ fn kernelArgs(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, see
     return s(alloc, "{s} rootfstype={s}", .{ r, @tagName(rootFsOf(cfg)) });
 }
 
-pub fn fsDevice(alloc: Allocator, cfg: *const Config) []const u8 {
+pub fn fsDevice(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) []const u8 {
     if (cfg.disk.lvm) return "/dev/vg0/root";
     if (cfg.disk.luks) return "/dev/mapper/cryptroot";
-    return partPath(alloc, cfg.disk.device, rootPartIdx(cfg));
+    return partPath(alloc, cfg.disk.device, rootPartIdx(cfg, env));
 }
 
 /// Partition index of the separate /boot partition, if configured.
@@ -535,9 +664,9 @@ fn rowMount(p: config.Partition) []const u8 {
     return "";
 }
 
-fn planMount(alloc: Allocator, cfg: *const Config) !Step {
+fn planMount(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !Step {
     var c: std.ArrayList(Cmd) = .empty;
-    const root = rootMountArgs(alloc, cfg);
+    const root = rootMountArgs(alloc, cfg, env);
     try c.append(alloc, argv(alloc, &.{ "mkdir", "-p", "/mnt/gentoo" }, "target mountpoint"));
     if (root.opts.len > 0)
         try c.append(alloc, argv(alloc, &.{ "mount", "-o", root.opts, root.dev, "/mnt/gentoo" }, "mount root"))
@@ -591,14 +720,20 @@ fn planMount(alloc: Allocator, cfg: *const Config) !Step {
         try c.append(alloc, argv(alloc, &.{ "mount", partPath(alloc, cfg.disk.device, bootPartIdx(cfg)), "/mnt/gentoo/boot" }, "mount /boot"));
     }
 
-    if (espPartIdx(cfg)) |esp_n| {
-        const esp = partPath(alloc, cfg.disk.device, esp_n);
+    if (espPath(alloc, cfg, env)) |esp| {
         const esp_target = espMountPoint(alloc, cfg);
         try c.append(alloc, argv(alloc, &.{ "mkdir", "-p", esp_target }, "ESP mountpoint"));
-        try c.append(alloc, argv(alloc, &.{ "mount", esp, esp_target }, "mount ESP"));
+        try c.append(alloc, argv(alloc, &.{ "mount", esp, esp_target }, if (cfg.disk.scheme == .alongside) "mount existing ESP (read-write, not reformatted)" else "mount ESP"));
     }
     if (cfg.disk.swap == .partition) {
-        const swap_n: u32 = if (cfg.boot_mode == .uefi) 2 else 2;
+        const swap_n: u32 = if (cfg.disk.scheme == .alongside) blk: {
+            // alongside: swap is the first appended partition (base+1).
+            const base = if (env) |e| blk2: {
+                const di = diskOf(e, cfg.disk.device) orelse break :blk2 0;
+                break :blk2 maxPartNum(di);
+            } else 0;
+            break :blk base + 1;
+        } else 2; // erase layouts: index 2 after esp/biosboot
         try c.append(alloc, argv(alloc, &.{ "swapon", partPath(alloc, cfg.disk.device, swap_n) }, "enable swap"));
     }
     // LVM thin home LV (non-btrfs roots only).
@@ -852,7 +987,7 @@ fn planPortage(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, se
     // emerge — so installkernel's initramfs generation (dracut
     // --hostonly) picks it up.
     if (cfg.disk.luks)
-        try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/crypttab", s(alloc, "cryptroot /dev/disk/by-partuuid/{s} none luks\n", .{partGuid(alloc, seed, rootPartIdx(cfg))})));
+        try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/crypttab", s(alloc, "cryptroot /dev/disk/by-partuuid/{s} none luks\n", .{partGuid(alloc, seed, rootPartIdx(cfg, env))})));
     return step(alloc, "portage-config", "Generate portage config", c);
 }
 
@@ -1098,15 +1233,15 @@ fn prepend(alloc: Allocator, head: []const u8, tail: []const []const u8) ![]cons
     return out;
 }
 
-fn planFstab(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
+fn planFstab(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, seed: u128) !Step {
     var c: std.ArrayList(Cmd) = .empty;
     var aw: std.Io.Writer.Allocating = .init(alloc);
     const w = &aw.writer;
-    const root = rootMountArgs(alloc, cfg);
+    const root = rootMountArgs(alloc, cfg, env);
     // Persistent identifiers only: PARTUUID for partitions (assigned by
     // our own sgdisk -u flags), mapper/LV names where already stable —
     // kernel /dev/sdX names can shift across renumbering.
-    const root_ident = rootIdent(alloc, cfg, seed);
+    const root_ident = rootIdent(alloc, cfg, env, seed);
     try w.writeAll("# generated by gentoo-installer (persistent ids)\n");
     if (cfg.disk.scheme == .manual) {
         // Every listed row maps to its assigned PARTUUID; root uses the
@@ -1138,10 +1273,17 @@ fn planFstab(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
         return step(alloc, "fstab", "Generate fstab", c);
     }
     try w.print("{s}\t/\t{s}\t{s}defaults\t0 1\n", .{ root_ident, @tagName(cfg.disk.root_fs), if (root.opts.len > 0) s(alloc, "{s},", .{root.opts}) else "" });
-    if (cfg.boot_mode == .uefi)
-        try w.print("{s}\t/efi\tvfat\tdefaults\t0 2\n", .{partIdent(alloc, seed, 1)});
-    if (cfg.disk.swap == .partition)
-        try w.print("{s}\tnone\tswap\tsw\t0 0\n", .{partIdent(alloc, seed, 2)}); // swap is always index 2 (after esp/biosboot)
+    if (cfg.boot_mode == .uefi) {
+        // alongside reuses the existing ESP — fstab carries ITS partuuid.
+        if (espIdent(alloc, cfg, env, seed)) |e|
+            try w.print("{s}\t/efi\tvfat\tdefaults\t0 2\n", .{e});
+    }
+    if (cfg.disk.swap == .partition) {
+        // erase layouts: swap is index 2 (after esp/biosboot); alongside
+        // appends it as the first new partition (root_idx - 1).
+        const swap_n = if (cfg.disk.scheme == .alongside) rootPartIdx(cfg, env) - 1 else 2;
+        try w.print("{s}\tnone\tswap\tsw\t0 0\n", .{partIdent(alloc, seed, swap_n)});
+    }
     if (cfg.disk.boot_part)
         try w.print("{s}\t/boot\t{s}\tdefaults\t0 2\n", .{ partIdent(alloc, seed, bootPartIdx(cfg)), bootPartFs(cfg) });
     if (cfg.disk.lvm and cfg.disk.home_part and cfg.disk.root_fs != .btrfs)
@@ -1544,16 +1686,46 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env,
                 .desc = "limine",
             } });
             if (cfg.boot_mode == .uefi) {
-                try c.append(alloc, .{ .exec = .{
-                    .argv = try alloc.dupe([]const u8, &.{ "mkdir", "-p", s(alloc, "{s}/EFI/BOOT", .{espInTarget(cfg)}) }),
-                    .chroot = true,
-                    .desc = "ESP layout",
-                } });
-                try c.append(alloc, .{ .exec = .{
-                    .argv = try alloc.dupe([]const u8, &.{ "cp", s(alloc, "/usr/share/limine/{s}", .{efiBootFile(cfg)}), s(alloc, "{s}/EFI/BOOT/", .{espInTarget(cfg)}) }),
-                    .chroot = true,
-                    .desc = s(alloc, "limine EFI binary ({s})", .{efiBootFile(cfg)}),
-                } });
+                if (cfg.disk.scheme == .alongside) {
+                    // Shared ESP: install under a scoped dir and register
+                    // a NVRAM entry — never overwrite EFI/BOOT (the
+                    // firmware fallback could belong to another loader).
+                    try c.append(alloc, .{ .exec = .{
+                        .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-boot/efibootmgr" }),
+                        .chroot = true,
+                        .desc = "efibootmgr (NVRAM entry on shared ESP)",
+                    } });
+                    try c.append(alloc, .{ .exec = .{
+                        .argv = try alloc.dupe([]const u8, &.{ "mkdir", "-p", s(alloc, "{s}/EFI/gentoo", .{espInTarget(cfg)}) }),
+                        .chroot = true,
+                        .desc = "scoped ESP dir",
+                    } });
+                    try c.append(alloc, .{ .exec = .{
+                        .argv = try alloc.dupe([]const u8, &.{ "cp", s(alloc, "/usr/share/limine/{s}", .{efiBootFile(cfg)}), s(alloc, "{s}/EFI/gentoo/", .{espInTarget(cfg)}) }),
+                        .chroot = true,
+                        .desc = s(alloc, "limine EFI binary ({s})", .{efiBootFile(cfg)}),
+                    } });
+                    try c.append(alloc, .{ .exec = .{
+                        .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "esp=$(findmnt -no SOURCE {s}) || exit 1; " ++
+                            "d=$(lsblk -no PKNAME \"$esp\"); p=$(lsblk -no PARTN \"$esp\"); " ++
+                            "[ -n \"$d\" ] && [ -n \"$p\" ] || exit 1; " ++
+                            "efibootmgr -c -d /dev/$d -p $p -L 'Gentoo (limine)' " ++
+                            "-l '\\EFI\\gentoo\\{s}'", .{ espInTarget(cfg), efiBootFile(cfg) }) }),
+                        .chroot = true,
+                        .desc = "efibootmgr: limine NVRAM entry (coexists with other loaders)",
+                    } });
+                } else {
+                    try c.append(alloc, .{ .exec = .{
+                        .argv = try alloc.dupe([]const u8, &.{ "mkdir", "-p", s(alloc, "{s}/EFI/BOOT", .{espInTarget(cfg)}) }),
+                        .chroot = true,
+                        .desc = "ESP layout",
+                    } });
+                    try c.append(alloc, .{ .exec = .{
+                        .argv = try alloc.dupe([]const u8, &.{ "cp", s(alloc, "/usr/share/limine/{s}", .{efiBootFile(cfg)}), s(alloc, "{s}/EFI/BOOT/", .{espInTarget(cfg)}) }),
+                        .chroot = true,
+                        .desc = s(alloc, "limine EFI binary ({s})", .{efiBootFile(cfg)}),
+                    } });
+                }
             } else {
                 // limine-bios.sys must exist on a partition BEFORE
                 // bios-install — it embeds a hint to the stage3's
@@ -1578,6 +1750,20 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env,
             // root fs — validation restricts bare-root BIOS to ext4).
             const stage_dir = if (cfg.boot_mode == .uefi) espInTarget(cfg) else "/boot";
             try c.append(alloc, wf(alloc, s(alloc, "/mnt/gentoo{s}/limine.conf", .{stage_dir}), limineConf(alloc, cfg, env, seed)));
+            if (cfg.disk.scheme == .alongside) {
+                // Menu merge: chainload the firmware's other loaders when
+                // they exist on the shared ESP. Guarded — absence is fine.
+                try c.append(alloc, .{ .exec = .{
+                    .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "esp={s}; " ++
+                        "if [ -f \"$esp/EFI/Microsoft/Boot/bootmgfw.efi\" ]; then " ++
+                        "printf '\\n/Windows\\n    protocol: efi_chainload\\n    image_path: boot():/EFI/Microsoft/Boot/bootmgfw.efi\\n' >> \"$esp/limine.conf\"; " ++
+                        "fi; if [ -f \"$esp/EFI/BOOT/BOOTX64.EFI\" ]; then " ++
+                        "printf '\\n/Other loader (fallback)\\n    protocol: efi_chainload\\n    image_path: boot():/EFI/BOOT/BOOTX64.EFI\\n' >> \"$esp/limine.conf\"; " ++
+                        "fi; true", .{espInTarget(cfg)}) }),
+                    .chroot = true,
+                    .desc = "limine.conf: chainload entries for existing ESP loaders",
+                } });
+            }
             // kernel-install hook: stage kernel+initramfs at the fixed
             // paths limine.conf references. installkernel invokes this on
             // every kernel add/remove — upgrades stay seamless.
@@ -1616,8 +1802,19 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env,
                 .@"nvidia-open", .@"nvidia-drivers" => true,
                 else => false,
             };
-            if (nvidia_prop)
-                try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/default/grub", "# generated by gentoo-installer\nGRUB_CMDLINE_LINUX_DEFAULT=\"nvidia-drm.modeset=1\"\n"));
+            if (nvidia_prop or cfg.disk.scheme == .alongside) {
+                const grub_default = s(alloc, "# generated by gentoo-installer\n{s}{s}", .{
+                    if (nvidia_prop) "GRUB_CMDLINE_LINUX_DEFAULT=\"nvidia-drm.modeset=1\"\n" else "",
+                    if (cfg.disk.scheme == .alongside) "GRUB_DISABLE_OS_PROBER=false\n" else "",
+                });
+                try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/default/grub", grub_default));
+            }
+            if (cfg.disk.scheme == .alongside)
+                try c.append(alloc, .{ .exec = .{
+                    .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-boot/os-prober" }),
+                    .chroot = true,
+                    .desc = "os-prober (dual-boot detection for grub.cfg)",
+                } });
             const target = if (cfg.boot_mode == .uefi) grubEfiTarget(cfg) else "i386-pc";
             if (cfg.boot_mode == .uefi)
                 try c.append(alloc, .{ .exec = .{
@@ -1706,7 +1903,7 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env,
             // the mounted ESP and creates the NVRAM entry; --alldrivers
             // lets it read kernels off /boot (btrfs/ext4/xfs).
             try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "refind-install", "--alldrivers", "--usedefault", partPath(alloc, cfg.disk.device, espPartIdx(cfg) orelse 1) }),
+                .argv = try alloc.dupe([]const u8, &.{ "refind-install", "--alldrivers", "--usedefault", espPath(alloc, cfg, env) orelse partPath(alloc, cfg.disk.device, 1) }),
                 .chroot = true,
                 .desc = "install rEFInd to ESP + NVRAM entry",
             } });
@@ -2263,4 +2460,136 @@ test "alt inits: init= cmdline + supervisor scaffolding" {
         try std.testing.expect(saw_zram); // init.d unit runs via openrc boot
         try std.testing.expect(saw_boot);
     }
+}
+
+test "alongside: preserve table, shrink ext4, reuse ESP, menu merge" {
+    const toml_mod = @import("toml.zig");
+    const doc_src =
+        \\arch = "amd64"
+        \\boot_mode = "uefi"
+        \\[disk]
+        \\device = "/dev/sda"
+        \\scheme = "alongside"
+        \\wipe = false
+        \\root_fs = "ext4"
+        \\swap = "zram"
+        \\space_src = "shrink"
+        \\shrink_part = "/dev/sda2"
+        \\shrink_mib = 20000
+        \\[stage3]
+        \\libc = "glibc"
+        \\toolchain = "gcc"
+        \\[system]
+        \\init = "openrc"
+        \\hostname = "dualboot"
+        \\kernel = "dist-bin"
+        \\bootloader = "limine"
+        \\[[users]]
+        \\name = "larry"
+        \\groups = ["wheel"]
+        \\password_hash = "$6$xyz"
+    ;
+    var doc = try toml_mod.parse(std.testing.allocator, doc_src, null);
+    defer doc.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const cfg = try config.decode(alloc, doc);
+
+    const sda1_esp_uuid = "AAAA-1111-2222-3333";
+    const sda2_uuid = "BBBB-4444-5555-6666";
+    var parts = [_]detect.PartInfo{
+        .{ .num = 1, .path = "/dev/sda1", .fs = "vfat", .partuuid = sda1_esp_uuid, .esp = true, .start_sector = 2048, .size_bytes = 512 << 20 },
+        .{ .num = 2, .path = "/dev/sda2", .fs = "ext4", .partuuid = sda2_uuid, .start_sector = 1050624, .size_bytes = 200 << 30, .fs_size_bytes = 200 << 30, .fs_free_bytes = 120 << 30 },
+    };
+    const sda2_end = @as(u64, 1050624) + (@as(u64, 200 << 30) / 512) - 1;
+    var disks = [_]detect.DiskInfo{.{
+        .name = "sda",
+        .path = "/dev/sda",
+        .size_bytes = 256 << 30,
+        .removable = false,
+        .label = "gpt",
+        .parts = &parts,
+    }};
+    const env = detect.Env{
+        .boot_mode = .uefi,
+        .arch = .amd64,
+        .ram_mib = 16384,
+        .cpu_count = 4,
+        .cpu_vendor = "GenuineIntel",
+        .cpu_flags = &.{},
+        .nics = &.{},
+        .gpus = &.{},
+        .disks = &disks,
+        .net_reachable = true,
+        .os_hint = "linux",
+    };
+
+    const plan = try build(alloc, &cfg, &env, .{}, 0x0123456789abcdef0123456789abcdef);
+
+    var saw_zap = false;
+    var saw_resize = false;
+    var saw_shrink_sgdisk = false;
+    var saw_new_root = false;
+    var saw_esp_mkfs = false;
+    var saw_efibootmgr = false;
+    var saw_efi_gentoo = false;
+    var saw_chainload_note = false;
+    var fstab_esp_ok = false;
+    var mount_esp_ok = false;
+    var saw_limine_conf = false;
+    for (plan.steps) |st| {
+        for (st.cmds) |cmd| {
+            switch (cmd) {
+                .exec => |e| {
+                    for (e.argv) |a| {
+                        if (std.mem.eql(u8, a, "--zap-all")) saw_zap = true;
+                        if (std.mem.indexOf(u8, a, "efibootmgr") != null) saw_efibootmgr = true;
+                        if (std.mem.indexOf(u8, a, "EFI/gentoo") != null) saw_efi_gentoo = true;
+                        if (std.mem.indexOf(u8, a, "bootmgfw.efi") != null) saw_chainload_note = true;
+                        if (std.mem.indexOf(u8, a, "mkfs.vfat") != null) saw_esp_mkfs = true;
+                    }
+                    if (std.mem.eql(u8, e.argv[0], "resize2fs") and std.mem.eql(u8, e.argv[1], "/dev/sda2"))
+                        saw_resize = true;
+                    if (std.mem.eql(u8, e.argv[0], "sgdisk")) {
+                        for (e.argv) |a| {
+                            if (std.mem.eql(u8, a, "-d2")) saw_shrink_sgdisk = true;
+                            if (std.mem.startsWith(u8, a, "-n3:")) saw_new_root = true;
+                        }
+                    }
+                },
+                .write_file => |w| {
+                    if (std.mem.eql(u8, w.path, "/mnt/gentoo/etc/fstab"))
+                        fstab_esp_ok = std.mem.indexOf(u8, w.content, "PARTUUID=" ++ sda1_esp_uuid) != null;
+                    if (std.mem.eql(u8, w.path, "/mnt/gentoo/efi/limine.conf") and
+                        std.mem.indexOf(u8, w.content, "root=") != null) saw_limine_conf = true;
+                },
+                else => {},
+            }
+            // mount step: existing ESP path under /mnt/gentoo/efi.
+            if (std.mem.eql(u8, st.id, "mount")) {
+                for (st.cmds) |mc| {
+                    if (mc == .exec) {
+                        const me = mc.exec;
+                        if (me.argv.len >= 3 and std.mem.eql(u8, me.argv[0], "mount") and
+                            std.mem.eql(u8, me.argv[me.argv.len - 1], "/mnt/gentoo/efi") and
+                            std.mem.eql(u8, me.argv[me.argv.len - 2], "/dev/sda1"))
+                            mount_esp_ok = true;
+                    }
+                }
+            }
+        }
+    }
+    _ = sda2_end;
+    try std.testing.expect(saw_limine_conf);
+    try std.testing.expect(!saw_zap);
+    try std.testing.expect(saw_resize);
+    try std.testing.expect(saw_shrink_sgdisk);
+    try std.testing.expect(saw_new_root);
+    try std.testing.expect(!saw_esp_mkfs); // existing ESP is never reformatted
+    try std.testing.expect(fstab_esp_ok);
+    try std.testing.expect(mount_esp_ok);
+    try std.testing.expect(saw_efibootmgr);
+    try std.testing.expect(saw_efi_gentoo);
+    try std.testing.expect(saw_chainload_note);
 }

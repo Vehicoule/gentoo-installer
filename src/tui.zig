@@ -229,7 +229,7 @@ pub const Tui = struct {
     }
 
     fn refreshErrors(t: *Tui) !void {
-        const errs = try engine.config.validate(t.alloc, &t.wiz.cfg, nvidiaTier(&t.wiz));
+        const errs = try engine.config.validate(t.alloc, &t.wiz.cfg, nvidiaTier(&t.wiz), if (t.wiz.env) |*e| e else null);
         t.errors.clearRetainingCapacity();
         for (errs) |e| try t.errors.append(t.alloc, e);
     }

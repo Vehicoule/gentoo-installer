@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """M5 scenario harness — drive variant installs end-to-end under QEMU.
 
-Usage: scenario.py <luks|bios|musl|dinit|runit> [phase-a|phase-b]   (default: both phases)
+Usage: scenario.py <luks|bios|musl|dinit|runit|alongside> [phase-a|phase-b]   (default: both phases)
 
   luks — UEFI install with disk.luks=true; phase B expects the dracut
          passphrase prompt on serial, enters it, reaches login.
@@ -13,6 +13,10 @@ Usage: scenario.py <luks|bios|musl|dinit|runit> [phase-a|phase-b]   (default: bo
   dinit — UEFI install with system.init=dinit; verifies the alt-init
          backend: gi-sysinit stage-1, dinit.d units + boot.d links,
          init=/sbin/dinit on the kernel cmdline.
+  alongside — dual-boot: fixture disk holds an ESP with a fake Windows
+         Boot Manager + EFI/BOOT fallback and an ext4 data partition;
+         the install shrinks the ext4, appends a Gentoo root, and must
+         leave every existing ESP file and the shrunk fs's data intact.
 """
 import os, secrets, shutil, subprocess, sys
 import pexpect
@@ -155,15 +159,76 @@ def phase_b(scn, disk):
     c.expect(rb"[$#]", timeout=20)
     c.sendline(b"uname -a; id; echo V-MARK-$?")
     c.expect(b"V-MARK-0", timeout=20)
+    # The survival checks need root — they ride inside the su command.
+    su_checks = b""
+    if scn == "alongside":
+        # Dual-boot invariants: the fake Windows Boot Manager and the
+        # EFI/BOOT fallback survive on the shared ESP, the shrunk ext4
+        # keeps its marker file, and a Gentoo NVRAM entry was added.
+        su_checks = (b"mkdir -p /tmp/esp /tmp/osd; mount /dev/vda1 /tmp/esp; "
+                     b"grep -q GI-WINDOWS-STUB /tmp/esp/EFI/Microsoft/Boot/bootmgfw.efi; "
+                     b"echo WINSTUB-$?; "
+                     b"grep -q GI-FALLBACK-STUB /tmp/esp/EFI/BOOT/BOOTX64.EFI; "
+                     b"echo FALLBACK-$?; "
+                     b"mount /dev/vda2 /tmp/osd; "
+                     b"grep -q GI-OS-DATA-MARKER /tmp/osd/gi-marker.txt; "
+                     b"echo DATA-OK-$?; "
+                     b"df -m /tmp/osd | tail -1; efibootmgr | grep -i gentoo; "
+                     b"echo NVRAM-$?; ")
     # runit/dinit don't answer util-linux poweroff (no sysvinit compat
     # ioctl chain by default) — sysrq 'o' powers off regardless of PID1.
-    c.sendline(b"su - root -c 'echo SU-OK; (poweroff 2>/dev/null || echo o > /proc/sysrq-trigger)'")
+    c.sendline(b"su - root -c 'echo SU-OK; " + su_checks +
+               b"(poweroff 2>/dev/null || echo o > /proc/sysrq-trigger)'")
     c.expect(b"[Pp]assword", timeout=20)
     c.sendline(ROOT_PW.encode())
     c.expect(b"SU-OK", timeout=20)
+    if scn == "alongside":
+        c.expect(b"WINSTUB-0", timeout=30)
+        print("== ESP files intact")
+        c.expect(b"FALLBACK-0", timeout=20)
+        c.expect(b"DATA-OK-0", timeout=30)
+        print("== shrunk fs data intact")
+        c.expect(b"NVRAM-0", timeout=20)
+        print("== efibootmgr entry present")
     c.expect(pexpect.EOF, timeout=60)
     log.close()
     print("== PHASE B PASS — %s scenario verified" % scn)
+
+def make_disk(scn, disk):
+    """Fresh target disk; alongside gets a populated 'foreign OS' fixture."""
+    if scn != "alongside":
+        subprocess.run(["qemu-img", "create", "-f", "qcow2", disk, "24G"], check=True)
+        return
+    subprocess.run(["qemu-img", "create", "-f", "qcow2", disk, "24G"], check=True)
+    nbd = "/dev/nbd0"
+    try:
+        subprocess.run(["sudo", "-n", "modprobe", "nbd", "max_part=8"], check=True)
+        subprocess.run(["sudo", "-n", "qemu-nbd", "-c", nbd, disk], check=True)
+        # p1: ESP with a fake Windows Boot Manager + fallback loader.
+        # p2: 18 GiB ext4 with a marker file — the shrink must keep it.
+        subprocess.run(["sudo", "-n", "sgdisk", "-n1:0:+512M", "-t1:EF00",
+                        "-c1:ESP", "-n2:0:+18G", "-t2:8300", "-c2:os-data", nbd],
+                       check=True)
+        subprocess.run(["sudo", "-n", "partprobe", nbd], check=True)
+        subprocess.run(["sudo", "-n", "mkfs.vfat", "-F32", nbd + "p1"], check=True)
+        subprocess.run(["sudo", "-n", "mkfs.ext4", "-F", "-L", "os-data", nbd + "p2"],
+                       check=True)
+        mnt = "/tmp/gi-fixture-mnt"
+        os.makedirs(mnt, exist_ok=True)
+        subprocess.run(["sudo", "-n", "mount", nbd + "p1", mnt], check=True)
+        subprocess.run("sudo -n mkdir -p '%s/EFI/Microsoft/Boot' '%s/EFI/BOOT'" % (mnt, mnt),
+                       shell=True, check=True)
+        subprocess.run("echo GI-WINDOWS-STUB | sudo -n tee '%s/EFI/Microsoft/Boot/bootmgfw.efi' >/dev/null" % mnt,
+                       shell=True, check=True)
+        subprocess.run("echo GI-FALLBACK-STUB | sudo -n tee '%s/EFI/BOOT/BOOTX64.EFI' >/dev/null" % mnt,
+                       shell=True, check=True)
+        subprocess.run(["sudo", "-n", "umount", mnt], check=True)
+        subprocess.run(["sudo", "-n", "mount", nbd + "p2", mnt], check=True)
+        subprocess.run("echo GI-OS-DATA-MARKER | sudo -n tee '%s/gi-marker.txt' >/dev/null" % mnt,
+                       shell=True, check=True)
+        subprocess.run(["sudo", "-n", "umount", mnt], check=True)
+    finally:
+        subprocess.run(["sudo", "-n", "qemu-nbd", "-d", nbd], check=False)
 
 if __name__ == "__main__":
     scn = sys.argv[1] if len(sys.argv) > 1 else "luks"
@@ -176,7 +241,7 @@ if __name__ == "__main__":
             vars_fd = "%s/%s-vars.fd" % (HERE, scn)
             if os.path.exists(vars_fd):
                 os.remove(vars_fd)
-            subprocess.run(["qemu-img", "create", "-f", "qcow2", disk, "24G"], check=True)
+            make_disk(scn, disk)
             phase_a(scn, disk)
         if which in ("both", "phase-b"):
             phase_b(scn, disk)

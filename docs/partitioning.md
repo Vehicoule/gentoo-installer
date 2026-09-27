@@ -128,10 +128,13 @@ detect OSes ──► space_src?
 ```
 
 - Never reformats the existing ESP; Windows Boot Manager preserved.
-  Bootloader files land under a preset-scoped dir (`EFI/<preset.id>`)
-  so a new install never overwrites another loader — the ESP write
-  list is part of the plan preview, and the alongside ack notes the
-  ESP gains files (nothing removed).
+  Bootloader files land under a scoped dir (`EFI/gentoo` for the stock
+  preset — `EFI/<preset.id>`) so a new install never overwrites another
+  loader — the ESP write list is part of the plan preview, and the
+  alongside ack notes the ESP gains files (nothing removed). limine
+  also appends `efi_chainload` stanzas for detected loaders
+  (`EFI/Microsoft/Boot/bootmgfw.efi`, `EFI/BOOT/BOOTX64.EFI`); grub
+  emerges os-prober with `GRUB_DISABLE_OS_PROBER=false`.
 - `resize_fs` runs **before** the partition shrink so fs metadata is
   consistent; ntfsresize then sgdisk resize; `ntfsfix`-clean required
   first (dirty NTFS ⇒ refuse with instructions to `chkdsk` / full
@@ -195,7 +198,8 @@ a "no swap at all" warning when RAM < 8 GiB.
 ## VALIDATE (planner)
 
 - Layout bounds: sum(parts) ≤ disk, all MiB-aligned, GPT entry limits.
-- `alongside` ⇒ `wipe=false`, ESP exists, `space_src` resolvable.
+- `alongside` ⇒ `wipe=false`, UEFI boot mode, GPT label, ESP exists,
+  `space_src` resolvable (BIOS ⇒ refuse: no foreign-OS chainload path).
 - `luks|lvm|boot_part` ⇒ `initramfs != none`.
 - `root_fs` on target part: fs tools present on live env
   (`mkfs.btrfs`/`mkfs.xfs`/`mkfs.f2fs`/`bcachefs` availability gate —

@@ -163,7 +163,7 @@ pub fn main(init: std.process.Init) !void {
         break :blk if (!any) .absent else if (turing) .open_capable else .legacy;
     } else null;
 
-    const errs = try engine.config.validate(alloc, &cfg, nvidia);
+    const errs = try engine.config.validate(alloc, &cfg, nvidia, if (env_opt) |*e| e else null);
     if (errs.len > 0) {
         for (errs) |e| try errw.print("validate: {s}\n", .{e});
         try errw.flush();
@@ -173,15 +173,6 @@ pub fn main(init: std.process.Init) !void {
         try out.writeAll("config valid\n");
         try out.flush();
         return;
-    }
-
-    // Exec-mode gates for schemes: alongside doesn't create the root
-    // partition yet (partition-level detection + dual-boot logic are
-    // M6) — refuse real runs, dry-run still prints the plan.
-    if (cmd == .run and !dry_run and cfg.disk.scheme == .alongside) {
-        try errw.print("scheme 'alongside' is not executable yet (dual-boot lands in M6) — use --dry-run to preview\n", .{});
-        try errw.flush();
-        std.process.exit(2);
     }
 
     // Exec-mode gates for choices with no complete backend: a manual
@@ -220,8 +211,10 @@ pub fn main(init: std.process.Init) !void {
     // configured disk — an answer file alone must never wipe a disk.
     // manual is always destructive: every listed row is partitioned
     // and formatted whether or not the table gets wiped first.
+    // alongside mutates too: fs/partition shrink is the first
+    // irreversible op, so it needs the same typed confirmation.
     const destructive = cfg.disk.scheme == .@"efi-swap-root" or cfg.disk.scheme == .@"bios-boot-swap-root" or
-        cfg.disk.scheme == .manual;
+        cfg.disk.scheme == .manual or cfg.disk.scheme == .alongside;
     if (cmd == .run and !dry_run and destructive) {
         const cd = confirm_dev orelse {
             try errw.print("refusing to run without --confirm {s} (this will wipe the target disk)\n", .{cfg.disk.device});
@@ -586,7 +579,7 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
             try writeResult(out, req);
             // validate delta — the whole-config errors (frontend maps
             // them to the owning page by field prefix)
-            const errs = engine.config.validate(req_alloc, &wiz.cfg, wizNvidia(&wiz)) catch &.{};
+            const errs = engine.config.validate(req_alloc, &wiz.cfg, wizNvidia(&wiz), if (wiz.env) |*e| e else null) catch &.{};
             try writeValidate(out, null, errs);
         } else if (std.mem.eql(u8, op, "set_config")) {
             // {config:{dotted.path:value,…}} — same as N `set` ops; a
@@ -615,17 +608,17 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
                 try writeErr(out, req, set_errs.written())
             else
                 try writeResult(out, req);
-            const errs = engine.config.validate(req_alloc, &wiz.cfg, wizNvidia(&wiz)) catch &.{};
+            const errs = engine.config.validate(req_alloc, &wiz.cfg, wizNvidia(&wiz), if (wiz.env) |*e| e else null) catch &.{};
             try writeValidate(out, null, errs);
         } else if (std.mem.eql(u8, op, "get_config")) {
             try wiz.emitConfigJson(out, req);
         } else if (std.mem.eql(u8, op, "validate")) {
-            const errs = engine.config.validate(req_alloc, &wiz.cfg, wizNvidia(&wiz)) catch &.{};
+            const errs = engine.config.validate(req_alloc, &wiz.cfg, wizNvidia(&wiz), if (wiz.env) |*e| e else null) catch &.{};
             try writeValidate(out, req, errs);
         } else if (std.mem.eql(u8, op, "plan")) {
             // A plan is executable shell — never emit one from an
             // invalid config (e.g. an unsafe mirror a `set` accepted).
-            const perrs = engine.config.validate(req_alloc, &wiz.cfg, wizNvidia(&wiz)) catch &.{};
+            const perrs = engine.config.validate(req_alloc, &wiz.cfg, wizNvidia(&wiz), if (wiz.env) |*e| e else null) catch &.{};
             if (perrs.len > 0) {
                 try writeValidate(out, req, perrs);
                 try out.flush();
@@ -789,7 +782,7 @@ fn stepEventCb(ctx: ?*anyopaque, i: usize, of: usize, id: []const u8, state: []c
 /// streaming `step` events, finished by a `done` or `error` event.
 fn doInstall(io: std.Io, alloc: std.mem.Allocator, wiz: *engine.wizard.Wizard, out: *std.Io.Writer, req: ?u64, dry: bool, jl: JsonLine) !void {
     const cfg = &wiz.cfg;
-    const errs = engine.config.validate(alloc, cfg, wizNvidia(wiz)) catch &.{};
+    const errs = engine.config.validate(alloc, cfg, wizNvidia(wiz), if (wiz.env) |*e| e else null) catch &.{};
     if (errs.len > 0) {
         try writeValidate(out, req, errs);
         return;
@@ -818,13 +811,6 @@ fn doInstall(io: std.Io, alloc: std.mem.Allocator, wiz: *engine.wizard.Wizard, o
             try writeErr(out, req, aw.written());
             return;
         }
-        // alongside is plan-only — partition-level detection and
-        // dual-boot are M6; proceeding would mount an unpopulated plan
-        // and touch existing data wrongly.
-        if (cfg.disk.scheme == .alongside) {
-            try writeErr(out, req, "scheme 'alongside' is not executable yet (dual-boot lands in M6) — dry_run still previews");
-            return;
-        }
         if (cfg.system.kernel == .manual and cfg.system.kernel_config.len == 0) {
             try writeErr(out, req, "kernel=manual needs system.kernel_config=<path to .config>");
             return;
@@ -842,7 +828,7 @@ fn doInstall(io: std.Io, alloc: std.mem.Allocator, wiz: *engine.wizard.Wizard, o
             return;
         }
         const destructive = cfg.disk.scheme == .@"efi-swap-root" or cfg.disk.scheme == .@"bios-boot-swap-root" or
-            cfg.disk.scheme == .manual;
+            cfg.disk.scheme == .manual or cfg.disk.scheme == .alongside;
         if (destructive) {
             const confirm = jstr(jl, "confirm") orelse {
                 try writeErr(out, req, "destructive install needs confirm=<disk basename>");
