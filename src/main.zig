@@ -193,15 +193,12 @@ pub fn main(init: std.process.Init) !void {
         try errw.flush();
         std.process.exit(2);
     }
-    if (cmd == .run and !dry_run) {
-        switch (cfg.system.init) {
-            .runit, .s6, .dinit => {
-                try errw.print("init={s} is not executable yet — its boot+service backends land in M6; use openrc|systemd or --dry-run to preview\n", .{@tagName(cfg.system.init)});
-                try errw.flush();
-                std.process.exit(2);
-            },
-            else => {},
-        }
+    if (cmd == .run and !dry_run and cfg.system.init == .s6) {
+        // s6-linux-init needs a generated boot dir (s6-linux-init-maker)
+        // + a compiled s6-rc database — still gated; runit/dinit exec.
+        try errw.print("init=s6 is not executable yet — its s6-linux-init backend lands in a later milestone; use runit|dinit|openrc|systemd or --dry-run to preview\n", .{});
+        try errw.flush();
+        std.process.exit(2);
     }
     // shim needs the MOK-enroll + signed-grub chain — not built in M1.
     // (sbctl's create/enroll/sign sequence is complete and fails loudly
@@ -832,8 +829,8 @@ fn doInstall(io: std.Io, alloc: std.mem.Allocator, wiz: *engine.wizard.Wizard, o
             try writeErr(out, req, "kernel=manual needs system.kernel_config=<path to .config>");
             return;
         }
-        if (cfg.system.init == .runit or cfg.system.init == .s6 or cfg.system.init == .dinit) {
-            try writeErr(out, req, "run/svc-install for runit/s6/dinit lands in M6");
+        if (cfg.system.init == .s6) {
+            try writeErr(out, req, "init=s6 is not executable yet — s6-linux-init backend lands in a later milestone");
             return;
         }
         if (cfg.security.secure_boot == .shim) {

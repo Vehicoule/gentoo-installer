@@ -497,6 +497,13 @@ fn kernelArgs(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, see
             r = s(alloc, "{s} nvidia-drm.modeset=1", .{r}),
         else => {},
     }
+    // Alt inits need their supervisor binary as PID1 — the stage3 ships
+    // sysvinit+openrc, so init= swaps the chain at kernel time.
+    switch (cfg.system.init) {
+        .runit => r = s(alloc, "{s} init=/sbin/runit-init", .{r}),
+        .dinit => r = s(alloc, "{s} init=/sbin/dinit", .{r}),
+        else => {},
+    }
     return s(alloc, "{s} rootfstype={s}", .{ r, @tagName(rootFsOf(cfg)) });
 }
 
@@ -1226,10 +1233,12 @@ fn planSystemConfig(alloc: Allocator, cfg: *const Config) !Step {
                 try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-apps/zram-generator" }), .chroot = true, .desc = "zram-generator" } });
                 try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/systemd/zram-generator.conf", "[zram0]\nzram-size = min(ram / 2, 8192)\ncompression-algorithm = zstd\n"));
             },
-            .openrc => {
+            .openrc, .runit, .s6, .dinit => {
                 // ::gentoo ships no openrc zram service (zram-init was
                 // tree-cleaned; zram-generator is systemd-only), so the plan
                 // installs a small runscript driving util-linux zramctl.
+                // Alt inits all run `openrc sysinit`+`openrc boot` in their
+                // stage-1, which is what executes this boot-runlevel unit.
                 try c.append(alloc, .{ .write_file = .{
                     .path = "/mnt/gentoo/etc/init.d/zram",
                     .mode = 0o755,
@@ -1275,7 +1284,6 @@ fn planSystemConfig(alloc: Allocator, cfg: *const Config) !Step {
                 } });
                 try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "rc-update", "add", "zram", "boot" }), .chroot = true, .desc = "enable zram" } });
             },
-            else => try c.append(alloc, .{ .note = "zram on this init lands with its backend in M6" }),
         }
     }
     return step(alloc, "system-config", "System config", c);
@@ -1360,12 +1368,70 @@ fn planServices(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !
     if (cfg.services.logger and init != .systemd) try enables.append(alloc, .{ .name = "sysklogd", .runlevel = "default" });
 
     // Alt-init packages: the stage3 is OpenRC-flavoured, so the chosen
-    // init is installed on top. Service-level migration (sv dirs, dinit
-    // links) lands with the init backends in M6.
+    // init is installed on top and takes over as PID1 via init= on the
+    // kernel cmdline (kernelArgs). All of them keep openrc for the
+    // sysinit+boot runlevels — udev, fsck, mounts, sysctl, our zram unit —
+    // and only the longrun supervision is init-native.
     switch (init) {
-        .dinit => try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-process/dinit" }), .chroot = true, .desc = "dinit package (service migration is M6)" } }),
-        .runit => try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-process/runit" }), .chroot = true, .desc = "runit package (service migration is M6)" } }),
-        .s6 => try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-apps/s6", "sys-apps/s6-rc" }), .chroot = true, .desc = "s6 + s6-rc packages (service migration is M6)" } }),
+        .dinit => {
+            // dinit lives in GURU as sys-apps/dinit (~amd64 only) —
+            // enable the repo, unmask, and drop sysvinit FIRST: the
+            // ebuild's `dosym dinit /sbin/init` collides with sysvinit's
+            // /sbin/init, and its !sys-apps/sysvinit block wants it gone.
+            try c.append(alloc, .{ .write_file = .{
+                .path = "/mnt/gentoo/etc/portage/package.accept_keywords/dinit",
+                .mode = 0o644,
+                .content = "sys-apps/dinit ~amd64\n",
+            } });
+            try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "app-eselect/eselect-repository", "dev-vcs/git" }), .chroot = true, .desc = "eselect-repository + git (for GURU)" } });
+            try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "eselect", "repository", "enable", "guru" }), .chroot = true, .desc = "enable GURU overlay" } });
+            try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emaint", "sync", "-r", "guru" }), .chroot = true, .desc = "sync GURU" } });
+            try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "--unmerge", "sys-apps/sysvinit" }), .chroot = true, .desc = "unmerge sysvinit (dinit takes PID1)" } });
+            try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-apps/dinit" }), .chroot = true, .desc = "dinit (PID1 + service manager)" } });
+        },
+        .runit => try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-process/runit" }), .chroot = true, .desc = "runit (PID1 + runsvdir)" } }),
+        .s6 => try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-apps/s6", "sys-apps/s6-rc" }), .chroot = true, .desc = "s6 + s6-rc packages" } }),
+        else => {},
+    }
+    // Boot scaffolding per init — a shared stage-1 script every
+    // supervisor execs before taking over service supervision.
+    if (init != .openrc and init != .systemd) {
+        try c.append(alloc, .{ .write_file = .{
+            .path = "/mnt/gentoo/usr/libexec/gi-sysinit",
+            .mode = 0o755,
+            .content = "#!/bin/sh\n# early boot stays with openrc — its sysinit/boot runlevels cover\n# udev, fsck, mounts, sysctl and the generated init.d units.\n/sbin/openrc sysinit\n/sbin/openrc boot\n",
+        } });
+    }
+    switch (init) {
+        .dinit => {
+            // The boot target is a real service: `waits-for.d` makes every
+            // link in boot.d/ a unit dinit starts before `boot` completes.
+            try c.append(alloc, argv(alloc, &.{ "mkdir", "-p", "/mnt/gentoo/etc/dinit.d/boot.d" }, "dinit.d dirs"));
+            try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/dinit.d/boot",
+                "type = internal\nwaits-for.d: boot.d\n"));
+            try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/dinit.d/sysinit",
+                "type = scripted\ncommand = /usr/libexec/gi-sysinit\n"));
+            // gettys on the vt consoles (serial getty is added by tests/
+            // installs that need it — console= decides what's live).
+            for ([_]u8{ '1', '2', '3', '4' }) |n| {
+                const name = s(alloc, "tty{c}", .{n});
+                try c.append(alloc, wf(alloc, s(alloc, "/mnt/gentoo/etc/dinit.d/{s}", .{name}),
+                    s(alloc, "type = process\ncommand = /sbin/agetty {s} 38400 linux\nrestart = true\ndepends-on = sysinit\n", .{name})));
+                try c.append(alloc, argv(alloc, &.{ "ln", "-sf", s(alloc, "../{s}", .{name}), s(alloc, "/mnt/gentoo/etc/dinit.d/boot.d/{s}", .{name}) }, s(alloc, "boot.d {s}", .{name})));
+            }
+            try c.append(alloc, argv(alloc, &.{ "ln", "-sf", "../sysinit", "/mnt/gentoo/etc/dinit.d/boot.d/sysinit" }, "boot.d sysinit"));
+        },
+        .runit => {
+            // runit-init runs /etc/runit/{1,2,3}: sysinit via openrc,
+            // then runsvdir on the default sv dir, openrc shutdown last.
+            try c.append(alloc, argv(alloc, &.{ "mkdir", "-p", "/mnt/gentoo/etc/runit/runsvdir/default", "/mnt/gentoo/etc/sv" }, "runit dirs"));
+            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/etc/runit/1", .mode = 0o755,
+                .content = "#!/bin/sh\nexec /usr/libexec/gi-sysinit\n" } });
+            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/etc/runit/2", .mode = 0o755,
+                .content = "#!/bin/sh\nexec /usr/bin/runsvdir -P /etc/runit/runsvdir/default\n" } });
+            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/etc/runit/3", .mode = 0o755,
+                .content = "#!/bin/sh\nexec /sbin/openrc shutdown\n" } });
+        },
         else => {},
     }
 
@@ -1373,12 +1439,59 @@ fn planServices(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !
         switch (init) {
             .systemd => try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "systemctl", "enable", e.name }), .chroot = true, .desc = s(alloc, "enable {s}", .{e.name}) } }),
             .openrc => try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "rc-update", "add", e.name, e.runlevel }), .chroot = true, .desc = s(alloc, "rc-update {s}", .{e.name}) } }),
-            .runit => try c.append(alloc, .{ .note = s(alloc, "runit: ln -s /etc/sv/{s} /run/runit/service/", .{e.name}) }),
-            .s6 => try c.append(alloc, .{ .note = s(alloc, "s6-rc: add {s} to default bundle", .{e.name}) }),
-            .dinit => try c.append(alloc, .{ .note = s(alloc, "dinit: enable {s}.d service link", .{e.name}) }),
+            .runit, .dinit, .s6 => {
+                // sysklogd is two daemons — one supervised unit each.
+                const units: []const []const u8 = if (std.mem.eql(u8, e.name, "sysklogd"))
+                    &.{ "syslogd", "klogd" }
+                else
+                    &.{e.name};
+                for (units) |u| {
+                    const cmd = altSvcCmd(u) orelse {
+                        try c.append(alloc, .{ .note = s(alloc, "no {s} unit for {s} — enable it manually", .{ @tagName(init), u }) });
+                        continue;
+                    };
+                    switch (init) {
+                        .runit => {
+                            try c.append(alloc, .{ .write_file = .{
+                                .path = s(alloc, "/mnt/gentoo/etc/sv/{s}/run", .{u}),
+                                .mode = 0o755,
+                                .content = s(alloc, "#!/bin/sh\nexec {s} 2>&1\n", .{cmd}),
+                            } });
+                            try c.append(alloc, argv(alloc, &.{ "ln", "-sf", s(alloc, "/etc/sv/{s}", .{u}), s(alloc, "/mnt/gentoo/etc/runit/runsvdir/default/{s}", .{u}) }, s(alloc, "runit enable {s}", .{u})));
+                        },
+                        .dinit => {
+                            try c.append(alloc, wf(alloc, s(alloc, "/mnt/gentoo/etc/dinit.d/{s}", .{u}),
+                                s(alloc, "type = process\ncommand = {s}\nrestart = true\ndepends-on = sysinit\n", .{cmd})));
+                            try c.append(alloc, argv(alloc, &.{ "ln", "-sf", s(alloc, "../{s}", .{u}), s(alloc, "/mnt/gentoo/etc/dinit.d/boot.d/{s}", .{u}) }, s(alloc, "dinit enable {s}", .{u})));
+                        },
+                        .s6 => try c.append(alloc, .{ .note = s(alloc, "s6-rc: add {s} to the default bundle", .{u}) }),
+                        else => unreachable,
+                    }
+                }
+            },
         }
     }
     return step(alloc, "services", "Enable services", c);
+}
+
+/// Foreground invocation for a supervised service — the command a
+/// runit run script or dinit service file execs. null for units with
+/// no alt-init equivalent (openrc init.d scripts like net.*).
+fn altSvcCmd(name: []const u8) ?[]const u8 {
+    const map = .{
+        .{ "dhcpcd", "/sbin/dhcpcd -B -q" },
+        .{ "NetworkManager", "/usr/sbin/NetworkManager -n" },
+        .{ "sshd", "/usr/sbin/sshd -D" },
+        .{ "cronie", "/usr/sbin/crond -n" },
+        .{ "chronyd", "/usr/sbin/chronyd -n" },
+        .{ "syslogd", "/usr/sbin/syslogd -n" },
+        .{ "klogd", "/usr/sbin/klogd -n" },
+        .{ "iwd", "/usr/libexec/iwd" },
+    };
+    inline for (map) |m| {
+        if (std.mem.eql(u8, name, m[0])) return m[1];
+    }
+    return null;
 }
 
 /// packages step: preset-resolved sets + config atoms actually emerge.
@@ -2093,5 +2206,61 @@ test "installkernel package.use always carries the initramfs generator" {
         const cfg = try config.decode(alloc, doc);
         const use = try packageUse(alloc, &cfg);
         try std.testing.expect(std.mem.indexOf(u8, use, tc.want) != null);
+    }
+}
+
+test "alt inits: init= cmdline + supervisor scaffolding" {
+    const cases = [_]struct { init: []const u8, arg: []const u8, want: []const u8 }{
+        .{ .init = "dinit", .arg = "init=/sbin/dinit", .want = "/mnt/gentoo/etc/dinit.d/sysinit" },
+        .{ .init = "runit", .arg = "init=/sbin/runit-init", .want = "/mnt/gentoo/etc/runit/2" },
+    };
+    for (cases) |tc| {
+        var doc = try @import("toml.zig").parse(std.testing.allocator,
+            \\arch = "amd64"
+            \\boot_mode = "uefi"
+            \\[disk]
+            \\device = "/dev/vda"
+            \\swap = "zram"
+            \\[system]
+            \\init = "dinit"
+            \\[security]
+            \\hardening = "standard"
+            \\selinux = false
+            \\[[users]]
+            \\name = "u"
+            \\password_hash = "$6$x$y"
+        , null);
+        defer doc.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        var cfg = try config.decode(alloc, doc);
+        if (std.mem.eql(u8, tc.init, "runit")) cfg.system.init = .runit;
+        const plan = try build(alloc, &cfg, null, .{}, null);
+        var saw_arg = false;
+        var saw_scaffold = false;
+        var saw_sysinit = false;
+        var saw_zram = false;
+        var saw_boot = std.mem.eql(u8, tc.init, "runit"); // only dinit needs the boot svc
+        for (plan.steps) |st| {
+            for (st.cmds) |cmd| {
+                switch (cmd) {
+                    .write_file => |w| {
+                        if (std.mem.indexOf(u8, w.content, tc.arg) != null) saw_arg = true;
+                        if (std.mem.eql(u8, w.path, tc.want)) saw_scaffold = true;
+                        if (std.mem.eql(u8, w.path, "/mnt/gentoo/usr/libexec/gi-sysinit")) saw_sysinit = true;
+                        if (std.mem.eql(u8, w.path, "/mnt/gentoo/etc/init.d/zram")) saw_zram = true;
+                        if (std.mem.eql(u8, w.path, "/mnt/gentoo/etc/dinit.d/boot") and
+                            std.mem.indexOf(u8, w.content, "waits-for.d") != null) saw_boot = true;
+                    },
+                    else => {},
+                }
+            }
+        }
+        try std.testing.expect(saw_arg);
+        try std.testing.expect(saw_scaffold);
+        try std.testing.expect(saw_sysinit);
+        try std.testing.expect(saw_zram); // init.d unit runs via openrc boot
+        try std.testing.expect(saw_boot);
     }
 }

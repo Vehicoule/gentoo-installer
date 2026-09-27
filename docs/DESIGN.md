@@ -143,7 +143,7 @@ sensible):
 13. **system-config** — hostname, `/etc/hosts`, root password, user
     accounts (`useradd -m -G wheel,audio,video,...`), sudo/doas.
 14. **services** — init-appropriate: `systemctl enable` / `rc-update add`
-    / runit `ln -s /etc/sv/* /run/runit/service` / s6-rc bundle edits,
+    / runit `/etc/sv/<n>/run` + runsvdir link / dinit unit + boot.d link,
     for network (dhcpcd/NetworkManager/netifrc/systemd-networkd), sshd,
     logger (sysklogd on OpenRC), cron (cronie), chrony.
 15. **bootloader** — GRUB (BIOS `grub-install /dev/X`; UEFI
@@ -380,6 +380,23 @@ those installs extract a normal stage3 and swap the init. An
 wiring per init) keeps the pipeline agnostic. Constraint: `musl` removes
 only systemd — the supervision inits work fine on musl.
 
+Alt-init layout (M6): every alt init keeps openrc for the **sysinit +
+boot** runlevels — udev, fsck, mounts, sysctl, and the init.d units
+(incl. zram) stay stock via the generated `/usr/libexec/gi-sysinit`
+(`openrc sysinit` → `openrc boot`); only longrun supervision is
+init-native. `init=` on the kernel cmdline swaps PID1:
+
+- **runit** — `init=/sbin/runit-init`: `/etc/runit/1` execs
+  gi-sysinit, `/2` `exec runsvdir -P /etc/runit/runsvdir/default`,
+  `/3` `exec openrc shutdown`; services get `/etc/sv/<n>/run`
+  (`exec <foreground cmd>`) symlinked into the runsvdir.
+- **dinit** — `init=/sbin/dinit`: a scripted `sysinit` unit runs
+  gi-sysinit, tty1-4 are process services (`restart`, `depends-on =
+  sysinit`), and units link into `boot.d/` (the implicit boot target).
+- **s6** — exec-gated for now: s6-linux-init needs a generated
+  skeldir + compiled s6-rc db; `plan`/`--dry-run` preview it, `run`
+  refuses.
+
 ## Headless protocol (GUI ↔ engine)
 
 `gentoo-installer --headless` (or `gentoo-installer wizard --headless`):
@@ -461,7 +478,7 @@ GUI is a separate build artifact; the TUI/engine binary stays dependency-free.
   proprietary NVIDIA driver selection
   paths; BIOS/CSM boot path; arm64 + riscv64 bring-up.
 - **M6** — secure boot signing flow (sbctl path first), dual-boot
-  alongside-mode + menu merge, runit/s6/dinit init-backend exploration.
+  alongside-mode + menu merge, runit/dinit init backends (s6 follows).
 - **M7** — distro preset layer hardening (branding, extra steps,
   post-install hooks), docs, 1.0.
 

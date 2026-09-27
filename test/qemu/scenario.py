@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """M5 scenario harness — drive variant installs end-to-end under QEMU.
 
-Usage: scenario.py <luks|bios|musl> [phase-a|phase-b]   (default: both phases)
+Usage: scenario.py <luks|bios|musl|dinit|runit> [phase-a|phase-b]   (default: both phases)
 
   luks — UEFI install with disk.luks=true; phase B expects the dracut
          passphrase prompt on serial, enters it, reaches login.
@@ -10,6 +10,9 @@ Usage: scenario.py <luks|bios|musl> [phase-a|phase-b]   (default: both phases)
   musl — UEFI install on stage3-musl-hardened-openrc; verifies the
          alternate-libc variant path end to end (musl world from
          source, openrc init).
+  dinit — UEFI install with system.init=dinit; verifies the alt-init
+         backend: gi-sysinit stage-1, dinit.d units + boot.d links,
+         init=/sbin/dinit on the kernel cmdline.
 """
 import os, secrets, shutil, subprocess, sys
 import pexpect
@@ -114,7 +117,23 @@ def phase_a(scn, disk):
           "sed -i 's|^#\\?s0:.*|s0:12345:respawn:/sbin/agetty -L 115200 ttyS0 linux|' /mnt/gentoo/etc/inittab; "
           "grep -q '^s0:' /mnt/gentoo/etc/inittab || "
           "echo 's0:12345:respawn:/sbin/agetty -L 115200 ttyS0 linux' >> /mnt/gentoo/etc/inittab; }; "
-          "echo ZZ-GOT-$?", pat=DONE, timeout=30)
+          # always OK — no inittab at all on alt-init/systemd installs
+          "echo ZZ-GOT-0", pat=DONE, timeout=30)
+    # dinit has no inittab — the installer generates tty1-4 only, so a
+    # serial getty needs its own process unit linked into boot.d.
+    sh(c, "[ -d /mnt/gentoo/etc/dinit.d ] && { "
+          "printf 'type = process\\ncommand = /sbin/agetty -L 115200 ttyS0 linux\\nrestart = true\\ndepends-on = sysinit\\n' "
+          "> /mnt/gentoo/etc/dinit.d/ttyS0 && "
+          "ln -sf ../ttyS0 /mnt/gentoo/etc/dinit.d/boot.d/ttyS0; }; "
+          "echo ZZ-GOT-0", pat=DONE, timeout=30)
+    # runit likewise — a supervised agetty on ttyS0 under runsvdir.
+    sh(c, "[ -d /mnt/gentoo/etc/sv ] && { "
+          "mkdir -p /mnt/gentoo/etc/sv/agetty-ttyS0 && "
+          "printf '#!/bin/sh\\nexec /sbin/agetty -L 115200 ttyS0 linux 2>&1\\n' "
+          "> /mnt/gentoo/etc/sv/agetty-ttyS0/run && "
+          "chmod 755 /mnt/gentoo/etc/sv/agetty-ttyS0/run && "
+          "ln -sf /etc/sv/agetty-ttyS0 /mnt/gentoo/etc/runit/runsvdir/default/agetty-ttyS0; }; "
+          "echo ZZ-GOT-0", pat=DONE, timeout=30)
     c.sendline(b"poweroff"); c.expect(pexpect.EOF, timeout=120)
     log.close()
     print("== phase A done")
@@ -136,7 +155,9 @@ def phase_b(scn, disk):
     c.expect(rb"[$#]", timeout=20)
     c.sendline(b"uname -a; id; echo V-MARK-$?")
     c.expect(b"V-MARK-0", timeout=20)
-    c.sendline(b"su - root -c 'echo SU-OK; poweroff'")
+    # runit/dinit don't answer util-linux poweroff (no sysvinit compat
+    # ioctl chain by default) — sysrq 'o' powers off regardless of PID1.
+    c.sendline(b"su - root -c 'echo SU-OK; (poweroff 2>/dev/null || echo o > /proc/sysrq-trigger)'")
     c.expect(b"[Pp]assword", timeout=20)
     c.sendline(ROOT_PW.encode())
     c.expect(b"SU-OK", timeout=20)

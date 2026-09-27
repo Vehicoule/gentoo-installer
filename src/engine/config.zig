@@ -669,9 +669,9 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
     // the keymap-name charset.
     if (!keymapOk(cfg.system.keymap))
         try errs.append(alloc, fmt(alloc, "keymap '{s}' has characters outside the keymap charset", .{cfg.system.keymap}));
-    // zram needs an init backend: systemd-generator or OpenRC zram-init.
-    if (cfg.disk.swap == .zram and cfg.system.init != .systemd and cfg.system.init != .openrc)
-        try errs.append(alloc, "disk.swap=zram requires systemd or openrc (other init backends land in M6)");
+    // zram works on every init — systemd via zram-generator; all others
+    // run `openrc boot` in stage-1 which executes the generated
+    // init.d/zram runscript.
     // No official Gentoo binhost exists for riscv64.
     if (cfg.system.binhost and cfg.arch == .riscv64)
         try errs.append(alloc, "system.binhost has no upstream binpackages for riscv64");
@@ -864,6 +864,11 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
         try errs.append(alloc, "security.selinux=true requires hardening=hardened-selinux (policy + toolchain live in that stage3)");
     if (!cfg.security.selinux and cfg.security.hardening == .@"hardened-selinux")
         try errs.append(alloc, "security.selinux=false contradicts hardening=hardened-selinux — use hardening=hardened");
+
+    // dinit comes from the GURU overlay, keyworded ~amd64 only — nothing
+    // to emerge on other arches until a keyworded ebuild/overlay exists.
+    if (cfg.system.init == .dinit and cfg.arch != .amd64)
+        try errs.append(alloc, "init=dinit is amd64-only for now (GURU sys-apps/dinit is ~amd64)");
 
     // locale must be a member of locales
     var found = false;
