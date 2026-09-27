@@ -773,10 +773,13 @@ fn packageUse(alloc: Allocator, cfg: *const Config) ![]const u8 {
     // USE=initramfs depend on installkernel[dracut|ugrd], which is only
     // on by default in systemd profiles (openrc/musl leave it off and
     // emerge aborts on the USE-change request).
+    // The unselected generator is explicitly disabled too — profiles
+    // default one of them on, and initramfs=none must suppress the
+    // kernel's initramfs USE entirely or emerge hits a USE-change abort.
     const gen_flag: []const u8 = switch (cfg.system.initramfs) {
-        .dracut => " dracut",
-        .ugrd => " ugrd",
-        .none => "",
+        .dracut => " dracut -ugrd",
+        .ugrd => " ugrd -dracut",
+        .none => " -dracut -ugrd",
     };
     switch (config.resolveBootloader(cfg)) {
         .limine => try w.print("sys-kernel/installkernel -systemd-boot -refind{s}\n", .{gen_flag}),
@@ -785,6 +788,8 @@ fn packageUse(alloc: Allocator, cfg: *const Config) ![]const u8 {
         .efistub => try w.print("sys-kernel/installkernel -systemd-boot{s}\n", .{gen_flag}),
         else => if (gen_flag.len > 0) try w.print("sys-kernel/installkernel{s}\n", .{gen_flag}),
     }
+    if (cfg.system.initramfs == .none)
+        try w.writeAll("sys-kernel/gentoo-kernel-bin -initramfs\nsys-kernel/gentoo-kernel -initramfs\n");
     if (cfg.system.uki) try w.writeAll("sys-kernel/installkernel uki\n");
     // LUKS unlock in a systemd initramfs runs through systemd-cryptsetup,
     // which Gentoo only builds under USE=cryptsetup — stage3s ship without
@@ -1061,6 +1066,9 @@ fn planKernel(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !St
 /// else falls back to nouveau (in-kernel; nothing to emerge).
 pub fn resolveGpuDriver(cfg: *const Config, env: ?*const detect.Env) config.GpuDriver {
     if (cfg.gpu.driver != .auto) return cfg.gpu.driver;
+    // proprietary NVIDIA is glibc + amd64/arm64 only — auto must not
+    // pick it on musl or riscv64 targets.
+    if (cfg.stage3.libc == .musl or cfg.arch == .riscv64) return .nouveau;
     if (env) |e| if (hasTuringNvidia(e)) return .@"nvidia-open";
     return .nouveau;
 }
@@ -1242,16 +1250,18 @@ fn planSystemConfig(alloc: Allocator, cfg: *const Config) !Step {
                     \\    cap=$((8 * 1024 * 1024 * 1024))
                     \\    if [ "$size" -gt "$cap" ]; then size=$cap; fi
                     \\    dev=$(zramctl --find --size "$size" --algorithm zstd)
-                    \\    mkswap "$dev" >/dev/null 2>&1 && swapon -p 100 "$dev"
+                    \\    mkswap "$dev" >/dev/null 2>&1 && swapon -p 100 "$dev" && echo "$dev" > /run/zram-swap.dev
                     \\    eend $?
                     \\}
                     \\
                     \\stop() {
                     \\    ebegin "Removing zram swap"
-                    \\    for dev in $(zramctl --raw --noheadings --output NAME); do
+                    \\    dev=$(cat /run/zram-swap.dev 2>/dev/null)
+                    \\    if [ -n "$dev" ]; then
                     \\        swapoff "$dev" 2>/dev/null
-                    \\        zramctl --reset "$dev"
-                    \\    done
+                    \\        zramctl --reset "$dev" 2>/dev/null
+                    \\        rm -f /run/zram-swap.dev
+                    \\    fi
                     \\    eend 0
                     \\}
                     \\
@@ -1637,9 +1647,21 @@ fn profilePath(alloc: Allocator, cfg: *const Config) !?[]const u8 {
     const toks = archTokens(cfg) orelse return null;
     var out: std.ArrayList([]const u8) = .empty;
     if (cfg.arch == .riscv64) {
+        // A pinned stage3.variant is authoritative — the profile must
+        // follow its tokens (rv64_lp64d_musl-systemd etc.), matching
+        // how the amd64/arm64 branches treat it; otherwise derive from
+        // the libc/init axes.
         try out.appendSlice(alloc, &.{ "rv64", "lp64d" });
-        if (cfg.stage3.libc == .musl) try out.append(alloc, "musl");
-        if (cfg.system.init == .systemd) try out.append(alloc, "systemd");
+        if (std.mem.eql(u8, cfg.stage3.variant, "auto")) {
+            if (cfg.stage3.libc == .musl) try out.append(alloc, "musl");
+            if (cfg.system.init == .systemd) try out.append(alloc, "systemd");
+        } else {
+            var rit = std.mem.tokenizeAny(u8, cfg.stage3.variant, "-_");
+            while (rit.next()) |seg| {
+                if (std.mem.eql(u8, seg, "musl") or std.mem.eql(u8, seg, "systemd"))
+                    try out.append(alloc, seg);
+            }
+        }
     } else {
         const stem = try config.stage3Stem(alloc, cfg);
         var it = std.mem.splitScalar(u8, stem, '-');
@@ -2032,7 +2054,7 @@ test "installkernel package.use always carries the initramfs generator" {
                  \\[security]
                  \\hardening = "standard"
                  \\selinux = false
-                 , .want = "sys-kernel/installkernel -systemd-boot dracut\n" },
+                 , .want = "sys-kernel/installkernel -systemd-boot dracut -ugrd\n" },
         .{ .src = \\arch = "amd64"
                  \\[disk]
                  \\device = "/dev/vda"
@@ -2043,7 +2065,7 @@ test "installkernel package.use always carries the initramfs generator" {
                  \\[security]
                  \\hardening = "standard"
                  \\selinux = false
-                 , .want = "sys-kernel/installkernel grub ugrd\n" },
+                 , .want = "sys-kernel/installkernel grub ugrd -dracut\n" },
         .{ .src = \\arch = "amd64"
                  \\[disk]
                  \\device = "/dev/vda"
@@ -2053,7 +2075,7 @@ test "installkernel package.use always carries the initramfs generator" {
                  \\[security]
                  \\hardening = "standard"
                  \\selinux = false
-                 , .want = "sys-kernel/installkernel -systemd-boot -refind\n" },
+                 , .want = "sys-kernel/installkernel -systemd-boot -refind -dracut -ugrd\n" },
     };
     for (cases) |tc| {
         var doc = try toml_mod.parse(std.testing.allocator, tc.src, null);

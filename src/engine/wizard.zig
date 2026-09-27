@@ -2062,6 +2062,7 @@ fn boolVal(cfg: *Config, name: []const u8) ?bool {
         .{ "disk.home_part", cfg.disk.home_part },
         .{ "system.uki", cfg.system.uki },
         .{ "system.binhost", cfg.system.binhost },
+        .{ "stage3.nomultilib", cfg.stage3.nomultilib },
         .{ "network.wifi", cfg.network.wifi },
         .{ "services.sshd", cfg.services.sshd },
         .{ "services.logger", cfg.services.logger },
