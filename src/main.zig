@@ -175,21 +175,21 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    // Exec-mode gates for scheme: alongside/manual don't create the
-    // root partition yet (partition-level detection + dual-boot logic
-    // are M6) — refuse real runs, dry-run still prints the plan.
-    if (cmd == .run and !dry_run and (cfg.disk.scheme == .alongside or cfg.disk.scheme == .manual)) {
-        try errw.print("scheme '{s}' is not executable yet (dual-boot lands in M6) — use --dry-run to preview\n", .{@tagName(cfg.disk.scheme)});
+    // Exec-mode gates for schemes: alongside doesn't create the root
+    // partition yet (partition-level detection + dual-boot logic are
+    // M6) — refuse real runs, dry-run still prints the plan.
+    if (cmd == .run and !dry_run and cfg.disk.scheme == .alongside) {
+        try errw.print("scheme 'alongside' is not executable yet (dual-boot lands in M6) — use --dry-run to preview\n", .{});
         try errw.flush();
         std.process.exit(2);
     }
 
-    // Exec-mode gates for choices with no complete M1 backend: a manual
-    // kernel produces no /boot/vmlinuz-* for the loader to stage, and
-    // alt inits install packages but can't yet take over PID 1 or enable
-    // services (service migration lands with the init backends in M6).
-    if (cmd == .run and !dry_run and cfg.system.kernel == .manual) {
-        try errw.print("kernel=manual is not executable unattended — use dist|dist-bin, or --dry-run to preview\n", .{});
+    // Exec-mode gates for choices with no complete backend: a manual
+    // kernel needs the user's .config, and alt inits install packages
+    // but can't yet take over PID 1 or enable services (service
+    // migration lands with the init backends in M6).
+    if (cmd == .run and !dry_run and cfg.system.kernel == .manual and cfg.system.kernel_config.len == 0) {
+        try errw.print("kernel=manual needs system.kernel_config=<path to .config> — or use dist|dist-bin\n", .{});
         try errw.flush();
         std.process.exit(2);
     }
@@ -221,7 +221,10 @@ pub fn main(init: std.process.Init) !void {
 
     // Destructive exec runs require --confirm <device> matching the
     // configured disk — an answer file alone must never wipe a disk.
-    const destructive = cfg.disk.scheme == .@"efi-swap-root" or cfg.disk.scheme == .@"bios-boot-swap-root";
+    // manual is always destructive: every listed row is partitioned
+    // and formatted whether or not the table gets wiped first.
+    const destructive = cfg.disk.scheme == .@"efi-swap-root" or cfg.disk.scheme == .@"bios-boot-swap-root" or
+        cfg.disk.scheme == .manual;
     if (cmd == .run and !dry_run and destructive) {
         const cd = confirm_dev orelse {
             try errw.print("refusing to run without --confirm {s} (this will wipe the target disk)\n", .{cfg.disk.device});
@@ -241,14 +244,29 @@ pub fn main(init: std.process.Init) !void {
         // linear gives root 70% of the VG, the thin pool 95%; LUKS/LVM
         // metadata and GPT overhead consume ~36 MiB on top.
         var need_mib: u64 = 4; // GPT overhead
-        if (cfg.boot_mode == .uefi) need_mib += cfg.disk.esp_mib else need_mib += 2;
-        if (cfg.disk.swap == .partition) need_mib += cfg.disk.swap_mib;
-        if (cfg.disk.boot_part) need_mib += 1024;
-        if (cfg.disk.luks or cfg.disk.lvm) need_mib += 32;
-        need_mib += if (cfg.disk.lvm)
-            (if (cfg.system.snapshots == .auto) (8192 * 100 + 94) / 95 else (8192 * 10 + 6) / 7)
-        else
-            8192;
+        if (cfg.disk.scheme == .manual) {
+            // Free-form: explicit sizes sum + an 8 GiB floor when the
+            // root row is "rest". (Validation already refuses an
+            // explicit root < 8 GiB.)
+            var root_is_rest = false;
+            for (cfg.disk.partitions) |p| {
+                if (engine.config.parseSizeMiB(p.size)) |n|
+                    need_mib +|= n
+                else if (std.mem.eql(u8, p.mount, "/"))
+                    root_is_rest = true;
+            }
+            if (root_is_rest) need_mib +|= 8192;
+            if (cfg.disk.luks) need_mib +|= 32;
+        } else {
+            if (cfg.boot_mode == .uefi) need_mib +|= cfg.disk.esp_mib else need_mib +|= 2;
+            if (cfg.disk.swap == .partition) need_mib +|= cfg.disk.swap_mib;
+            if (cfg.disk.boot_part) need_mib +|= 1024;
+            if (cfg.disk.luks or cfg.disk.lvm) need_mib +|= 32;
+            need_mib +|= if (cfg.disk.lvm)
+                (if (cfg.system.snapshots == .auto) (8192 * 100 + 94) / 95 else (8192 * 10 + 6) / 7)
+            else
+                8192;
+        }
         var size_mib: ?u64 = null;
         if (env_opt) |*e| {
             // Match kernel names AND persistent names: resolve symlinks
@@ -803,17 +821,15 @@ fn doInstall(io: std.Io, alloc: std.mem.Allocator, wiz: *engine.wizard.Wizard, o
             try writeErr(out, req, aw.written());
             return;
         }
-        // Preservation schemes are plan-only — partition-level detection
-        // and dual-boot are M6; proceeding would mount an unpopulated
-        // plan and format nothing / touch existing data wrongly.
-        if (cfg.disk.scheme == .alongside or cfg.disk.scheme == .manual) {
-            var aw: std.Io.Writer.Allocating = .init(alloc);
-            aw.writer.print("scheme '{s}' is not executable yet (dual-boot lands in M6) — dry_run still previews", .{@tagName(cfg.disk.scheme)}) catch {};
-            try writeErr(out, req, aw.written());
+        // alongside is plan-only — partition-level detection and
+        // dual-boot are M6; proceeding would mount an unpopulated plan
+        // and touch existing data wrongly.
+        if (cfg.disk.scheme == .alongside) {
+            try writeErr(out, req, "scheme 'alongside' is not executable yet (dual-boot lands in M6) — dry_run still previews");
             return;
         }
-        if (cfg.system.kernel == .manual) {
-            try writeErr(out, req, "kernel=manual is a TUI flow — exec support lands in a later milestone");
+        if (cfg.system.kernel == .manual and cfg.system.kernel_config.len == 0) {
+            try writeErr(out, req, "kernel=manual needs system.kernel_config=<path to .config>");
             return;
         }
         if (cfg.system.init == .runit or cfg.system.init == .s6 or cfg.system.init == .dinit) {
@@ -828,7 +844,8 @@ fn doInstall(io: std.Io, alloc: std.mem.Allocator, wiz: *engine.wizard.Wizard, o
             try writeErr(out, req, e);
             return;
         }
-        const destructive = cfg.disk.scheme == .@"efi-swap-root" or cfg.disk.scheme == .@"bios-boot-swap-root";
+        const destructive = cfg.disk.scheme == .@"efi-swap-root" or cfg.disk.scheme == .@"bios-boot-swap-root" or
+            cfg.disk.scheme == .manual;
         if (destructive) {
             const confirm = jstr(jl, "confirm") orelse {
                 try writeErr(out, req, "destructive install needs confirm=<disk basename>");
@@ -841,14 +858,26 @@ fn doInstall(io: std.Io, alloc: std.mem.Allocator, wiz: *engine.wizard.Wizard, o
             }
             // capacity preflight — same floor as `run`
             var need_mib: u64 = 4;
-            if (cfg.boot_mode == .uefi) need_mib += cfg.disk.esp_mib else need_mib += 2;
-            if (cfg.disk.swap == .partition) need_mib += cfg.disk.swap_mib;
-            if (cfg.disk.boot_part) need_mib += 1024;
-            if (cfg.disk.luks or cfg.disk.lvm) need_mib += 32;
-            need_mib += if (cfg.disk.lvm)
-                (if (cfg.system.snapshots == .auto) (8192 * 100 + 94) / 95 else (8192 * 10 + 6) / 7)
-            else
-                8192;
+            if (cfg.disk.scheme == .manual) {
+                var root_is_rest = false;
+                for (cfg.disk.partitions) |p| {
+                    if (engine.config.parseSizeMiB(p.size)) |n|
+                        need_mib +|= n
+                    else if (std.mem.eql(u8, p.mount, "/"))
+                        root_is_rest = true;
+                }
+                if (root_is_rest) need_mib +|= 8192;
+                if (cfg.disk.luks) need_mib +|= 32;
+            } else {
+                if (cfg.boot_mode == .uefi) need_mib +|= cfg.disk.esp_mib else need_mib +|= 2;
+                if (cfg.disk.swap == .partition) need_mib +|= cfg.disk.swap_mib;
+                if (cfg.disk.boot_part) need_mib +|= 1024;
+                if (cfg.disk.luks or cfg.disk.lvm) need_mib +|= 32;
+                need_mib +|= if (cfg.disk.lvm)
+                    (if (cfg.system.snapshots == .auto) (8192 * 100 + 94) / 95 else (8192 * 10 + 6) / 7)
+                else
+                    8192;
+            }
             var size_mib: ?u64 = null;
             const e = env_opt.?;
             var rbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;

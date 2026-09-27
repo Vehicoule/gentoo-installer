@@ -38,6 +38,19 @@ pub const User = struct {
     ssh_authorized_keys: []const []const u8 = &.{},
 };
 
+/// One [[disk.partitions]] row — the free-form layout scheme=manual
+/// builds. Sizes are "<n>MiB"/"<n>GiB" or "rest" (last entry only);
+/// ptype is a GPT type code (EF00 ESP, EF02 BIOS boot, 8200 swap,
+/// 8300/8304 Linux); fs is vfat|ext4|xfs|btrfs|f2fs|bcachefs|swap|none
+/// ("none" = leave unformatted); mount is absolute or "" (unmounted).
+pub const Partition = struct {
+    size: []const u8 = "",
+    ptype: []const u8 = "8300",
+    name: []const u8 = "",
+    fs: []const u8 = "",
+    mount: []const u8 = "",
+};
+
 pub const Config = struct {
     arch: Arch = .detect,
     boot_mode: BootMode = .uefi,
@@ -67,6 +80,8 @@ pub const Config = struct {
         shrink_mib: u32 = 0,
         esp_mib: u32 = 512,
         home_part: bool = false,
+        /// scheme=manual only: the free-form partition table.
+        partitions: []const Partition = &.{},
     } = .{},
 
     stage3: struct {
@@ -91,6 +106,11 @@ pub const Config = struct {
         privilege: Privilege = .doas,
         keep_kernels: u32 = 3,
         snapshots: Snapshots = .auto,
+        /// `system.kernel_config` — kernel=manual only: path to a
+        /// .config on the live env fs, copied into the target and
+        /// built with olddefconfig. Required for a manual kernel to
+        /// be executable.
+        kernel_config: []const u8 = "",
     } = .{},
 
     makeconf: struct {
@@ -242,6 +262,24 @@ pub fn decode(alloc: Allocator, doc: toml.Document) DecodeError!Config {
         if (field(t, "shrink_mib")) |x| cfg.disk.shrink_mib = try intOr(x, "disk.shrink_mib");
         if (field(t, "esp_mib")) |x| cfg.disk.esp_mib = try intOr(x, "disk.esp_mib");
         if (field(t, "home_part")) |x| cfg.disk.home_part = try boolOr(x, "disk.home_part");
+        if (field(t, "partitions")) |x| {
+            const arr = switch (x) {
+                .array => |a| a,
+                else => return decodeFail("disk.partitions", "expected [[disk.partitions]] array"),
+            };
+            const parts = try alloc.alloc(Partition, arr.len);
+            for (arr, 0..) |item, i| {
+                const pt = try tableOf(item, "disk.partitions[]");
+                var p: Partition = .{};
+                if (field(pt, "size")) |y| p.size = try strOr(y, "disk.partitions[].size");
+                if (field(pt, "type")) |y| p.ptype = try strOr(y, "disk.partitions[].type");
+                if (field(pt, "name")) |y| p.name = try strOr(y, "disk.partitions[].name");
+                if (field(pt, "fs")) |y| p.fs = try strOr(y, "disk.partitions[].fs");
+                if (field(pt, "mount")) |y| p.mount = try strOr(y, "disk.partitions[].mount");
+                parts[i] = p;
+            }
+            cfg.disk.partitions = parts;
+        }
     }
 
     if (doc.root.get("stage3")) |v| {
@@ -268,6 +306,7 @@ pub fn decode(alloc: Allocator, doc: toml.Document) DecodeError!Config {
         if (field(t, "privilege")) |x| cfg.system.privilege = try enumOr(Privilege, x, "system.privilege");
         if (field(t, "keep_kernels")) |x| cfg.system.keep_kernels = try intOr(x, "system.keep_kernels");
         if (field(t, "snapshots")) |x| cfg.system.snapshots = try enumOr(Snapshots, x, "system.snapshots");
+        if (field(t, "kernel_config")) |x| cfg.system.kernel_config = try strOr(x, "system.kernel_config");
     }
 
     if (doc.root.get("makeconf")) |v| {
@@ -463,31 +502,149 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
         try errs.append(alloc, "makeconf.mirrors contains characters outside URL charset");
     // Erase-disk schemes always format — wipe=false preserves nothing.
     if (!cfg.disk.wipe and cfg.disk.scheme != .alongside and cfg.disk.scheme != .manual)
-        try errs.append(alloc, "disk.wipe=false has no effect on erase schemes — use alongside/manual to preserve data");
+        try errs.append(alloc, "disk.wipe=false has no effect on erase schemes — use alongside to preserve data");
     // Erase scheme must match the firmware boot mode (partition layout
     // and bootloader paths are mode-specific).
     if (cfg.disk.scheme == .@"efi-swap-root" and cfg.boot_mode == .bios)
         try errs.append(alloc, "disk.scheme=efi-swap-root requires boot_mode=uefi — use bios-boot-swap-root");
     if (cfg.disk.scheme == .@"bios-boot-swap-root" and cfg.boot_mode == .uefi)
         try errs.append(alloc, "disk.scheme=bios-boot-swap-root requires boot_mode=bios — use efi-swap-root");
-    // BIOS limine reads only ext-family filesystems and cannot unlock
-    // LUKS — a separate /boot is required unless the root is plain ext4.
-    if (cfg.boot_mode == .bios and resolveBootloader(cfg) == .limine) {
-        if (cfg.disk.luks and !cfg.disk.boot_part)
-            try errs.append(alloc, "BIOS + LUKS requires disk.boot_part=true — limine cannot read encrypted roots");
-        if (cfg.disk.root_fs != .ext4 and !cfg.disk.boot_part)
-            try errs.append(alloc, fmt(alloc, "BIOS limine cannot read {s} roots — set disk.boot_part=true (ext4 /boot)", .{@tagName(cfg.disk.root_fs)}));
-    }
+    // Limine ≥12 dropped ext support — its BIOS stage reads only
+    // FAT/ISO9660. Kernel, initramfs, limine-bios.sys and limine.conf
+    // must all live on a FAT /boot, so BIOS+limine always needs a
+    // separate boot partition (also covers the LUKS case — the FAT /boot
+    // is unencrypted either way).
+    if (cfg.boot_mode == .bios and resolveBootloader(cfg) == .limine and
+        cfg.disk.scheme == .@"bios-boot-swap-root" and !cfg.disk.boot_part)
+        try errs.append(alloc, "BIOS + limine requires disk.boot_part=true — limine reads only FAT filesystems");
     // GRUB reads kernels before the initramfs can unlock LUKS, and we
     // emit no cryptodisk setup — it needs an unencrypted /boot.
-    if (resolveBootloader(cfg) == .grub and cfg.disk.luks and !cfg.disk.boot_part)
-        try errs.append(alloc, "GRUB + LUKS requires disk.boot_part=true — grub cannot read kernels inside the encrypted root");
+    if (resolveBootloader(cfg) == .grub and cfg.disk.luks) {
+        if (cfg.disk.scheme == .manual) {
+            if (manualMountPart(cfg, "/boot") == null)
+                try errs.append(alloc, "GRUB + LUKS under scheme=manual needs a mount=\"/boot\" row — grub cannot read kernels inside the encrypted root");
+        } else if (!cfg.disk.boot_part)
+            try errs.append(alloc, "GRUB + LUKS requires disk.boot_part=true — grub cannot read kernels inside the encrypted root");
+    }
     // Zero-sized partitions produce sgdisk failures AFTER --zap-all has
     // already wiped the table — catch them in validation.
     if (cfg.boot_mode == .uefi and cfg.disk.esp_mib == 0)
         try errs.append(alloc, "disk.esp_mib must be > 0 on UEFI — the ESP is required");
     if (cfg.disk.swap == .partition and cfg.disk.swap_mib == 0)
         try errs.append(alloc, "disk.swap_mib must be > 0 when disk.swap=\"partition\"");
+    // scheme=manual: the [[disk.partitions]] table IS the layout — the
+    // guided knobs (esp_mib/boot_part/home_part/shrink_*/space_src) are
+    // inert there. The spec itself is checked here so sgdisk can't hit
+    // a malformed row after --zap-all has already wiped the table.
+    if (cfg.disk.scheme != .manual and cfg.disk.partitions.len > 0)
+        try errs.append(alloc, "disk.partitions only applies to scheme=manual");
+    if (cfg.disk.scheme == .manual) {
+        if (cfg.disk.partitions.len == 0)
+            try errs.append(alloc, "scheme=manual needs at least one [[disk.partitions]] entry");
+        if (cfg.disk.partitions.len > 128)
+            try errs.append(alloc, "disk.partitions exceeds GPT's 128-entry limit");
+        if (cfg.disk.lvm)
+            try errs.append(alloc, "disk.lvm is a guided-layout feature — express volumes as partitions under scheme=manual");
+        if (!cfg.disk.wipe)
+            try errs.append(alloc, "disk.wipe=false is unsupported under scheme=manual — rows are always created at fixed indices and formatted; use scheme=alongside to preserve an existing install");
+        if (cfg.disk.swap == .partition)
+            try errs.append(alloc, "disk.swap=partition is guided-only — under manual, list a fs=\"swap\" partition");
+        var root_count: u32 = 0;
+        var rest_count: u32 = 0;
+        var esp_count: u32 = 0;
+        var biosboot_count: u32 = 0;
+        for (cfg.disk.partitions, 0..) |p, i| {
+            const row = i + 1;
+            if (std.mem.eql(u8, p.size, "rest")) {
+                rest_count += 1;
+                if (i != cfg.disk.partitions.len - 1)
+                    try errs.append(alloc, "disk.partitions: \"rest\" must be the last entry — it consumes all remaining space");
+            } else if (parseSizeMiB(p.size) == null)
+                try errs.append(alloc, fmt(alloc, "disk.partitions[{}].size must be <n>MiB, <n>GiB, or \"rest\"", .{row}));
+            if (!partTypeOk(p.ptype))
+                try errs.append(alloc, fmt(alloc, "disk.partitions[{}].type '{s}' is not a GPT type code (hex/short code like EF00, 8304)", .{ row, p.ptype }));
+            if (hasCtl(p.name) or std.mem.indexOfScalar(u8, p.name, '"') != null)
+                try errs.append(alloc, fmt(alloc, "disk.partitions[{}].name has characters sgdisk -c can't carry", .{row}));
+            if (p.name.len > 0 and p.name[0] == '-')
+                try errs.append(alloc, fmt(alloc, "disk.partitions[{}].name can't start with '-' — it lands after -n/-L in mkfs calls", .{row}));
+            if (!manualFsOk(p.fs))
+                try errs.append(alloc, fmt(alloc, "disk.partitions[{}].fs '{s}' — expected vfat|ext4|xfs|btrfs|f2fs|bcachefs|swap|none", .{ row, p.fs }));
+            if (std.mem.eql(u8, p.fs, "swap") and p.mount.len > 0)
+                try errs.append(alloc, fmt(alloc, "disk.partitions[{}]: fs=swap takes no mount point", .{row}));
+            if (p.mount.len > 0) {
+                if (!mountOk(p.mount))
+                    try errs.append(alloc, fmt(alloc, "disk.partitions[{}].mount '{s}' must be an absolute path in [A-Za-z0-9._/-]", .{ row, p.mount }));
+                if (std.mem.eql(u8, p.mount, "/")) {
+                    root_count += 1;
+                    if (manualRootFs(cfg) == null)
+                        try errs.append(alloc, fmt(alloc, "disk.partitions[{}]: mount=\"/\" needs a root filesystem (btrfs|xfs|ext4|f2fs|bcachefs)", .{row}));
+                    if (parseSizeMiB(p.size)) |sz| {
+                        if (sz < 8192)
+                            try errs.append(alloc, fmt(alloc, "disk.partitions[{}]: root needs ≥8192 MiB (stage3 + toolchain + world) — or size=\"rest\"", .{row}));
+                    }
+                }
+            }
+            // Dedup on the EFFECTIVE mount — an EF00 row with a blank
+            // mount still lands at /efi (manualEspMount default).
+            const eff_mount: []const u8 = if (p.mount.len > 0) p.mount else if (std.ascii.eqlIgnoreCase(p.ptype, "EF00")) "/efi" else "";
+            for (cfg.disk.partitions[0..i]) |q| {
+                const q_eff: []const u8 = if (q.mount.len > 0) q.mount else if (std.ascii.eqlIgnoreCase(q.ptype, "EF00")) "/efi" else "";
+                if (q_eff.len > 0 and std.mem.eql(u8, q_eff, eff_mount))
+                    try errs.append(alloc, fmt(alloc, "disk.partitions[{}].mount '{s}' duplicates an earlier entry", .{ row, eff_mount }));
+            }
+            // fs="none" means unformatted — a mount would fail mid-install.
+            if (std.mem.eql(u8, p.fs, "none") and eff_mount.len > 0)
+                try errs.append(alloc, fmt(alloc, "disk.partitions[{}]: fs=\"none\" takes no mount point", .{row}));
+            // EF02 is a bootloader embed target — never a filesystem,
+            // and "rest" here would swallow the remainder of the disk.
+            if (std.ascii.eqlIgnoreCase(p.ptype, "EF02")) {
+                if (!std.mem.eql(u8, p.fs, "none") or p.mount.len > 0)
+                    try errs.append(alloc, fmt(alloc, "disk.partitions[{}]: EF02 biosboot must be fs=\"none\" mount=\"\" — bios-install embeds stage2 there, corrupting any filesystem", .{row}));
+                const sz = parseSizeMiB(p.size);
+                if (sz == null or sz.? > 8192)
+                    try errs.append(alloc, fmt(alloc, "disk.partitions[{}]: EF02 needs an explicit small size (1–8192 MiB), not \"{s}\"", .{ row, p.size }));
+            }
+            if (std.ascii.eqlIgnoreCase(p.ptype, "EF00")) esp_count += 1;
+            if (std.ascii.eqlIgnoreCase(p.ptype, "EF02")) biosboot_count += 1;
+        }
+        if (root_count != 1)
+            try errs.append(alloc, "disk.partitions needs exactly one mount=\"/\" entry");
+        if (rest_count > 1)
+            try errs.append(alloc, "disk.partitions: at most one size=\"rest\" entry");
+        if (cfg.boot_mode == .uefi) {
+            // Exactly one ESP — the planner (espPartIdx/manualEspMount)
+            // picks the first EF00 row, so multiples would bootload the
+            // wrong partition.
+            if (esp_count != 1)
+                try errs.append(alloc, "scheme=manual on UEFI needs exactly one type=\"EF00\" partition (the ESP)");
+            var esp_ok = false;
+            for (cfg.disk.partitions) |p| {
+                if (std.ascii.eqlIgnoreCase(p.ptype, "EF00") and std.mem.eql(u8, p.fs, "vfat")) esp_ok = true;
+            }
+            if (esp_count == 1 and !esp_ok)
+                try errs.append(alloc, "the EF00 ESP row needs fs=\"vfat\"");
+        } else {
+            if (esp_count > 0)
+                try errs.append(alloc, "disk.partitions lists an EF00 ESP under BIOS boot — ESPs are UEFI-only");
+            if (biosboot_count == 0)
+                try errs.append(alloc, "BIOS boot needs a type=\"EF02\" biosboot partition (grub and limine both embed stage2 there — GPT has no post-MBR gap)");
+            if (resolveBootloader(cfg) == .limine) {
+                const bf = manualBootFs(cfg);
+                if (bf == null or !std.mem.eql(u8, bf.?, "vfat"))
+                    try errs.append(alloc, "BIOS limine reads only FAT — add a mount=\"/boot\" fs=\"vfat\" partition for kernels + limine-bios.sys");
+            }
+        }
+    }
+    // kernel=manual builds gentoo-sources from a caller-supplied .config
+    // — the path must exist on the live env for the copy to succeed.
+    if (cfg.system.kernel == .manual and cfg.system.kernel_config.len == 0)
+        try errs.append(alloc, "kernel=manual needs system.kernel_config=<path to .config>");
+    if (cfg.system.kernel != .manual and cfg.system.kernel_config.len > 0)
+        try errs.append(alloc, "system.kernel_config only applies to kernel=manual");
+    if (hasCtl(cfg.system.kernel_config))
+        try errs.append(alloc, "system.kernel_config contains control characters");
+    if (cfg.system.kernel_config.len > 0 and cfg.system.kernel_config[0] != '/')
+        try errs.append(alloc, "system.kernel_config must be an absolute path on the live env");
     // Keymaps land in shell-sourced conf.d files under OpenRC — pin to
     // the keymap-name charset.
     if (!keymapOk(cfg.system.keymap))
@@ -717,6 +874,97 @@ fn urlSafe(v: []const u8) bool {
         }
     }
     return true;
+}
+
+// ---- scheme=manual partition-spec helpers ----
+
+/// "<n>MiB" / "<n>GiB" / "rest" → MiB; null on any other shape.
+pub fn parseSizeMiB(s: []const u8) ?u64 {
+    if (std.mem.eql(u8, s, "rest")) return null; // caller handles rest
+    for ([_]struct { suf: []const u8, mul: u64 }{ .{ .suf = "MiB", .mul = 1 }, .{ .suf = "GiB", .mul = 1024 } }) |u| {
+        if (std.mem.endsWith(u8, s, u.suf)) {
+            const n = std.fmt.parseInt(u64, s[0 .. s.len - u.suf.len], 10) catch return null;
+            if (n == 0) return null;
+            return std.math.mul(u64, n, u.mul) catch null;
+        }
+    }
+    return null;
+}
+
+/// GPT type codes we accept for manual rows: the short hex forms
+/// (EF00, 8200, 8300…) or a full GUID. Hex/dash only, sane length.
+fn partTypeOk(v: []const u8) bool {
+    if (v.len == 0 or v.len > 36) return false;
+    for (v) |ch| {
+        const ok = (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f') or
+            (ch >= 'A' and ch <= 'F') or ch == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+fn manualFsOk(v: []const u8) bool {
+    const known = [_][]const u8{ "vfat", "ext4", "xfs", "btrfs", "f2fs", "bcachefs", "swap", "none" };
+    for (known) |k| if (std.mem.eql(u8, v, k)) return true;
+    return false;
+}
+
+// Mount points become fstab fields + mkdir targets under /mnt/gentoo
+// — a strict charset, not a denylist, so shell meta / fstab
+// comment-syntax / whitespace can't reinterpret the field.
+fn mountOk(v: []const u8) bool {
+    if (v.len == 0 or v.len > 64 or v[0] != '/') return false;
+    if (v.len > 1 and v[v.len - 1] == '/') return false;
+    for (v) |ch| {
+        const ok = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+            (ch >= '0' and ch <= '9') or ch == '/' or ch == '-' or ch == '_' or ch == '.';
+        if (!ok) return false;
+    }
+    // no empty (//) or traversal segments
+    if (std.mem.indexOf(u8, v, "//") != null) return false;
+    var it = std.mem.splitScalar(u8, v, '/');
+    while (it.next()) |seg| {
+        if (std.mem.eql(u8, seg, "..") or std.mem.eql(u8, seg, ".")) return false;
+    }
+    return true;
+}
+
+/// 1-based partition number carrying mount="/" under scheme=manual.
+pub fn manualRootPart(cfg: *const Config) ?u32 {
+    for (cfg.disk.partitions, 0..) |p, i|
+        if (std.mem.eql(u8, p.mount, "/")) return @intCast(i + 1);
+    return null;
+}
+
+/// The manual row mounted at `path` (e.g. "/boot"), if listed.
+pub fn manualMountPart(cfg: *const Config, path: []const u8) ?u32 {
+    for (cfg.disk.partitions, 0..) |p, i|
+        if (std.mem.eql(u8, p.mount, path)) return @intCast(i + 1);
+    return null;
+}
+
+/// Root filesystem under scheme=manual comes from the "/" row's fs —
+/// disk.root_fs is a guided-layout knob. null = no/invalid root fs.
+pub fn manualRootFs(cfg: *const Config) ?RootFs {
+    const n = manualRootPart(cfg) orelse return null;
+    const fs = cfg.disk.partitions[n - 1].fs;
+    return std.meta.stringToEnum(RootFs, fs);
+}
+
+/// Where the manual ESP mounts inside the target — the EF00 row's own
+/// mount, defaulting to /efi when left blank.
+pub fn manualEspMount(cfg: *const Config) []const u8 {
+    for (cfg.disk.partitions) |p|
+        if (std.ascii.eqlIgnoreCase(p.ptype, "EF00"))
+            return if (p.mount.len > 0) p.mount else "/efi";
+    return "/efi";
+}
+
+/// The fs type on the manual /boot row, if one exists.
+fn manualBootFs(cfg: *const Config) ?[]const u8 {
+    const n = manualMountPart(cfg, "/boot") orelse return null;
+    const fs = cfg.disk.partitions[n - 1].fs;
+    return if (fs.len > 0 and !std.mem.eql(u8, fs, "none")) fs else null;
 }
 
 // POSIX account/group names: [a-z_][a-z0-9_-]*, ≤32 chars. This also

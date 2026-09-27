@@ -106,9 +106,11 @@ GPT partitions ──► LUKS2 ──► LVM ──► filesystems
 
 ### `bios-boot-swap-root` (BIOS)
 
-`EF02` BIOS-boot partition (1 MiB, grub core image) instead of ESP;
-`/boot` on rootfs unless `boot_part`. Limine BIOS mode needs only the
-MBR gap it installs into — no EF02 required when bootloader=limine.
+`EF02` BIOS-boot partition (1 MiB) instead of ESP — GPT has no
+post-MBR gap, so both grub's core image and limine's stage2 embed
+there (`limine bios-install <disk> 1`). `boot_part` creates a 1 GiB
+/boot; under limine it is FAT32 because limine ≥12 reads only
+FAT/ISO9660 (ext support was dropped upstream).
 
 ### `alongside`
 
@@ -140,9 +142,37 @@ detect OSes ──► space_src?
 
 ### `manual` (expert)
 
-Free-form table editor producing the same `DiskPlan` op list — so
-VALIDATE, preview, and resume work identically. Nothing is type-specific
-to guided layouts.
+Free-form table producing the same plan ops as guided layouts — so
+validate, preview, and exec work identically. The table is a list of
+`[[disk.partitions]]` entries in the answer file:
+
+```toml
+[[disk.partitions]]
+size  = "512MiB"   # <n>MiB | <n>GiB | "rest" ("rest" last only, ≤1)
+type  = "EF00"     # GPT type code (EF00 ESP, EF02 BIOS boot, 8200 swap,
+                   #   8300/8304 Linux)
+name  = "ESP"      # partition label (GPT PARTLABEL)
+fs    = "vfat"     # vfat|ext4|xfs|btrfs|f2fs|bcachefs|swap|none
+                   #   ("none" = leave unformatted)
+mount = "/efi"     # absolute mount point, or "" (unmounted)
+```
+
+In the wizard's text field the same table is one row per entry,
+`size:type:name:fs:mount` colon-separated, `;` or newline between
+entries (`-` = empty name):
+`512MiB:EF00:ESP:vfat:/efi; rest:8304:root:btrfs:/`
+
+Rules the validator enforces: exactly one row mounts `/` with a root
+filesystem; UEFI needs a `type=EF00 fs=vfat` row (its mount is the ESP —
+default `/efi` when omitted); BIOS needs a `type=EF02` BIOS-boot row
+(grub core image / limine stage2 embed target — GPT has no post-MBR
+gap) and rejects `EF00`; BIOS + limine needs a `mount="/boot"
+fs="vfat"` row (limine ≥12 reads only FAT — no ext4, and LUKS roots
+get their kernel+initramfs from the FAT /boot either way); mounts are deduplicated; an explicit root size below 8 GiB
+is refused; `swap` fs rows take no mount and are swapped on at mount
+time; `lvm` and `swap=partition` are guided-layout features and are
+rejected (express volumes as plain partitions); `luks=on` still wraps
+the `/` row exactly as in guided mode.
 
 ## Sizing rules
 

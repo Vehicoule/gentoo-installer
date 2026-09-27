@@ -67,7 +67,7 @@ alongside Windows** (only shown when Windows/another OS is detected),
 | space_src | enum `shrink\|free-space` | auto-detected | alongside only: `free-space` uses existing unallocated space — no partition is touched; `shrink` reveals the two fields below |
 | shrink_part | enum (existing partitions) | — | shrink only; fs must be ntfs/ext4/btrfs (xfs/f2fs unshrinkable → need unallocated space) |
 | shrink_mib | int | — | shrink only; ≥ min install size (8 GiB) and ≤ fs free space |
-| manual_plan | partition table editor (expert) | — | free-form: part/fs/mount table; validated like any scheme |
+| disk.partitions | partition table editor (expert) | — | free-form `size:type:name:fs:mount` rows; validated like any scheme (see partitioning.md) |
 
 Normal/alongside modes auto-default every field above — the user only
 picks disk, fs, LUKS toggle. Live preview: engine emits the post-install
@@ -138,6 +138,7 @@ password on a surviving account, or `sshd=true` + authorized key.
 |---|---|---|---|
 | hostname | string | `gentoo` | RFC 1123 |
 | kernel | enum with user-facing explanations: `dist-bin` = "prebuilt official kernel — fastest, recommended"; `dist` = "compiled from source with Gentoo defaults — tunable"; `manual` = "gentoo-sources, you configure it" (expert) | `dist-bin` | — |
+| kernel_config | path | — | `kernel=manual` only: a `.config` on the live env, copied into the target and built via `olddefconfig` |
 | initramfs | enum `dracut\|ugrd\|none` | `dracut` | `none` unsafe with LUKS/LVM/separate-/usr — VALIDATE warns/blocks |
 | uki | bool | false | implies dracut/ugrd + installkernel[uki] |
 | bootloader | enum `auto\|grub\|systemd-boot\|efistub\|limine\|refind` | `auto` (resolves to **limine** on both BIOS and UEFI, both flows) | grub/systemd-boot/efistub/rEFInd are explicit Advanced picks. VALIDATE hard-rejects `systemd-boot`/`efistub`/`uki`/`refind` on BIOS (limine BIOS mode is supported) |
