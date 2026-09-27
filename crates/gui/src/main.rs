@@ -448,9 +448,13 @@ impl cosmic::app::Application for Installer {
                     if let Some(req) = v.get("req").and_then(Value::as_u64)
                         && let Some(field) = self.pending_sets.remove(&req)
                     {
-                        self.inputs.remove(&field);
-                        self.confirm_inputs.remove(&field);
-                        send_op(json!({"op": "page"}));
+                        // answer_file rejects on every incomplete path while
+                        // typing — keep the text so the user can finish it
+                        if field != "answer_file" {
+                            self.inputs.remove(&field);
+                            self.confirm_inputs.remove(&field);
+                            send_op(json!({"op": "page"}));
+                        }
                     }
                     self.errors.push(
                         v.get("error")
@@ -466,8 +470,18 @@ impl cosmic::app::Application for Installer {
                 }
                 Some("result") => {
                     // accepted set — clear the correlation entry
-                    if let Some(req) = v.get("req").and_then(Value::as_u64) {
-                        self.pending_sets.remove(&req);
+                    if let Some(req) = v.get("req").and_then(Value::as_u64)
+                        && let Some(field) = self.pending_sets.remove(&req)
+                    {
+                        // a confirmed answer-file load replaces the whole
+                        // engine config and jumps to Review — stale local
+                        // buffers are dropped now that the file parsed
+                        if field == "answer_file" {
+                            self.inputs.clear();
+                            self.confirm_inputs.clear();
+                            self.selected.clear();
+                            send_op(json!({"op": "page"}));
+                        }
                     }
                 }
                 Some("bye") => {}
@@ -491,15 +505,9 @@ impl cosmic::app::Application for Installer {
                 } else {
                     let tv = self.typed_value(&name, &val);
                     self.send_set(&name, tv);
-                    // a successful answer-file load replaces the whole engine
-                    // config and jumps to Review — every local buffer is now
-                    // stale, so clear before the re-fetch re-seeds
-                    if name == "answer_file" {
-                        self.inputs.clear();
-                        self.confirm_inputs.clear();
-                        self.selected.clear();
-                        send_op(json!({"op": "page"}));
-                    }
+                    // answer_file stays in inputs while typing — buffers
+                    // clear only on the correlated `result` (a failed load
+                    // keeps the path editable); see the result handler
                 }
             }
             Message::Toggle(name, val) => {
