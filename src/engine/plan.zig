@@ -158,9 +158,9 @@ pub fn build(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, pkg_
     if (pre) |p| {
         if (p.post_install) |script| {
             var c: std.ArrayList(Cmd) = .empty;
-            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/tmp/gi-post-install.sh", .content = script, .mode = 0o755 } });
-            try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "/bin/sh", "/tmp/gi-post-install.sh" }), .chroot = true, .desc = "preset post-install hook" } });
-            try c.append(alloc, argv(alloc, &.{ "rm", "-f", "/mnt/gentoo/tmp/gi-post-install.sh" }, "cleanup hook script"));
+            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/root/gi-post-install.sh", .content = script, .mode = 0o700 } });
+            try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "/bin/sh", "/root/gi-post-install.sh" }), .chroot = true, .desc = "preset post-install hook" } });
+            try c.append(alloc, argv(alloc, &.{ "rm", "-f", "/mnt/gentoo/root/gi-post-install.sh" }, "cleanup hook script"));
             try steps.append(alloc, .{ .id = "post-install", .title = "Preset post-install hook", .cmds = c.items });
         }
     }
@@ -178,16 +178,22 @@ pub fn build(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, pkg_
                 return error.BadExtraStep;
             };
             const floor = findStepIndex(steps.items, "enter-chroot") orelse 0;
-            if (anchor < floor) {
+            // Ceiling: the terminal steps are not valid anchors — finish
+            // unmounts the target and post-install is the last chroot hook.
+            const anchor_id = steps.items[anchor].id;
+            const past_end = std.mem.eql(u8, anchor_id, "finish") or
+                std.mem.eql(u8, anchor_id, "post-install") or
+                std.mem.startsWith(u8, anchor_id, "preset-");
+            if (anchor < floor or past_end) {
                 if (!builtin.is_test)
-                    std.log.err("preset extra_step '{s}': anchor '{s}' is before enter-chroot", .{ ex.name, ex.after });
+                    std.log.err("preset extra_step '{s}': anchor '{s}' is outside the chroot pipeline", .{ ex.name, ex.after });
                 return error.BadExtraStep;
             }
             var c: std.ArrayList(Cmd) = .empty;
-            const spath = s(alloc, "/mnt/gentoo/tmp/gi-extra-{s}.sh", .{ex.name});
-            try c.append(alloc, .{ .write_file = .{ .path = spath, .content = ex.script, .mode = 0o755 } });
+            const spath = s(alloc, "/mnt/gentoo/root/gi-extra-{s}.sh", .{ex.name});
+            try c.append(alloc, .{ .write_file = .{ .path = spath, .content = ex.script, .mode = 0o700 } });
             try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "/bin/sh", s(alloc, "/tmp/gi-extra-{s}.sh", .{ex.name}) }),
+                .argv = try alloc.dupe([]const u8, &.{ "/bin/sh", s(alloc, "/root/gi-extra-{s}.sh", .{ex.name}) }),
                 .chroot = true,
                 .desc = if (ex.description.len > 0) ex.description else ex.name,
             } });
@@ -1823,8 +1829,22 @@ fn planPackages(alloc: Allocator, cfg: *const Config, sets: Sets) !Step {
     var c: std.ArrayList(Cmd) = .empty;
     // overlay repos a set asked for (e.g. cosmic) — enable + sync first.
     // A preset [[repos]] entry with sync_uri is unknown to eselect: write
-    // the repos.conf file and sync it directly instead.
+    // the repos.conf file and sync it directly instead. Git sync needs
+    // dev-vcs/git in the target — stage3s don't guarantee it.
+    var needs_git = false;
+    for (sets.repos) |repo| if (repo.sync_uri != null) {
+        needs_git = true;
+        break;
+    };
+    if (needs_git)
+        try c.append(alloc, .{ .exec = .{
+            .argv = try alloc.dupe([]const u8, &.{ "emerge", "--noreplace", "dev-vcs/git" }),
+            .chroot = true,
+            .desc = "git for overlay sync",
+        } });
     for (sets.repos) |repo| {
+        // repo names land in a repos.conf path + [section] — no traversal.
+        if (!stepNameOk(repo.name)) return error.BadRepo;
         if (repo.sync_uri) |uri| {
             try c.append(alloc, wf(alloc, s(alloc, "/mnt/gentoo/etc/portage/repos.conf/{s}.conf", .{repo.name}),
                 s(alloc, "[{s}]\nlocation = /var/db/repos/{s}\nsync-type = git\nsync-uri = {s}\nauto-sync = yes\n", .{ repo.name, repo.name, uri })));
@@ -2945,8 +2965,8 @@ test "preset extra_steps insert after anchor; post_install before finish" {
     try std.testing.expect(!pl.steps[sc + 2].skippable);
     // script staged into the target then run in the chroot
     const cmds = pl.steps[sc + 1].cmds;
-    try std.testing.expectEqualStrings("/mnt/gentoo/tmp/gi-extra-motd.sh", cmds[0].write_file.path);
-    try std.testing.expectEqual(0o755, cmds[0].write_file.mode);
+    try std.testing.expectEqualStrings("/mnt/gentoo/root/gi-extra-motd.sh", cmds[0].write_file.path);
+    try std.testing.expectEqual(0o700, cmds[0].write_file.mode);
     try std.testing.expect(cmds[1].exec.chroot);
     // post-install sits between bootloader and finish
     const fin = idxOf(pl.steps, "finish");
@@ -2959,4 +2979,13 @@ test "preset extra_steps insert after anchor; post_install before finish" {
     var early: preset.Preset = .{ .doc = doc };
     early.extra_steps = &.{.{ .name = "x", .after = "stage3", .script = "true\n" }};
     try std.testing.expectError(error.BadExtraStep, build(alloc, &cfg, null, .{}, &early, null));
+
+    // terminal steps are not valid anchors
+    var late: preset.Preset = .{ .doc = doc };
+    late.extra_steps = &.{.{ .name = "late", .after = "finish", .script = "true\n" }};
+    try std.testing.expectError(error.BadExtraStep, build(alloc, &cfg, null, .{}, &late, null));
+    var last: preset.Preset = .{ .doc = doc };
+    last.extra_steps = &.{.{ .name = "last", .after = "post-install", .script = "true\n" }};
+    last.post_install = "true\n";
+    try std.testing.expectError(error.BadExtraStep, build(alloc, &cfg, null, .{}, &last, null));
 }

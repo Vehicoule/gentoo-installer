@@ -308,7 +308,11 @@ pub fn main(init: std.process.Init) !void {
     }
     pkg_sets = .{ .atoms = rs.resolved.atoms, .repos = rs.resolved.repos };
 
-    const p = try engine.plan.build(alloc, &cfg, if (env_opt) |*e| e else null, pkg_sets, if (preset) |*pp| pp else null, null);
+    const p = engine.plan.build(alloc, &cfg, if (env_opt) |*e| e else null, pkg_sets, if (preset) |*pp| pp else null, null) catch |e| {
+        try errw.print("plan build failed: {s}\n", .{@errorName(e)});
+        try errw.flush();
+        std.process.exit(1);
+    };
     try engine.runner.run(io, alloc, p, .{
         .mode = if (dry_run or cmd == .plan) .dry_run else .exec,
         .journal_path = if (cmd == .run and !dry_run) journal_path else null,

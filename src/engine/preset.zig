@@ -74,8 +74,9 @@ pub fn load(alloc: Allocator, path: []const u8, io: std.Io) LoadError!Preset {
         dir_path = path;
         file_path = std.fmt.allocPrint(alloc, "{s}/preset.toml", .{path}) catch return error.OutOfMemory;
     } else if (std.fs.path.dirname(path)) |d| dir_path = d;
-    const preset_dir = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch
+    var preset_dir = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch
         return error.BadPreset;
+    defer preset_dir.close(io);
     const text = std.Io.Dir.cwd().readFileAlloc(io, file_path, alloc, .limited(4 << 20)) catch
         return error.BadPreset;
     var perr: toml.ParseError = undefined;
@@ -135,6 +136,8 @@ pub fn load(alloc: Allocator, path: []const u8, io: std.Io) LoadError!Preset {
                 if (item != .table) continue;
                 const nv = item.table.get("name") orelse continue;
                 if (nv != .string) continue;
+                if (!nameOk(nv.string))
+                    return presetErr("repo name '{s}' must be [A-Za-z0-9_-]+", .{nv.string});
                 var r: Repo = .{ .name = nv.string };
                 if (item.table.get("sync_uri")) |sv| {
                     if (sv != .string)
@@ -229,18 +232,36 @@ fn findRepo(preset: *const Preset, name: []const u8) Repo {
     return .{ .name = name };
 }
 
-/// Dotted-numeric version compare: have < want. An unparseable
-/// component fails closed (treated as "too old") — a preset can't
-/// smuggle a bogus engine_min past the check.
+/// Names that land in paths / ini section headers — keep them tame.
+fn nameOk(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64) return false;
+    for (name) |ch|
+        if (!std.ascii.isAlphanumeric(ch) and ch != '-' and ch != '_') return false;
+    return true;
+}
+
+/// Dotted-numeric version compare: have < want. `want` must be fully
+/// dotted-numeric — a malformed engine_min refuses. An unparseable `have`
+/// component also fails closed (treated as "too old").
 pub fn versionLt(have: []const u8, want: []const u8) bool {
+    {
+        var wi = std.mem.splitScalar(u8, want, '.');
+        var n: usize = 0;
+        while (wi.next()) |w| {
+            n += 1;
+            if (w.len == 0) return true;
+            _ = std.fmt.parseInt(u32, w, 10) catch return true;
+        }
+        if (n == 0) return true;
+    }
     var hi = std.mem.splitScalar(u8, have, '.');
-    var wi = std.mem.splitScalar(u8, want, '.');
+    var wi2 = std.mem.splitScalar(u8, want, '.');
     while (true) {
         const h = hi.next();
-        const w = wi.next();
+        const w = wi2.next();
         if (h == null and w == null) return false;
         const hn = std.fmt.parseInt(u32, h orelse "0", 10) catch return true;
-        const wn = std.fmt.parseInt(u32, w orelse "0", 10) catch return true;
+        const wn = std.fmt.parseInt(u32, w orelse "0", 10) catch unreachable;
         if (hn != wn) return hn < wn;
     }
 }
@@ -482,6 +503,10 @@ test "versionLt dotted compare" {
     try std.testing.expect(!versionLt("1.0", "1.0.0"));
     try std.testing.expect(versionLt("1.0", "1.0.1"));
     try std.testing.expect(versionLt("1.0.0", "bogus")); // unparseable want → refuse
+    try std.testing.expect(versionLt("1.0.0", "0.9.bogus")); // trailing junk → refuse
+    try std.testing.expect(versionLt("1.0.0", "0.9.")); // empty component → refuse
+    try std.testing.expect(versionLt("bogus", "0.9")); // unparseable have → refuse
+    try std.testing.expect(versionLt("1.0.0", "")); // empty → refuse
 }
 
 test "resolveSets maps repos to [[repos]] sync_uri" {
