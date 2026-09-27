@@ -64,16 +64,16 @@ fn loadScript(alloc: Allocator, dir: std.Io.Dir, io: std.Io, where: []const u8, 
         while (it.next()) |seg|
             if (std.mem.eql(u8, seg, "..")) return presetErr("{s}: script path '{s}' escapes the preset dir", .{ where, rel });
     }
-    // No symlink component may leave the preset dir: stat each segment
-    // without following, so a shipped link to an outside file refuses.
-    var rest = rel;
-    while (std.mem.indexOfScalar(u8, rest, '/')) |slash| {
-        const comp = rest[0..slash];
-        const cst = dir.statFile(io, comp, .{ .follow_symlinks = false }) catch
+    // No symlink component may leave the preset dir: stat each cumulative
+    // prefix (scripts, scripts/setup, ...) without following, so a shipped
+    // link to an outside file refuses.
+    var pos: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, rel, pos, '/')) |slash| {
+        const cst = dir.statFile(io, rel[0..slash], .{ .follow_symlinks = false }) catch
             return presetErr("{s}: script '{s}' not found", .{ where, rel });
         if (cst.kind == .sym_link)
             return presetErr("{s}: script path '{s}' contains a symlink", .{ where, rel });
-        rest = rest[slash + 1 ..];
+        pos = slash + 1;
     }
     const st = dir.statFile(io, rel, .{ .follow_symlinks = false }) catch
         return presetErr("{s}: script '{s}' not found", .{ where, rel });
