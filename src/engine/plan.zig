@@ -970,10 +970,12 @@ fn planKernel(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !St
             } });
             // The path is arbitrary live-env input — confirm it smells
             // like a .config before copying so a bad answer file can't
-            // exfiltrate an unrelated host file into the target.
+            // exfiltrate an unrelated host file into the target. Real
+            // configs are a few hundred KiB; an 8 MiB cap both bounds
+            // the grep and defines the max supported config size.
             try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", "[ -f \"$1\" ] && head -c 4194304 \"$1\" | grep -q CONFIG_", "kcfg", cfg.system.kernel_config }),
-                .desc = "verify kernel_config is a regular file containing CONFIG_",
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", "[ -f \"$1\" ] && [ \"$(wc -c < \"$1\")\" -le 8388608 ] && grep -q CONFIG_ \"$1\"", "kcfg", cfg.system.kernel_config }),
+                .desc = "verify kernel_config is a regular file ≤8MiB containing CONFIG_",
             } });
             try c.append(alloc, argv(alloc, &.{ "cp", cfg.system.kernel_config, "/mnt/gentoo/tmp/kernel.config" }, "stage .config into target"));
             try c.append(alloc, .{ .exec = .{
