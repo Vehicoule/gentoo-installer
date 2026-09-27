@@ -1632,7 +1632,13 @@ fn planServices(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !
                 \\            !strcmp(argv[i], "-s")) cmd = RB_AUTOBOOT;
                 \\    }
                 \\    if (!sys) {
-                \\        if (cmd == RB_AUTOBOOT) { kill(1, SIGINT); _exit(0); }
+                \\        if (cmd == RB_AUTOBOOT) {
+                \\            if (kill(1, SIGINT)) {
+                \\                write(2, "shutdown: cannot signal init\n", 28);
+                \\                _exit(1);
+                \\            }
+                \\            _exit(0);
+                \\        }
                 \\        execl("/sbin/dinitctl", "dinitctl", "shutdown", (char *)0);
                 \\        _exit(1);
                 \\    }
