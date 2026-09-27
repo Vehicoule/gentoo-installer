@@ -90,6 +90,7 @@ enum Message {
     Engine(Value),
     EngineLine(String),
     Input(String, String),
+    ConfirmInput(String, String),
     Toggle(String, bool),
     Select(String, String),
     Op(&'static str),
@@ -115,12 +116,98 @@ struct Installer {
     core: cosmic::Core,
     phase: Phase,
     page: Option<Value>,
-    inputs: HashMap<String, String>,   // text/secret/confirm buffers
-    selected: HashMap<String, String>, // enum selections
+    inputs: HashMap<String, String>,         // text/secret buffers
+    confirm_inputs: HashMap<String, String>, // second entry for confirm:true secrets
+    selected: HashMap<String, String>,       // enum selections
+    disk_device: String,                     // last disk.device seen — survives leaving its page
     steps: Vec<Step>,
     plan: Option<String>,
     errors: Vec<String>,
     log: Vec<String>,
+}
+
+impl Installer {
+    /// `(type, confirm)` for a field on the current page.
+    fn field_meta(&self, name: &str) -> (String, bool) {
+        self.page
+            .as_ref()
+            .and_then(|p| p.get("fields"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|f| f.get("name").and_then(Value::as_str) == Some(name))
+            .map(|f| {
+                (
+                    f.get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or("string")
+                        .to_string(),
+                    f.get("confirm").and_then(Value::as_bool).unwrap_or(false),
+                )
+            })
+            .unwrap_or_else(|| ("string".into(), false))
+    }
+
+    /// Send any buffered secret inputs (secrets aren't streamed per
+    /// keystroke — partial passwords are sensitive plaintext the engine
+    /// doesn't need). Returns false when a confirm field mismatches.
+    fn flush_secrets(&mut self) -> bool {
+        let mut ok = true;
+        let fields: Vec<String> = self
+            .page
+            .as_ref()
+            .and_then(|p| p.get("fields"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|f| f.get("type").and_then(Value::as_str) == Some("secret"))
+            .map(|f| {
+                f.get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect();
+        for name in fields {
+            let Some(val) = self.inputs.get(&name) else {
+                continue;
+            };
+            let (_, needs_confirm) = self.field_meta(&name);
+            if needs_confirm {
+                let c = self
+                    .confirm_inputs
+                    .get(&name)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                if c != val.as_str() {
+                    self.errors
+                        .push(format!("confirmation does not match for {name}"));
+                    ok = false;
+                    continue;
+                }
+            }
+            send_op(json!({"op": "set", "field": name, "value": val}));
+        }
+        ok
+    }
+
+    /// Serialize a text-field edit to the JSON shape the engine expects:
+    /// int → number, list/record/table → parsed JSON, otherwise a string.
+    /// Unparseable values go out as strings so the engine's own error
+    /// (shown in the error list) explains the rejection.
+    fn typed_value(&self, name: &str, text: &str) -> Value {
+        let (ftype, _) = self.field_meta(name);
+        match ftype.as_str() {
+            "int" => text
+                .parse::<i64>()
+                .map(Value::from)
+                .unwrap_or_else(|_| Value::String(text.into())),
+            "list" | "record" | "table" => {
+                serde_json::from_str::<Value>(text).unwrap_or_else(|_| Value::String(text.into()))
+            }
+            _ => Value::String(text.into()),
+        }
+    }
 }
 
 impl cosmic::app::Application for Installer {
@@ -142,7 +229,9 @@ impl cosmic::app::Application for Installer {
             phase: Phase::Boot,
             page: None,
             inputs: HashMap::new(),
+            confirm_inputs: HashMap::new(),
             selected: HashMap::new(),
+            disk_device: String::new(),
             steps: Vec::new(),
             plan: None,
             errors: Vec::new(),
@@ -181,6 +270,18 @@ impl cosmic::app::Application for Installer {
                 Some("page") => {
                     self.phase = Phase::Wizard;
                     self.errors.clear();
+                    // disk.device isn't on the review page — remember the
+                    // engine-side value so Install can confirm it later.
+                    if let Some(dev) = v
+                        .get("fields")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .find(|f| f.get("name").and_then(Value::as_str) == Some("disk.device"))
+                        .and_then(|f| f.get("value").and_then(Value::as_str))
+                    {
+                        self.disk_device = dev.to_string();
+                    }
                     self.page = Some(v);
                 }
                 Some("validate") => {
@@ -189,7 +290,11 @@ impl cosmic::app::Application for Installer {
                         .and_then(Value::as_array)
                         .map(|a| {
                             a.iter()
-                                .filter_map(|e| e.as_str().map(String::from))
+                                .filter_map(|e| {
+                                    e.as_str()
+                                        .or_else(|| e.get("message").and_then(Value::as_str))
+                                        .map(String::from)
+                                })
                                 .collect()
                         })
                         .unwrap_or_default();
@@ -197,10 +302,14 @@ impl cosmic::app::Application for Installer {
                         self.errors.clear();
                     }
                 }
+                // {"ev":"plan","cmds":[...]} — one generated command per entry
                 Some("plan") => {
-                    self.plan = v
-                        .get("plan")
-                        .map(|p| serde_json::to_string_pretty(p).unwrap_or_default());
+                    self.plan = v.get("cmds").and_then(Value::as_array).map(|a| {
+                        a.iter()
+                            .filter_map(|c| c.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    });
                 }
                 Some("step") => {
                     self.phase = Phase::Running;
@@ -234,42 +343,65 @@ impl cosmic::app::Application for Installer {
                             .unwrap_or("unknown")
                             .to_string(),
                     );
+                    // doInstall reports failure via `error` and returns
+                    // without a `done` — don't leave the UI on Installing…
+                    if matches!(self.phase, Phase::Running) {
+                        self.phase = Phase::Done(false);
+                    }
                 }
                 Some("result") | Some("bye") => {}
                 _ => {}
             },
+            Message::ConfirmInput(name, val) => {
+                self.confirm_inputs.insert(name, val);
+            }
             Message::Input(name, val) => {
+                let (ftype, _) = self.field_meta(&name);
                 self.inputs.insert(name.clone(), val.clone());
-                // secrets wait for confirm; non-secrets send immediately
-                send_op(json!({"op": "set", "field": name, "value": val}));
+                if name == "disk.device" {
+                    self.disk_device = val.clone();
+                }
+                if ftype == "secret" {
+                    // buffered — flush_secrets sends it on the next action
+                } else {
+                    let tv = self.typed_value(&name, &val);
+                    send_op(json!({"op": "set", "field": name, "value": tv}));
+                }
             }
             Message::Toggle(name, val) => {
                 send_op(json!({"op": "set", "field": name, "value": val}));
+                // `set` doesn't re-emit the page, but a toggle can change
+                // conditional fields (e.g. luks reveals its passphrase)
+                send_op(json!({"op": "page"}));
             }
             Message::Select(name, val) => {
                 self.selected.insert(name.clone(), val.clone());
+                if name == "disk.device" {
+                    self.disk_device = val.clone();
+                }
                 send_op(json!({"op": "set", "field": name, "value": val}));
+                send_op(json!({"op": "page"}));
             }
             Message::Op("export_answer") => {
                 send_op(json!({"op": "export_answer", "path": "gentoo-installer-answers.toml"}))
             }
-            Message::Op(op) => send_op(json!({"op": op})),
-            Message::Plan => send_op(json!({"op": "plan"})),
+            Message::Op(op) => {
+                if !self.flush_secrets() {
+                    return Task::none();
+                }
+                send_op(json!({"op": op}));
+            }
+            Message::Plan => {
+                if self.flush_secrets() {
+                    send_op(json!({"op": "plan"}));
+                }
+            }
             Message::Install => {
-                // confirm token is the basename of disk.device
-                let dev = self
-                    .page
-                    .as_ref()
-                    .and_then(|p| p.get("fields"))
-                    .and_then(|f| f.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .find(|f| f.get("name").and_then(Value::as_str) == Some("disk.device"))
-                            .and_then(|f| f.get("value").and_then(Value::as_str))
-                            .unwrap_or("")
-                    })
-                    .unwrap_or("")
-                    .to_string();
+                if !self.flush_secrets() {
+                    return Task::none();
+                }
+                // confirm token is the basename of the disk picked earlier
+                let dev = self.disk_device.clone();
                 let confirm = dev.rsplit('/').next().unwrap_or(&dev).to_string();
                 self.steps.clear();
                 send_op(json!({"op": "install", "dry_run": false, "confirm": confirm}));
@@ -317,7 +449,12 @@ impl cosmic::app::Application for Installer {
                     col = col.push(widget::text::title2(title));
                     if let Some(fields) = p.get("fields").and_then(Value::as_array) {
                         for f in fields {
-                            col = col.push(field_widget(f, &self.inputs, &self.selected));
+                            col = col.push(field_widget(
+                                f,
+                                &self.inputs,
+                                &self.confirm_inputs,
+                                &self.selected,
+                            ));
                         }
                     }
                     if let Some(groups) = p.get("summary").and_then(Value::as_array) {
@@ -386,6 +523,7 @@ impl cosmic::app::Application for Installer {
 fn field_widget<'a>(
     f: &'a Value,
     inputs: &'a HashMap<String, String>,
+    confirm_inputs: &'a HashMap<String, String>,
     selected: &'a HashMap<String, String>,
 ) -> Element<'a, Message> {
     let spacing = theme::spacing();
@@ -441,12 +579,22 @@ fn field_widget<'a>(
             .into(),
         "secret" => {
             let cur: &str = inputs.get(name).map(String::as_str).unwrap_or("");
-            widget::secure_input(label, cur, None, true)
-                .on_input({
-                    let n = name.to_string();
-                    move |v| Message::Input(n.clone(), v)
-                })
-                .into()
+            let mut sc = widget::column::with_capacity(4).spacing(spacing.space_xxs);
+            sc = sc.push(widget::secure_input(label, cur, None, true).on_input({
+                let n = name.to_string();
+                move |v| Message::Input(n.clone(), v)
+            }));
+            // confirm:true secrets ask twice; compared on the next action
+            if f.get("confirm").and_then(Value::as_bool).unwrap_or(false) {
+                let cur2: &str = confirm_inputs.get(name).map(String::as_str).unwrap_or("");
+                sc = sc.push(
+                    widget::secure_input("again to confirm", cur2, None, true).on_input({
+                        let n = name.to_string();
+                        move |v| Message::ConfirmInput(n.clone(), v)
+                    }),
+                );
+            }
+            sc.into()
         }
         _ => {
             let cur: &str = inputs
