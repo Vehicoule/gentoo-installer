@@ -519,13 +519,14 @@ impl cosmic::app::Application for Installer {
                 }
                 Some("config") => {
                     // answer-file load refresh — adopt the imported target
-                    // disk and force re-confirmation against it
+                    // disk and force re-confirmation against it; an empty
+                    // device still applies — it disables Install until the
+                    // user picks a disk again
                     if let Some(dev) = v
                         .get("config")
                         .and_then(|c| c.get("disk"))
                         .and_then(|d| d.get("device"))
                         .and_then(Value::as_str)
-                        && !dev.is_empty()
                         && self.disk_device != dev
                     {
                         self.disk_device = dev.to_string();
