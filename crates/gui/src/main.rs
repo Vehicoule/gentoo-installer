@@ -38,7 +38,7 @@ fn engine_stream() -> impl cosmic::iced::futures::Stream<Item = Message> {
                 .arg("headless")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn();
             let mut child: Child = match spawn {
                 Ok(c) => c,
@@ -49,6 +49,20 @@ fn engine_stream() -> impl cosmic::iced::futures::Stream<Item = Message> {
             };
             *ENGINE_IN.lock().unwrap() = child.stdin.take();
             let stdout = child.stdout.take().unwrap();
+            // stderr carries engine diagnostics — forward into the app log
+            // instead of discarding, else a fatal exit leaves no trace.
+            if let Some(stderr) = child.stderr.take() {
+                let mut tx2 = tx.clone();
+                std::thread::spawn(move || {
+                    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                        if block_on(tx2.send(Message::EngineLine(format!("__stderr:{line}"))))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
             let _ = block_on(tx.send(Message::EngineLine("__spawned".into())));
             for line in BufReader::new(stdout).lines() {
                 match line {
@@ -91,10 +105,12 @@ enum Message {
     EngineLine(String),
     Input(String, String),
     ConfirmInput(String, String),
+    InstallConfirm(String),
     Toggle(String, bool),
     Select(String, String),
     Op(&'static str),
     Install,
+    DryRun,
     Plan,
 }
 
@@ -109,7 +125,8 @@ enum Phase {
     Wizard,  // page events
     Running, // step events during install
     Done(bool),
-    Dead, // engine stdout closed
+    Failed, // install error mid-run — distinct from a clean dry run
+    Dead,   // engine stdout closed
 }
 
 struct Installer {
@@ -120,6 +137,7 @@ struct Installer {
     confirm_inputs: HashMap<String, String>, // second entry for confirm:true secrets
     selected: HashMap<String, String>,       // enum selections
     disk_device: String,                     // last disk.device seen — survives leaving its page
+    install_confirm: String,                 // typed basename ack gating the Install button
     steps: Vec<Step>,
     plan: Option<String>,
     errors: Vec<String>,
@@ -168,27 +186,36 @@ impl Installer {
                     .to_string()
             })
             .collect();
-        for name in fields {
-            let Some(val) = self.inputs.get(&name) else {
+        for name in &fields {
+            let Some(val) = self.inputs.get(name.as_str()) else {
                 continue;
             };
-            let (_, needs_confirm) = self.field_meta(&name);
+            let (_, needs_confirm) = self.field_meta(name);
             if needs_confirm {
                 let c = self
                     .confirm_inputs
-                    .get(&name)
+                    .get(name)
                     .map(String::as_str)
                     .unwrap_or("");
                 if c != val.as_str() {
                     self.errors
                         .push(format!("confirmation does not match for {name}"));
                     ok = false;
-                    continue;
                 }
             }
+        }
+        if !ok {
+            return false;
+        }
+        // every confirm passed — only now send the secrets, so a blocked
+        // navigation never stores partial credentials engine-side
+        for name in fields {
+            let Some(val) = self.inputs.get(&name) else {
+                continue;
+            };
             send_op(json!({"op": "set", "field": name, "value": val}));
         }
-        ok
+        true
     }
 
     /// Serialize a text-field edit to the JSON shape the engine expects:
@@ -232,6 +259,7 @@ impl cosmic::app::Application for Installer {
             confirm_inputs: HashMap::new(),
             selected: HashMap::new(),
             disk_device: String::new(),
+            install_confirm: String::new(),
             steps: Vec::new(),
             plan: None,
             errors: Vec::new(),
@@ -257,6 +285,11 @@ impl cosmic::app::Application for Installer {
                     self.phase = Phase::Dead;
                 } else if let Some(e) = l.strip_prefix("__spawn_error:") {
                     self.errors.push(format!("cannot start engine: {e}"));
+                } else if let Some(e) = l.strip_prefix("__stderr:") {
+                    self.log.push(format!("engine: {e}"));
+                    if self.log.len() > 64 {
+                        self.log.remove(0);
+                    }
                 } else if let Ok(v) = serde_json::from_str::<Value>(&l) {
                     return self.update(Message::Engine(v));
                 }
@@ -280,7 +313,42 @@ impl cosmic::app::Application for Installer {
                         .find(|f| f.get("name").and_then(Value::as_str) == Some("disk.device"))
                         .and_then(|f| f.get("value").and_then(Value::as_str))
                     {
+                        if self.disk_device != dev {
+                            self.install_confirm.clear();
+                        }
+                        if self.disk_device != dev {
+                            self.install_confirm.clear();
+                        }
                         self.disk_device = dev.to_string();
+                    }
+                    // text-family fields with non-string values (ints,
+                    // lists, records) would otherwise render blank — seed
+                    // the input buffer with the serialized engine value.
+                    let seeds: Vec<(String, String)> = v
+                        .get("fields")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|f| {
+                            let name = f.get("name").and_then(Value::as_str)?;
+                            let t = f.get("type").and_then(Value::as_str).unwrap_or("");
+                            if matches!(t, "enum" | "bool" | "secret") {
+                                return None;
+                            }
+                            let val = f.get("value")?;
+                            if val.is_null() {
+                                return None;
+                            }
+                            let s = match val.as_str() {
+                                Some(s) => s.to_string(),
+                                None => serde_json::to_string(val).ok()?,
+                            };
+                            Some((name.to_string(), s))
+                        })
+                        .collect();
+                    for (n, s) in seeds {
+                        // keep an in-progress user edit over the re-emitted value
+                        self.inputs.entry(n).or_insert(s);
                     }
                     self.page = Some(v);
                 }
@@ -346,7 +414,7 @@ impl cosmic::app::Application for Installer {
                     // doInstall reports failure via `error` and returns
                     // without a `done` — don't leave the UI on Installing…
                     if matches!(self.phase, Phase::Running) {
-                        self.phase = Phase::Done(false);
+                        self.phase = Phase::Failed;
                     }
                 }
                 Some("result") | Some("bye") => {}
@@ -355,17 +423,26 @@ impl cosmic::app::Application for Installer {
             Message::ConfirmInput(name, val) => {
                 self.confirm_inputs.insert(name, val);
             }
+            Message::InstallConfirm(val) => {
+                self.install_confirm = val;
+            }
             Message::Input(name, val) => {
                 let (ftype, _) = self.field_meta(&name);
                 self.inputs.insert(name.clone(), val.clone());
                 if name == "disk.device" {
                     self.disk_device = val.clone();
+                    self.install_confirm.clear();
                 }
                 if ftype == "secret" {
                     // buffered — flush_secrets sends it on the next action
                 } else {
                     let tv = self.typed_value(&name, &val);
                     send_op(json!({"op": "set", "field": name, "value": tv}));
+                    // a successful answer-file load makes the engine jump
+                    // pages — re-fetch so the GUI shows what it's really on
+                    if name == "answer_file" {
+                        send_op(json!({"op": "page"}));
+                    }
                 }
             }
             Message::Toggle(name, val) => {
@@ -378,6 +455,7 @@ impl cosmic::app::Application for Installer {
                 self.selected.insert(name.clone(), val.clone());
                 if name == "disk.device" {
                     self.disk_device = val.clone();
+                    self.install_confirm.clear();
                 }
                 send_op(json!({"op": "set", "field": name, "value": val}));
                 send_op(json!({"op": "page"}));
@@ -400,11 +478,26 @@ impl cosmic::app::Application for Installer {
                 if !self.flush_secrets() {
                     return Task::none();
                 }
-                // confirm token is the basename of the disk picked earlier
+                // the engine's confirm gate expects the user to have typed
+                // the target disk's basename — never derive it silently
                 let dev = self.disk_device.clone();
                 let confirm = dev.rsplit('/').next().unwrap_or(&dev).to_string();
+                if self.install_confirm != confirm || confirm.is_empty() {
+                    self.errors
+                        .push(format!("type '{confirm}' to confirm the install"));
+                    return Task::none();
+                }
                 self.steps.clear();
                 send_op(json!({"op": "install", "dry_run": false, "confirm": confirm}));
+            }
+            Message::DryRun => {
+                // dry-run needs no confirm token — the engine skips
+                // destructive gates entirely and only exercises the plan
+                if !self.flush_secrets() {
+                    return Task::none();
+                }
+                self.steps.clear();
+                send_op(json!({"op": "install", "dry_run": true}));
             }
         }
         Task::none()
@@ -423,11 +516,12 @@ impl cosmic::app::Application for Installer {
             Phase::Dead => {
                 col = col.push(widget::text::title2("Engine exited"));
             }
-            Phase::Running | Phase::Done(_) => {
+            Phase::Running | Phase::Done(_) | Phase::Failed => {
                 col = col.push(widget::text::title2(match self.phase {
                     Phase::Running => "Installing…",
                     Phase::Done(true) => "Install complete — safe to reboot",
                     Phase::Done(false) => "Dry run complete",
+                    Phase::Failed => "Installation failed",
                     _ => unreachable!(),
                 }));
                 for s in &self.steps {
@@ -471,6 +565,29 @@ impl cosmic::app::Application for Installer {
                             }
                         }
                     }
+                    let has_install = p
+                        .get("actions")
+                        .and_then(Value::as_array)
+                        .map(|a| a.iter().any(|x| x.as_str() == Some("install")))
+                        .unwrap_or(false);
+                    if has_install {
+                        // destructive gate: the engine wants the target disk's
+                        // basename; make the user type it instead of
+                        // auto-filling the confirm token.
+                        let base = self
+                            .disk_device
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(&self.disk_device)
+                            .to_string();
+                        col = col.push(
+                            widget::text_input(
+                                format!("type '{base}' to confirm install"),
+                                &self.install_confirm,
+                            )
+                            .on_input(Message::InstallConfirm),
+                        );
+                    }
                     // actions
                     let mut row = widget::row::with_capacity(4).spacing(spacing.space_s);
                     for a in p
@@ -480,23 +597,37 @@ impl cosmic::app::Application for Installer {
                         .unwrap_or_default()
                     {
                         let a = a.as_str().unwrap_or("");
-                        let btn =
-                            match a {
-                                "next" => {
-                                    widget::button::suggested("Next").on_press(Message::Op("next"))
+                        let btn = match a {
+                            "next" => {
+                                widget::button::suggested("Next").on_press(Message::Op("next"))
+                            }
+                            "back" => {
+                                widget::button::standard("Back").on_press(Message::Op("back"))
+                            }
+                            "quit" => {
+                                widget::button::destructive("Quit").on_press(Message::Op("quit"))
+                            }
+                            "plan" => widget::button::standard("Plan").on_press(Message::Plan),
+                            "export_answer" => widget::button::standard("Export")
+                                .on_press(Message::Op("export_answer")),
+                            "install" => {
+                                let dry =
+                                    widget::button::standard("Dry run").on_press(Message::DryRun);
+                                row = row.push(dry);
+                                let b = widget::button::destructive("Install");
+                                let base = self
+                                    .disk_device
+                                    .rsplit('/')
+                                    .next()
+                                    .unwrap_or(&self.disk_device);
+                                if !base.is_empty() && self.install_confirm == base {
+                                    b.on_press(Message::Install)
+                                } else {
+                                    b
                                 }
-                                "back" => {
-                                    widget::button::standard("Back").on_press(Message::Op("back"))
-                                }
-                                "quit" => widget::button::destructive("Quit")
-                                    .on_press(Message::Op("quit")),
-                                "plan" => widget::button::standard("Plan").on_press(Message::Plan),
-                                "export_answer" => widget::button::standard("Export")
-                                    .on_press(Message::Op("export_answer")),
-                                "install" => widget::button::destructive("Install")
-                                    .on_press(Message::Install),
-                                _ => continue,
-                            };
+                            }
+                            _ => continue,
+                        };
                         row = row.push(btn);
                     }
                     col = col.push(row);
