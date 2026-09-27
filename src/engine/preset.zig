@@ -54,9 +54,16 @@ fn presetErr(comptime fmt: []const u8, args: anytype) LoadError {
     return error.BadPreset;
 }
 
-/// Read a script asset relative to the preset dir; refuse missing or
-/// non-executable files rather than half-applying.
+/// Read a script asset relative to the preset dir; refuse missing,
+/// non-executable, or escaping paths rather than half-applying.
 fn loadScript(alloc: Allocator, dir: std.Io.Dir, io: std.Io, where: []const u8, rel: []const u8) LoadError![]const u8 {
+    if (rel.len == 0 or rel[0] == '/' or rel[0] == '\\')
+        return presetErr("{s}: script path '{s}' must be relative to the preset dir", .{ where, rel });
+    {
+        var it = std.mem.splitScalar(u8, rel, '/');
+        while (it.next()) |seg|
+            if (std.mem.eql(u8, seg, "..")) return presetErr("{s}: script path '{s}' escapes the preset dir", .{ where, rel });
+    }
     const st = dir.statFile(io, rel, .{}) catch
         return presetErr("{s}: script '{s}' not found", .{ where, rel });
     if (st.permissions.toMode() & 0o111 == 0)
@@ -142,10 +149,12 @@ pub fn load(alloc: Allocator, path: []const u8, io: std.Io) LoadError!Preset {
                 if (item.table.get("sync_uri")) |sv| {
                     if (sv != .string)
                         return presetErr("repo '{s}': sync_uri must be a string", .{r.name});
-                    if (sv.string.len == 0) continue; // "" = eselect enable
-                    if (!std.mem.startsWith(u8, sv.string, "https://"))
-                        return presetErr("repo '{s}': sync_uri must be an https:// URI", .{r.name});
-                    r.sync_uri = sv.string;
+                    if (sv.string.len != 0) {
+                        if (!uriOk(sv.string))
+                            return presetErr("repo '{s}': sync_uri must be a single-token https:// URI", .{r.name});
+                        r.sync_uri = sv.string;
+                    }
+                    // "" = eselect enable
                 }
                 try repos.append(alloc, r);
             }
@@ -161,6 +170,11 @@ pub fn load(alloc: Allocator, path: []const u8, io: std.Io) LoadError!Preset {
                 const t = item.table;
                 const nv = t.get("name") orelse return presetErr("extra_steps entry missing 'name'", .{});
                 if (nv != .string) return presetErr("extra_steps: 'name' must be a string", .{});
+                if (!nameOk(nv.string))
+                    return presetErr("extra_steps name '{s}' must be [A-Za-z0-9_-]+", .{nv.string});
+                for (exs.items) |e2|
+                    if (std.mem.eql(u8, e2.name, nv.string))
+                        return presetErr("duplicate extra_steps name '{s}'", .{nv.string});
                 const av = t.get("after") orelse return presetErr("extra_steps '{s}': missing 'after'", .{nv.string});
                 if (av != .string) return presetErr("extra_steps '{s}': 'after' must be a string", .{nv.string});
                 const sv = t.get("script") orelse return presetErr("extra_steps '{s}': missing 'script'", .{nv.string});
@@ -230,6 +244,16 @@ fn findRepo(preset: *const Preset, name: []const u8) Repo {
         if (std.mem.eql(u8, r.name, name)) return r;
     // Not declared in [[repos]] — a repo eselect knows already.
     return .{ .name = name };
+}
+
+/// A URI headed for a repos.conf line: https://, no whitespace or
+/// control chars (a newline would inject extra Portage directives).
+fn uriOk(u: []const u8) bool {
+    if (!std.mem.startsWith(u8, u, "https://")) return false;
+    if (u.len <= "https://".len) return false;
+    for (u) |ch|
+        if (ch <= ' ' or ch == 0x7f) return false;
+    return true;
 }
 
 /// Names that land in paths / ini section headers — keep them tame.

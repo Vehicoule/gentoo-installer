@@ -123,6 +123,7 @@ pub fn run(io: std.Io, alloc: Allocator, p: plan.Plan, opts: Options) !void {
         if (opts.on_step) |cb| cb(opts.ctx, i + 1, p.steps.len, step.id, "started");
         try out.print("[{d:0>2}] {s}  ({s})\n", .{ i + 1, step.title, step.id });
         var skipped_fail = false;
+        var staged: std.ArrayList([]const u8) = .empty;
         for (step.cmds) |cmd| {
             switch (cmd) {
                 .note => |n| try out.print("     note: {s}\n", .{n}),
@@ -131,6 +132,7 @@ pub fn run(io: std.Io, alloc: Allocator, p: plan.Plan, opts: Options) !void {
                     if (opts.mode == .exec) {
                         if (writeFile(io, w.path, w.content, w.mode)) {
                             journal.cmdWriteFile(step.id, w, "ok");
+                            staged.append(alloc, w.path) catch {};
                         } else |err| {
                             journal.cmdWriteFile(step.id, w, "fail");
                             if (opts.on_step) |cb| cb(opts.ctx, i + 1, p.steps.len, step.id, "failed");
@@ -175,6 +177,9 @@ pub fn run(io: std.Io, alloc: Allocator, p: plan.Plan, opts: Options) !void {
             }
         }
         if (skipped_fail) {
+            // best-effort: drop staged scripts the dead step left behind
+            for (staged.items) |sp|
+                std.Io.Dir.cwd().deleteFile(io, sp) catch {};
             // failed skippable step is not a success — journal + observers
             // see it as skipped, and the install continues.
             journal.stepDone(step.id, true);
