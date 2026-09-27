@@ -1251,7 +1251,7 @@ fn planSystemConfig(alloc: Allocator, cfg: *const Config) !Step {
                     \\    if [ "$size" -gt "$cap" ]; then size=$cap; fi
                     \\    dev=$(zramctl --find --size "$size" --algorithm zstd)
                     \\    [ -n "$dev" ] || { eend 1; return 1; }
-                    \\    echo "$dev" > /run/zram-swap.dev
+                    \\    echo "$dev" > /run/zram-swap.dev || { zramctl --reset "$dev" 2>/dev/null; eend 1; return 1; }
                     \\    if mkswap "$dev" >/dev/null 2>&1 && swapon -p 100 "$dev"; then
                     \\        eend 0
                     \\    else
