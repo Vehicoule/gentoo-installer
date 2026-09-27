@@ -142,7 +142,7 @@ pub fn build(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, pkg_
     try steps.append(alloc, try planSystemConfig(alloc, cfg));
     try steps.append(alloc, try planServices(alloc, cfg, env));
     try steps.append(alloc, try planPackages(alloc, cfg, pkg_sets));
-    try steps.append(alloc, try planBootloader(alloc, cfg, seed));
+    try steps.append(alloc, try planBootloader(alloc, cfg, env, seed));
     try steps.append(alloc, try planFinish(alloc, cfg));
 
     return .{ .steps = steps.items };
@@ -482,7 +482,7 @@ pub fn rootIdent(alloc: Allocator, cfg: *const Config, seed: u128) []const u8 {
     return partIdent(alloc, seed, rootPartIdx(cfg));
 }
 
-fn kernelArgs(alloc: Allocator, cfg: *const Config, seed: u128) []const u8 {
+fn kernelArgs(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, seed: u128) []const u8 {
     var r = s(alloc, "root={s}", .{rootIdent(alloc, cfg, seed)});
     // btrfs: install mounted subvol=@root — boot must select it too.
     if (rootFsOf(cfg) == .btrfs)
@@ -490,6 +490,13 @@ fn kernelArgs(alloc: Allocator, cfg: *const Config, seed: u128) []const u8 {
     // LUKS: dracut unlocks via crypttab/rd.luks at initramfs time.
     if (cfg.disk.luks)
         r = s(alloc, "{s} rd.luks=1", .{r});
+    // Proprietary NVIDIA: kernel modesetting is required for Wayland
+    // compositors and gives a working fb console before X starts.
+    switch (resolveGpuDriver(cfg, env)) {
+        .@"nvidia-open", .@"nvidia-drivers" =>
+            r = s(alloc, "{s} nvidia-drm.modeset=1", .{r}),
+        else => {},
+    }
     return s(alloc, "{s} rootfstype={s}", .{ r, @tagName(rootFsOf(cfg)) });
 }
 
@@ -610,7 +617,8 @@ fn archTokens(cfg: *const Config) ?struct { dir: []const u8, file: []const u8 } 
     return switch (cfg.arch) {
         .amd64 => .{ .dir = "amd64", .file = "amd64" },
         .arm64 => .{ .dir = "arm64", .file = "arm64" },
-        .riscv64 => .{ .dir = "riscv", .file = "rv64_lp64d" },
+        // riscv folds musl into the ABI token: stage3-rv64_lp64d_musl-*.
+        .riscv64 => .{ .dir = "riscv", .file = if (cfg.stage3.libc == .musl) "rv64_lp64d_musl" else "rv64_lp64d" },
         .detect => null,
     };
 }
@@ -728,7 +736,16 @@ fn makeConf(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) ![]co
         };
         if (on) try w.print(" {s}", .{flag}) else try w.print(" -{s}", .{flag});
     }
+    // Secure boot + out-of-tree modules: linux-mod-r1 signs at merge
+    // time when modules-sign is on and the sbctl db key is wired up.
+    const sign_mods = cfg.security.secure_boot == .sbctl and switch (resolveGpuDriver(cfg, env)) {
+        .@"nvidia-open", .@"nvidia-drivers" => true,
+        else => false,
+    };
+    if (sign_mods) try w.writeAll(" modules-sign");
     try w.writeAll("\"\n");
+    if (sign_mods)
+        try w.writeAll("MODULES_SIGN_KEY=\"/var/lib/sbctl/keys/db/db.key\"\nMODULES_SIGN_CERT=\"/var/lib/sbctl/keys/db/db.pem\"\nMODULES_SIGN_HASH=\"sha512\"\n");
     return aw.written();
 }
 
@@ -751,14 +768,28 @@ fn packageUse(alloc: Allocator, cfg: *const Config) ![]const u8 {
         };
         try w.print("{s} {s}\n", .{ atom, flags });
     }
-    // engine-managed entries (bootloader/kernel wiring)
+    // engine-managed entries (bootloader/kernel wiring). The initramfs
+    // generator USE must accompany every pick — kernels with
+    // USE=initramfs depend on installkernel[dracut|ugrd], which is only
+    // on by default in systemd profiles (openrc/musl leave it off and
+    // emerge aborts on the USE-change request).
+    // The unselected generator is explicitly disabled too — profiles
+    // default one of them on, and initramfs=none must suppress the
+    // kernel's initramfs USE entirely or emerge hits a USE-change abort.
+    const gen_flag: []const u8 = switch (cfg.system.initramfs) {
+        .dracut => " dracut -ugrd",
+        .ugrd => " ugrd -dracut",
+        .none => " -dracut -ugrd",
+    };
     switch (config.resolveBootloader(cfg)) {
-        .limine => try w.writeAll("sys-kernel/installkernel -systemd-boot -refind dracut\n"),
-        .grub => try w.writeAll("sys-kernel/installkernel grub\n"),
-        .@"systemd-boot" => try w.writeAll("sys-kernel/installkernel systemd-boot\n"),
-        .efistub => try w.writeAll("sys-kernel/installkernel -systemd-boot\n"),
-        else => {},
+        .limine => try w.print("sys-kernel/installkernel -systemd-boot -refind{s}\n", .{gen_flag}),
+        .grub => try w.print("sys-kernel/installkernel grub{s}\n", .{gen_flag}),
+        .@"systemd-boot" => try w.print("sys-kernel/installkernel systemd-boot{s}\n", .{gen_flag}),
+        .efistub => try w.print("sys-kernel/installkernel -systemd-boot{s}\n", .{gen_flag}),
+        else => if (gen_flag.len > 0) try w.print("sys-kernel/installkernel{s}\n", .{gen_flag}),
     }
+    if (cfg.system.initramfs == .none)
+        try w.writeAll("sys-kernel/gentoo-kernel-bin -initramfs\nsys-kernel/gentoo-kernel -initramfs\n");
     if (cfg.system.uki) try w.writeAll("sys-kernel/installkernel uki\n");
     // LUKS unlock in a systemd initramfs runs through systemd-cryptsetup,
     // which Gentoo only builds under USE=cryptsetup — stage3s ship without
@@ -872,14 +903,22 @@ fn planWorldUpdate(alloc: Allocator, cfg: *const Config) !Step {
 fn planBaseConfig(alloc: Allocator, cfg: *const Config) !Step {
     var c: std.ArrayList(Cmd) = .empty;
     try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/timezone", cfg.system.timezone));
-    // locale.gen
-    var gen: std.Io.Writer.Allocating = .init(alloc);
-    const gw = &gen.writer;
-    for (cfg.system.locales) |l|
-        try gw.print("{s} UTF-8\n", .{l});
-    try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/locale.gen", gen.written()));
-    try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{"locale-gen"}), .chroot = true, .desc = "generate locales" } });
-    try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "eselect", "locale", "set", cfg.system.locale }), .chroot = true, .desc = "default locale" } });
+    if (cfg.stage3.libc == .musl) {
+        // musl has no locale-gen/SUPPORTED database — C.UTF-8 is builtin
+        // and extra locales come from musl-locales via MUSL_LOCPATH. Set
+        // the default through env.d directly (what eselect would write).
+        try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/env.d/02locale",
+            s(alloc, "LANG=\"{s}\"\nMUSL_LOCPATH=\"/usr/share/i18n/locales\"\n", .{cfg.system.locale})));
+        try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "--oneshot", "sys-apps/musl-locales" }), .chroot = true, .desc = "musl locale data" } });
+    } else {
+        var gen: std.Io.Writer.Allocating = .init(alloc);
+        const gw = &gen.writer;
+        for (cfg.system.locales) |l|
+            try gw.print("{s} UTF-8\n", .{l});
+        try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/locale.gen", gen.written()));
+        try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{"locale-gen"}), .chroot = true, .desc = "generate locales" } });
+        try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "eselect", "locale", "set", cfg.system.locale }), .chroot = true, .desc = "default locale" } });
+    }
     // localectl needs a running systemd — write the config files directly.
     if (cfg.system.init == .systemd)
         try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/vconsole.conf", s(alloc, "KEYMAP={s}\n", .{cfg.system.keymap})))
@@ -987,6 +1026,25 @@ fn planKernel(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !St
     }
     // GPU driver packages — resolve `auto` the same way make.conf's
     // VIDEO_CARDS / ACCEPT_LICENSE do (Turing+ → nvidia-open).
+    const nvidia_prop = switch (resolveGpuDriver(cfg, env)) {
+        .@"nvidia-open", .@"nvidia-drivers" => true,
+        else => false,
+    };
+    // Secure boot: out-of-tree modules are signed at emerge time by
+    // linux-mod-r1 (USE=modules-sign + MODULES_SIGN_* in make.conf), so
+    // the sbctl key pair must exist before nvidia-drivers builds.
+    if (cfg.security.secure_boot == .sbctl and nvidia_prop) {
+        try c.append(alloc, .{ .exec = .{
+            .argv = try alloc.dupe([]const u8, &.{ "emerge", "app-crypt/sbctl" }),
+            .chroot = true,
+            .desc = "sbctl (secure boot key mgmt)",
+        } });
+        try c.append(alloc, .{ .exec = .{
+            .argv = try alloc.dupe([]const u8, &.{ "sbctl", "create-keys" }),
+            .chroot = true,
+            .desc = "generate secure boot keys (before module builds)",
+        } });
+    }
     switch (resolveGpuDriver(cfg, env)) {
         .@"nvidia-open" => try c.append(alloc, .{ .exec = .{
             .argv = try alloc.dupe([]const u8, &.{ "emerge", "x11-drivers/nvidia-drivers[kernel-open]" }),
@@ -1008,6 +1066,9 @@ fn planKernel(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !St
 /// else falls back to nouveau (in-kernel; nothing to emerge).
 pub fn resolveGpuDriver(cfg: *const Config, env: ?*const detect.Env) config.GpuDriver {
     if (cfg.gpu.driver != .auto) return cfg.gpu.driver;
+    // proprietary NVIDIA is glibc + amd64/arm64 only — auto must not
+    // pick it on musl or riscv64 targets.
+    if (cfg.stage3.libc == .musl or cfg.arch == .riscv64) return .nouveau;
     if (env) |e| if (hasTuringNvidia(e)) return .@"nvidia-open";
     return .nouveau;
 }
@@ -1065,7 +1126,7 @@ fn planFstab(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
                 try w.print("{s}\t/.snapshots\tbtrfs\tsubvol=@snapshots,compress=zstd:1,noatime\t0 2\n", .{root_ident});
         }
         if (cfg.disk.swap == .zram)
-            try w.writeAll("# zram swap configured via /etc/systemd/zram-generator.conf or OpenRC zram service\n");
+            try w.writeAll("# zram swap configured via zram-generator.conf (systemd) or /etc/init.d/zram (openrc)\n");
         try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/fstab", aw.written()));
         return step(alloc, "fstab", "Generate fstab", c);
     }
@@ -1083,7 +1144,7 @@ fn planFstab(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
         try w.print("{s}\t/.snapshots\tbtrfs\tsubvol=@snapshots,compress=zstd:1,noatime\t0 2\n", .{root_ident});
     }
     if (cfg.disk.swap == .zram)
-        try w.writeAll("# zram swap configured via /etc/systemd/zram-generator.conf or OpenRC zram service\n");
+        try w.writeAll("# zram swap configured via zram-generator.conf (systemd) or /etc/init.d/zram (openrc)\n");
     try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/fstab", aw.written()));
     // crypttab is written in planPortage — the kernel emerge's
     // installkernel hook bakes it into the initramfs; writing it in this
@@ -1159,17 +1220,60 @@ fn planSystemConfig(alloc: Allocator, cfg: *const Config) !Step {
 
     // zram swap: install the backend the config file needs.
     if (cfg.disk.swap == .zram) {
+        try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/sysctl.d/60-zram.conf", "vm.swappiness = 180\n"));
         switch (cfg.system.init) {
             .systemd => {
                 try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-apps/zram-generator" }), .chroot = true, .desc = "zram-generator" } });
                 try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/systemd/zram-generator.conf", "[zram0]\nzram-size = min(ram / 2, 8192)\ncompression-algorithm = zstd\n"));
             },
             .openrc => {
-                try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-apps/zram-init" }), .chroot = true, .desc = "zram-init" } });
-                // zram-init sizes use its `lram` expression var (RAM in MiB),
-                // not the zram-generator `ram` spelling.
-                try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/conf.d/zram-init", "num_devices=1\ntype0=swap\nsize0=min(lram / 2, 8192)\ncompr0=zstd\n"));
-                try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "rc-update", "add", "zram-init", "boot" }), .chroot = true, .desc = "enable zram-init" } });
+                // ::gentoo ships no openrc zram service (zram-init was
+                // tree-cleaned; zram-generator is systemd-only), so the plan
+                // installs a small runscript driving util-linux zramctl.
+                try c.append(alloc, .{ .write_file = .{
+                    .path = "/mnt/gentoo/etc/init.d/zram",
+                    .mode = 0o755,
+                    .content =
+                    \\#!/sbin/openrc-run
+                    \\description="zram compressed swap device"
+                    \\
+                    \\depend() {
+                    \\    after localmount
+                    \\    before swap
+                    \\}
+                    \\
+                    \\start() {
+                    \\    ebegin "Creating zram swap"
+                    \\    modprobe zram 2>/dev/null || true
+                    \\    mem_kb=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)
+                    \\    size=$((mem_kb * 512))
+                    \\    cap=$((8 * 1024 * 1024 * 1024))
+                    \\    if [ "$size" -gt "$cap" ]; then size=$cap; fi
+                    \\    dev=$(zramctl --find --size "$size" --algorithm zstd)
+                    \\    [ -n "$dev" ] || { eend 1; return 1; }
+                    \\    echo "$dev" > /run/zram-swap.dev || { zramctl --reset "$dev" 2>/dev/null; eend 1; return 1; }
+                    \\    if mkswap "$dev" >/dev/null 2>&1 && swapon -p 100 "$dev"; then
+                    \\        eend 0
+                    \\    else
+                    \\        zramctl --reset "$dev" 2>/dev/null
+                    \\        rm -f /run/zram-swap.dev
+                    \\        eend 1
+                    \\    fi
+                    \\}
+                    \\
+                    \\stop() {
+                    \\    ebegin "Removing zram swap"
+                    \\    dev=$(cat /run/zram-swap.dev 2>/dev/null)
+                    \\    if [ -n "$dev" ]; then
+                    \\        swapoff "$dev" 2>/dev/null
+                    \\        zramctl --reset "$dev" 2>/dev/null
+                    \\        rm -f /run/zram-swap.dev
+                    \\    fi
+                    \\    eend 0
+                    \\}
+                    \\
+                } });
+                try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "rc-update", "add", "zram", "boot" }), .chroot = true, .desc = "enable zram" } });
             },
             else => try c.append(alloc, .{ .note = "zram on this init lands with its backend in M6" }),
         }
@@ -1307,9 +1411,13 @@ fn planPackages(alloc: Allocator, cfg: *const Config, sets: Sets) !Step {
     return step(alloc, "packages", "Install packages", c);
 }
 
-fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
+fn planBootloader(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, seed: u128) !Step {
     var c: std.ArrayList(Cmd) = .empty;
     const bl = config.resolveBootloader(cfg);
+    const nvidia_prop_sbctl = cfg.security.secure_boot == .sbctl and switch (resolveGpuDriver(cfg, env)) {
+        .@"nvidia-open", .@"nvidia-drivers" => true,
+        else => false,
+    };
     switch (bl) {
         .limine => {
             const limine_atoms: []const []const u8 =
@@ -1356,7 +1464,7 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
             // (a separate ext4 partition when disk.boot_part, else the
             // root fs — validation restricts bare-root BIOS to ext4).
             const stage_dir = if (cfg.boot_mode == .uefi) espInTarget(cfg) else "/boot";
-            try c.append(alloc, wf(alloc, s(alloc, "/mnt/gentoo{s}/limine.conf", .{stage_dir}), limineConf(alloc, cfg, seed)));
+            try c.append(alloc, wf(alloc, s(alloc, "/mnt/gentoo{s}/limine.conf", .{stage_dir}), limineConf(alloc, cfg, env, seed)));
             // kernel-install hook: stage kernel+initramfs at the fixed
             // paths limine.conf references. installkernel invokes this on
             // every kernel add/remove — upgrades stay seamless.
@@ -1389,6 +1497,14 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
             var grub_args: std.ArrayList([]const u8) = .empty;
             try grub_args.appendSlice(alloc, &.{ "emerge", "sys-boot/grub" });
             try c.append(alloc, .{ .exec = .{ .argv = grub_args.items, .chroot = true, .desc = "grub" } });
+            // grub-mkconfig composes root= itself; extra args go through
+            // GRUB_CMDLINE_LINUX_DEFAULT — proprietary NVIDIA needs KMS.
+            const nvidia_prop = switch (resolveGpuDriver(cfg, env)) {
+                .@"nvidia-open", .@"nvidia-drivers" => true,
+                else => false,
+            };
+            if (nvidia_prop)
+                try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/default/grub", "# generated by gentoo-installer\nGRUB_CMDLINE_LINUX_DEFAULT=\"nvidia-drm.modeset=1\"\n"));
             const target = if (cfg.boot_mode == .uefi) grubEfiTarget(cfg) else "i386-pc";
             if (cfg.boot_mode == .uefi)
                 try c.append(alloc, .{ .exec = .{
@@ -1424,7 +1540,7 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
                 .desc = "stage kernel + initramfs on the ESP",
             } });
             try c.append(alloc, wf(alloc, s(alloc, "/mnt/gentoo{s}/loader/loader.conf", .{espInTarget(cfg)}), "default gentoo.conf\ntimeout 4\n"));
-            try c.append(alloc, wf(alloc, s(alloc, "/mnt/gentoo{s}/loader/entries/gentoo.conf", .{espInTarget(cfg)}), s(alloc, "title   Gentoo Linux\nlinux   /vmlinuz\n{s}options {s}\n", .{ if (cfg.system.initramfs == .none) "" else "initrd  /initramfs.img\n", kernelArgs(alloc, cfg, seed) })));
+            try c.append(alloc, wf(alloc, s(alloc, "/mnt/gentoo{s}/loader/entries/gentoo.conf", .{espInTarget(cfg)}), s(alloc, "title   Gentoo Linux\nlinux   /vmlinuz\n{s}options {s}\n", .{ if (cfg.system.initramfs == .none) "" else "initrd  /initramfs.img\n", kernelArgs(alloc, cfg, env, seed) })));
             // kernel-install hook keeps the entry current on upgrades.
             try c.append(alloc, .{ .write_file = .{
                 .path = "/mnt/gentoo/etc/kernel/install.d/91-sd-boot.install",
@@ -1462,7 +1578,7 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
                     "d=$(lsblk -no PKNAME \"$esp\"); p=$(lsblk -no PARTN \"$esp\"); " ++
                     "[ -n \"$d\" ] && [ -n \"$p\" ] || exit 1; " ++
                     "efibootmgr -c -d /dev/$d -p $p -L Gentoo -l '\\vmlinuz' " ++
-                    "-u '{s}{s}'", .{ espInTarget(cfg), kernelArgs(alloc, cfg, seed), if (cfg.system.initramfs == .none) "" else " initrd=\\initramfs.img" }) }),
+                    "-u '{s}{s}'", .{ espInTarget(cfg), kernelArgs(alloc, cfg, env, seed), if (cfg.system.initramfs == .none) "" else " initrd=\\initramfs.img" }) }),
                 .chroot = true,
                 .desc = "efibootmgr: create Gentoo NVRAM entry",
             } });
@@ -1489,16 +1605,20 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
     // Secure boot: sign every boot binary with the locally-generated key.
     switch (cfg.security.secure_boot) {
         .sbctl => {
-            try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "emerge", "app-crypt/sbctl" }),
-                .chroot = true,
-                .desc = "sbctl (secure boot key mgmt)",
-            } });
-            try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "sbctl", "create-keys" }),
-                .chroot = true,
-                .desc = "generate secure boot keys",
-            } });
+            if (!nvidia_prop_sbctl) {
+                // nvidia+sbctl already emerged sbctl and created keys
+                // back at the firmware-kernel step.
+                try c.append(alloc, .{ .exec = .{
+                    .argv = try alloc.dupe([]const u8, &.{ "emerge", "app-crypt/sbctl" }),
+                    .chroot = true,
+                    .desc = "sbctl (secure boot key mgmt)",
+                } });
+                try c.append(alloc, .{ .exec = .{
+                    .argv = try alloc.dupe([]const u8, &.{ "sbctl", "create-keys" }),
+                    .chroot = true,
+                    .desc = "generate secure boot keys",
+                } });
+            }
             try c.append(alloc, .{ .exec = .{
                 .argv = try alloc.dupe([]const u8, &.{ "sbctl", "enroll-keys" }),
                 .chroot = true,
@@ -1523,22 +1643,49 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
     return step(alloc, "bootloader", "Install bootloader", c);
 }
 
-/// stem → eselect profile path: `default/linux/{arch}/23.0/` + stem
-/// segments joined with `/` (nomultilib → no-multilib).
+/// stem → eselect profile path under `default/linux/{arch}/23.0/`.
+/// The openrc base profile carries no init suffix — only systemd is a
+/// segment. amd64/arm64 paths mirror the stage3 word order with
+/// `-selinux` and `nomultilib` mapped to real directory names
+/// (hardened/selinux, no-multilib); riscv64 is fixed rv64/lp64d with
+/// musl nested under it. A pinned `stage3.variant` is split the same
+/// way so e.g. "desktop-systemd" still resolves to a real profile.
 fn profilePath(alloc: Allocator, cfg: *const Config) !?[]const u8 {
-    const stem = try config.stage3Stem(alloc, cfg);
     const toks = archTokens(cfg) orelse return null;
     var out: std.ArrayList([]const u8) = .empty;
-    var it = std.mem.splitScalar(u8, stem, '-');
-    while (it.next()) |seg| {
-        if (std.mem.eql(u8, seg, "nomultilib")) {
-            try out.append(alloc, "no-multilib");
-        } else if (std.mem.eql(u8, seg, "usr") and out.items.len > 0 and std.mem.eql(u8, out.items[out.items.len - 1], "split")) {
-            out.items[out.items.len - 1] = "split-usr";
+    if (cfg.arch == .riscv64) {
+        // A pinned stage3.variant is authoritative — the profile must
+        // follow its tokens (rv64_lp64d_musl-systemd etc.), matching
+        // how the amd64/arm64 branches treat it; otherwise derive from
+        // the libc/init axes.
+        try out.appendSlice(alloc, &.{ "rv64", "lp64d" });
+        if (std.mem.eql(u8, cfg.stage3.variant, "auto")) {
+            if (cfg.stage3.libc == .musl) try out.append(alloc, "musl");
+            if (cfg.system.init == .systemd) try out.append(alloc, "systemd");
         } else {
-            try out.append(alloc, seg);
+            var rit = std.mem.tokenizeAny(u8, cfg.stage3.variant, "-_");
+            while (rit.next()) |seg| {
+                if (std.mem.eql(u8, seg, "musl") or std.mem.eql(u8, seg, "systemd"))
+                    try out.append(alloc, seg);
+            }
+        }
+    } else {
+        const stem = try config.stage3Stem(alloc, cfg);
+        var it = std.mem.splitScalar(u8, stem, '-');
+        while (it.next()) |seg| {
+            if (std.mem.eql(u8, seg, "openrc")) {
+                // openrc is the base profile — no suffix segment
+            } else if (std.mem.eql(u8, seg, "nomultilib")) {
+                try out.append(alloc, "no-multilib");
+            } else if (std.mem.eql(u8, seg, "usr") and out.items.len > 0 and std.mem.eql(u8, out.items[out.items.len - 1], "split")) {
+                out.items[out.items.len - 1] = "split-usr";
+            } else {
+                try out.append(alloc, seg);
+            }
         }
     }
+    if (out.items.len == 0)
+        return s(alloc, "default/linux/{s}/23.0", .{toks.dir});
     const joined = try std.mem.join(alloc, "/", out.items);
     return s(alloc, "default/linux/{s}/23.0/{s}", .{ toks.dir, joined });
 }
@@ -1563,12 +1710,12 @@ fn grubEfiTarget(cfg: *const Config) []const u8 {
     };
 }
 
-fn limineConf(alloc: Allocator, cfg: *const Config, seed: u128) []const u8 {
+fn limineConf(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, seed: u128) []const u8 {
     var aw: std.Io.Writer.Allocating = .init(alloc);
     const w = &aw.writer;
     w.writeAll("# generated by gentoo-installer\n") catch {};
     w.writeAll("timeout: 5\n\n") catch {};
-    const root_args = kernelArgs(alloc, cfg, seed);
+    const root_args = kernelArgs(alloc, cfg, env, seed);
     // boot() resolves on the volume holding limine.conf: ESP root under
     // UEFI or a dedicated /boot partition; the root fs otherwise, where
     // staged files live under /boot/. Modern limine path grammar is
@@ -1750,4 +1897,201 @@ test "persistent ids: fstab + kernel args use PARTUUID, exec paths use /dev" {
     try std.testing.expect(saw_swap); // fstab swap line uses swap PARTUUID
     try std.testing.expect(saw_rootarg); // a written file carries root=PARTUUID
     try std.testing.expect(!saw_dev_root); // no /dev/vdb persisted
+}
+
+fn profileFor(alloc: std.mem.Allocator, src: []const u8) !?[]const u8 {
+    var doc = try @import("toml.zig").parse(alloc, src, null);
+    defer doc.deinit();
+    var cfg = try config.decode(doc.arena.allocator(), doc);
+    return profilePath(alloc, &cfg);
+}
+
+// Every expected path must exist in ::gentoo profiles.desc — these were
+// verified against the live tree (openrc is the base profile: no suffix).
+test "profilePath matrix matches profiles.desc" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { src: []const u8, want: []const u8 }{
+        .{ .src = \\arch = "amd64"
+                 \\[security]
+                 \\hardening = "standard"
+                 \\selinux = false
+                 , .want = "default/linux/amd64/23.0/systemd" },
+        .{ .src = \\arch = "amd64"
+                 \\[system]
+                 \\init = "openrc"
+                 , .want = "default/linux/amd64/23.0/hardened/selinux" },
+        .{ .src = \\arch = "amd64"
+                 \\[system]
+                 \\init = "openrc"
+                 \\[security]
+                 \\hardening = "standard"
+                 \\selinux = false
+                 , .want = "default/linux/amd64/23.0" },
+        .{ .src = \\arch = "amd64"
+                 \\[stage3]
+                 \\nomultilib = true
+                 \\[security]
+                 \\hardening = "standard"
+                 \\selinux = false
+                 , .want = "default/linux/amd64/23.0/no-multilib/systemd" },
+        .{ .src = \\arch = "amd64"
+                 \\[stage3]
+                 \\libc = "musl"
+                 \\toolchain = "llvm"
+                 \\[system]
+                 \\init = "openrc"
+                 \\[security]
+                 \\hardening = "standard"
+                 \\selinux = false
+                 , .want = "default/linux/amd64/23.0/musl/llvm" },
+        .{ .src = \\arch = "amd64"
+                 \\[stage3]
+                 \\libc = "musl"
+                 \\[security]
+                 \\hardening = "hardened"
+                 \\selinux = false
+                 , .want = "default/linux/amd64/23.0/musl/hardened/systemd" },
+        .{ .src = \\arch = "arm64"
+                 \\[stage3]
+                 \\libc = "musl"
+                 \\[system]
+                 \\init = "openrc"
+                 \\[security]
+                 \\hardening = "standard"
+                 \\selinux = false
+                 , .want = "default/linux/arm64/23.0/musl" },
+        .{ .src = \\arch = "riscv64"
+                 \\[security]
+                 \\hardening = "standard"
+                 \\selinux = false
+                 , .want = "default/linux/riscv/23.0/rv64/lp64d/systemd" },
+        .{ .src = \\arch = "riscv64"
+                 \\[stage3]
+                 \\libc = "musl"
+                 \\[system]
+                 \\init = "openrc"
+                 \\[security]
+                 \\hardening = "standard"
+                 \\selinux = false
+                 , .want = "default/linux/riscv/23.0/rv64/lp64d/musl" },
+    };
+    for (cases) |tc| {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const got = try profileFor(arena.allocator(), tc.src);
+        try std.testing.expectEqualStrings(tc.want, got.?);
+    }
+}
+
+test "proprietary nvidia: modeset arg, signed modules, sbctl before emerge" {
+    var doc = try @import("toml.zig").parse(std.testing.allocator,
+        \\arch = "amd64"
+        \\boot_mode = "uefi"
+        \\[disk]
+        \\device = "/dev/vda"
+        \\[gpu]
+        \\driver = "nvidia-drivers"
+        \\[security]
+        \\hardening = "standard"
+        \\selinux = false
+        \\secure_boot = "sbctl"
+        \\[[users]]
+        \\name = "u"
+        \\password_hash = "$6$x$y"
+    , null);
+    defer doc.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const cfg = try config.decode(alloc, doc);
+    const plan = try build(alloc, &cfg, null, .{}, null);
+
+    var saw_modeset = false;
+    var saw_sign_key = false;
+    var create_keys_idx: ?usize = null;
+    var nvidia_emerge_idx: ?usize = null;
+    var bootloader_create_keys = false;
+    for (plan.steps) |st| {
+        for (st.cmds, 0..) |cmd, i| {
+            switch (cmd) {
+                .write_file => |w| {
+                    if (std.mem.indexOf(u8, w.content, "nvidia-drm.modeset=1") != null)
+                        saw_modeset = true;
+                    if (std.mem.endsWith(u8, w.path, "make.conf") and
+                        std.mem.indexOf(u8, w.content, "MODULES_SIGN_KEY") != null and
+                        std.mem.indexOf(u8, w.content, "modules-sign") != null)
+                        saw_sign_key = true;
+                },
+                .exec => |e| {
+                    const joins_create = e.argv.len >= 2 and std.mem.eql(u8, e.argv[0], "sbctl") and std.mem.eql(u8, e.argv[1], "create-keys");
+                    if (std.mem.eql(u8, st.id, "firmware-kernel")) {
+                        if (joins_create) create_keys_idx = i;
+                        if (e.argv.len == 2 and std.mem.eql(u8, e.argv[0], "emerge") and
+                            std.mem.indexOf(u8, e.argv[1], "nvidia-drivers") != null)
+                            nvidia_emerge_idx = i;
+                    }
+                    if (std.mem.eql(u8, st.id, "bootloader") and joins_create)
+                        bootloader_create_keys = true;
+                },
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(saw_modeset); // limine.conf/loader entry carries it
+    try std.testing.expect(saw_sign_key); // linux-mod-r1 signs at merge time
+    try std.testing.expect(create_keys_idx != null and nvidia_emerge_idx != null);
+    try std.testing.expect(create_keys_idx.? < nvidia_emerge_idx.?);
+    try std.testing.expect(!bootloader_create_keys); // no duplicate key gen
+}
+
+test "installkernel package.use always carries the initramfs generator" {
+    const toml_mod = @import("toml.zig");
+    // openrc/musl profiles default installkernel to -dracut — kernels with
+    // USE=initramfs then fail dep resolution. Every bootloader pick must
+    // emit the generator flag (dracut for the default initramfs).
+    const cases = [_]struct { src: []const u8, want: []const u8 }{
+        .{ .src = \\arch = "amd64"
+                 \\[disk]
+                 \\device = "/dev/vda"
+                 \\[stage3]
+                 \\libc = "musl"
+                 \\[system]
+                 \\init = "openrc"
+                 \\bootloader = "efistub"
+                 \\[security]
+                 \\hardening = "standard"
+                 \\selinux = false
+                 , .want = "sys-kernel/installkernel -systemd-boot dracut -ugrd\n" },
+        .{ .src = \\arch = "amd64"
+                 \\[disk]
+                 \\device = "/dev/vda"
+                 \\[system]
+                 \\init = "openrc"
+                 \\bootloader = "grub"
+                 \\initramfs = "ugrd"
+                 \\[security]
+                 \\hardening = "standard"
+                 \\selinux = false
+                 , .want = "sys-kernel/installkernel grub ugrd -dracut\n" },
+        .{ .src = \\arch = "amd64"
+                 \\[disk]
+                 \\device = "/dev/vda"
+                 \\[system]
+                 \\bootloader = "limine"
+                 \\initramfs = "none"
+                 \\[security]
+                 \\hardening = "standard"
+                 \\selinux = false
+                 , .want = "sys-kernel/installkernel -systemd-boot -refind -dracut -ugrd\n" },
+    };
+    for (cases) |tc| {
+        var doc = try toml_mod.parse(std.testing.allocator, tc.src, null);
+        defer doc.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const cfg = try config.decode(alloc, doc);
+        const use = try packageUse(alloc, &cfg);
+        try std.testing.expect(std.mem.indexOf(u8, use, tc.want) != null);
+    }
 }

@@ -198,8 +198,9 @@ const variant_fields = [_]Field{
     } },
     .{ .name = "stage3.libc", .ftype = .@"enum", .label = "C library", .options = &.{
         .{ .v = "glibc", .label = "glibc" },
-        .{ .v = "musl", .label = "musl", .help = "leaner; removes systemd" },
+        .{ .v = "musl", .label = "musl", .help = "leaner; musl+systemd stage3s exist but are experimental" },
     } },
+    .{ .name = "stage3.nomultilib", .ftype = .bool, .label = "No multilib (amd64)", .help = "plain glibc+gcc only — no 32-bit compat libs" },
     .{ .name = "stage3.toolchain", .ftype = .@"enum", .label = "Toolchain", .options = &.{
         .{ .v = "gcc", .label = "gcc" },
         .{ .v = "llvm", .label = "llvm/clang" },
@@ -1143,6 +1144,8 @@ pub const Wizard = struct {
         try fieldStr(out, "libc", @tagName(w.cfg.stage3.libc));
         try out.writeAll(",");
         try fieldStr(out, "toolchain", @tagName(w.cfg.stage3.toolchain));
+        try out.writeAll(",\"nomultilib\":");
+        try out.writeAll(if (w.cfg.stage3.nomultilib) "true" else "false");
         try out.writeAll(",");
         try fieldStr(out, "variant", w.cfg.stage3.variant);
         try out.writeAll(",");
@@ -1327,7 +1330,7 @@ pub const Wizard = struct {
             try tomlStr(o, p.mount);
             try o.writeAll("\n");
         }
-        try o.print("[stage3]\nlibc = \"{s}\"\ntoolchain = \"{s}\"\nvariant = ", .{ @tagName(w.cfg.stage3.libc), @tagName(w.cfg.stage3.toolchain) });
+        try o.print("[stage3]\nlibc = \"{s}\"\ntoolchain = \"{s}\"\nnomultilib = {}\nvariant = ", .{ @tagName(w.cfg.stage3.libc), @tagName(w.cfg.stage3.toolchain), w.cfg.stage3.nomultilib });
         try tomlStr(o, w.cfg.stage3.variant);
         try o.writeAll("\nmirror = ");
         try tomlStr(o, w.cfg.stage3.mirror);
@@ -1738,8 +1741,8 @@ fn setEnum(cfg: *Config, ef: EField, s: []const u8) WizardError!void {
     // keep derived flags consistent
     if (ef.tag == .scheme) cfg.disk.scheme_explicit = true;
     if (ef.tag == .init) {
-        // musl ⇒ no systemd; systemd-networkd follows init
-        if (cfg.system.init == .systemd and cfg.stage3.libc == .musl) cfg.stage3.libc = .glibc;
+        // musl-systemd stage3s exist (experimental upstream) — no libc
+        // coercion. systemd-networkd does still require systemd.
         // leaving systemd while networkd is selected leaves an invalid
         // pair — move the manager to the default rather than stranding
         // the user on a validation error from another page.
@@ -1747,8 +1750,10 @@ fn setEnum(cfg: *Config, ef: EField, s: []const u8) WizardError!void {
             cfg.network.manager = .networkmanager;
     }
     if (ef.tag == .libc) {
-        if (cfg.stage3.libc == .musl and cfg.system.init == .systemd) cfg.system.init = .openrc;
         if (cfg.stage3.libc == .musl and cfg.network.manager == .@"systemd-networkd") cfg.network.manager = .networkmanager;
+        // proprietary NVIDIA is glibc-only — musl falls back to nouveau
+        if (cfg.stage3.libc == .musl and (cfg.gpu.driver == .@"nvidia-open" or cfg.gpu.driver == .@"nvidia-drivers"))
+            cfg.gpu.driver = .nouveau;
     }
     // selinux+ hardening is one decision (the policy/toolchain ships in
     // the hardened-selinux stage3) — keep the bool in lock-step so the
@@ -1786,6 +1791,7 @@ const cfg_bool = struct {
             .{ "services.logger", &cfg.services.logger },
             .{ "services.cron", &cfg.services.cron },
             .{ "services.ntp", &cfg.services.ntp },
+            .{ "stage3.nomultilib", &cfg.stage3.nomultilib },
         };
         inline for (map) |m| {
             if (std.mem.eql(u8, name, m[0])) {
@@ -1795,7 +1801,7 @@ const cfg_bool = struct {
         }
     }
 };
-const bool_fields = [_][]const u8{ "disk.wipe", "disk.boot_part", "disk.luks", "disk.lvm", "disk.home_part", "system.uki", "system.binhost", "network.wifi", "services.sshd", "services.logger", "services.cron", "services.ntp", "security.selinux" };
+const bool_fields = [_][]const u8{ "disk.wipe", "disk.boot_part", "disk.luks", "disk.lvm", "disk.home_part", "system.uki", "system.binhost", "network.wifi", "services.sshd", "services.logger", "services.cron", "services.ntp", "security.selinux", "stage3.nomultilib" };
 
 const cfg_int = struct {
     fn set(cfg: *Config, name: []const u8, n: u32) void {
@@ -2056,6 +2062,7 @@ fn boolVal(cfg: *Config, name: []const u8) ?bool {
         .{ "disk.home_part", cfg.disk.home_part },
         .{ "system.uki", cfg.system.uki },
         .{ "system.binhost", cfg.system.binhost },
+        .{ "stage3.nomultilib", cfg.stage3.nomultilib },
         .{ "network.wifi", cfg.network.wifi },
         .{ "services.sshd", cfg.services.sshd },
         .{ "services.logger", cfg.services.logger },
@@ -2232,9 +2239,13 @@ test "set enum coercion keeps derived state consistent" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var w = testWizard();
+    // proprietary NVIDIA is glibc-only — musl drops back to nouveau
+    try w.setField("gpu.driver", .{ .string = "nvidia-drivers" });
     try w.setField("stage3.libc", .{ .string = "musl" });
-    // musl can't host systemd → init falls back to openrc
-    try testing.expect(w.cfg.system.init == .openrc);
+    try testing.expect(w.cfg.gpu.driver == .nouveau);
+    // musl+systemd stage3s exist — init is not coerced (still the
+    // systemd default the wizard started with)
+    try testing.expect(w.cfg.system.init == .systemd);
 }
 
 test "users table set masks password as hash" {

@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """M5 scenario harness — drive variant installs end-to-end under QEMU.
 
-Usage: scenario.py <luks|bios> [phase-a|phase-b]   (default: both phases)
+Usage: scenario.py <luks|bios|musl> [phase-a|phase-b]   (default: both phases)
 
   luks — UEFI install with disk.luks=true; phase B expects the dracut
          passphrase prompt on serial, enters it, reaches login.
   bios — SeaBIOS install (no OVMF); exercises the BIOS partition layout
          and `limine bios-install`; phase B boots the disk via SeaBIOS.
+  musl — UEFI install on stage3-musl-hardened-openrc; verifies the
+         alternate-libc variant path end to end (musl world from
+         source, openrc init).
 """
-import os, secrets, subprocess, sys
+import os, secrets, shutil, subprocess, sys
 import pexpect
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ISO = os.path.join(HERE, "install-amd64-minimal.iso")
 OVMF = "/usr/share/OVMF/OVMF_CODE.fd"
+OVMF_VARS = "/usr/share/OVMF/OVMF_VARS.fd"
 WWW = os.environ.get("GI_WWW", os.path.expanduser("~/m3/www"))
 # Credentials live only in the throwaway qcow2 — generated per run so
 # the repo carries no reusable test passwords. GI_* env vars pin them
@@ -28,7 +32,18 @@ def iso_label():
         ["blkid", "-o", "value", "-s", "LABEL", ISO]).decode().strip()
 
 def qemu(scn, disk):
-    fw = [] if scn == "bios" else ["-bios", OVMF]
+    if scn == "bios":
+        fw = []
+    else:
+        # Split pflash so efibootmgr NVRAM writes persist across the
+        # phase-A→B reboot — bare `-bios OVMF_CODE.fd` silently discards
+        # them and efistub/refind installs then boot straight to the
+        # UEFI shell.
+        vars_fd = "%s/%s-vars.fd" % (HERE, scn)
+        if not os.path.exists(vars_fd):
+            shutil.copyfile(OVMF_VARS, vars_fd)
+        fw = ["-drive", "if=pflash,format=raw,unit=0,readonly=on,file=%s" % OVMF,
+              "-drive", "if=pflash,format=raw,unit=1,file=%s" % vars_fd]
     return (["qemu-system-x86_64",
              "-machine", "q35,accel=kvm", "-cpu", "host",
              "-smp", "4", "-m", "12288"] + fw +
@@ -78,6 +93,10 @@ def phase_a(scn, disk):
         print("== INSTALL FAILED — forensics")
         sh(c, "tail -40 /tmp/gi.err; echo ZZ-GOT-$?", pat=DONE, timeout=30)
         sh(c, "tail -25 /tmp/gi.out; echo ZZ-GOT-$?", pat=DONE, timeout=30)
+        # journal records every cmd argv+status — the 'fail' line names
+        # the culprit even when the command itself printed nothing.
+        sh(c, "grep -n 'fail\\|\"firmware-kernel\"' /tmp/gentoo-installer.journal | tail -12; "
+              "echo ZZ-GOT-$?", pat=DONE, timeout=30)
         c.sendline(b"poweroff"); c.expect(pexpect.EOF, timeout=120)
         sys.exit(2)
     print("== install OK")
@@ -88,6 +107,14 @@ def phase_a(scn, disk):
           "[ -f \"$f\" ] || continue; grep -q ttyS0 \"$f\" || "
           "sed -i 's|^\\s*cmdline:|    cmdline: console=ttyS0,115200|' \"$f\"; done; "
           "grep -rn cmdline /mnt/gentoo/efi/limine.conf /mnt/gentoo/boot/limine.conf 2>/dev/null", timeout=60)
+    # openrc stage3s ship the serial getty commented out — enable a
+    # 115200 ttyS0 agetty so phase B sees a login prompt (harmless on
+    # systemd, which has no inittab to match).
+    sh(c, "[ -f /mnt/gentoo/etc/inittab ] && { "
+          "sed -i 's|^#\\?s0:.*|s0:12345:respawn:/sbin/agetty -L 115200 ttyS0 linux|' /mnt/gentoo/etc/inittab; "
+          "grep -q '^s0:' /mnt/gentoo/etc/inittab || "
+          "echo 's0:12345:respawn:/sbin/agetty -L 115200 ttyS0 linux' >> /mnt/gentoo/etc/inittab; }; "
+          "echo ZZ-GOT-$?", pat=DONE, timeout=30)
     c.sendline(b"poweroff"); c.expect(pexpect.EOF, timeout=120)
     log.close()
     print("== phase A done")
@@ -123,6 +150,11 @@ if __name__ == "__main__":
     disk = os.path.join(HERE, "target-%s.qcow2" % scn)
     try:
         if which in ("both", "phase-a"):
+            # fresh NVRAM alongside the fresh disk — a reused vars.fd
+            # would carry the previous run's BootOrder/entries.
+            vars_fd = "%s/%s-vars.fd" % (HERE, scn)
+            if os.path.exists(vars_fd):
+                os.remove(vars_fd)
             subprocess.run(["qemu-img", "create", "-f", "qcow2", disk, "24G"], check=True)
             phase_a(scn, disk)
         if which in ("both", "phase-b"):

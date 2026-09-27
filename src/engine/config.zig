@@ -87,6 +87,9 @@ pub const Config = struct {
     stage3: struct {
         libc: Libc = .glibc,
         toolchain: Toolchain = .gcc,
+        /// amd64-only stem token; musl is already single-ABI so this is
+        /// a no-op there, and non-amd64 arches ship one ABI only.
+        nomultilib: bool = false,
         variant: []const u8 = "auto",
         mirror: []const u8 = "https://distfiles.gentoo.org",
     } = .{},
@@ -286,6 +289,7 @@ pub fn decode(alloc: Allocator, doc: toml.Document) DecodeError!Config {
         const t = try tableOf(v, "stage3");
         if (field(t, "libc")) |x| cfg.stage3.libc = try enumOr(Libc, x, "stage3.libc");
         if (field(t, "toolchain")) |x| cfg.stage3.toolchain = try enumOr(Toolchain, x, "stage3.toolchain");
+        if (field(t, "nomultilib")) |x| cfg.stage3.nomultilib = try boolOr(x, "stage3.nomultilib");
         if (field(t, "variant")) |x| cfg.stage3.variant = try strOr(x, "stage3.variant");
         if (field(t, "mirror")) |x| cfg.stage3.mirror = try strOr(x, "stage3.mirror");
     }
@@ -419,12 +423,18 @@ pub fn resolveBootloader(cfg: *const Config) Bootloader {
     return .limine;
 }
 
-/// Resolve the stage3 stem from the axes (libc × toolchain × hardening ×
-/// init) unless `stage3.variant` pins one explicitly.
+/// Resolve the stage3 stem (the pointer-file suffix after the arch
+/// token) from the axes unless `stage3.variant` pins one explicitly.
+/// Gentoo names differ per arch: on amd64/arm64 variants are dash
+/// segments in the filename — stage3-amd64-musl-llvm-systemd-* — but on
+/// riscv musl is part of the ABI token (stage3-rv64_lp64d_musl-*) so
+/// the stem carries init only; archTokens() handles that side.
 pub fn stage3Stem(alloc: Allocator, cfg: *const Config) ![]const u8 {
     if (!std.mem.eql(u8, cfg.stage3.variant, "auto")) return cfg.stage3.variant;
-    // Stem word order matches Gentoo's published names:
-    // stage3-<arch>[-musl][-hardened[-selinux]][-llvm]-<init>
+    if (cfg.arch == .riscv64)
+        return stage3Init(cfg);
+    // amd64/arm64 word order matches the published names:
+    // <arch>[-musl][-hardened[-selinux]][-llvm][-nomultilib]-<init>
     var parts: std.ArrayList([]const u8) = .empty;
     if (cfg.stage3.libc == .musl) try parts.append(alloc, "musl");
     switch (cfg.security.hardening) {
@@ -433,11 +443,19 @@ pub fn stage3Stem(alloc: Allocator, cfg: *const Config) ![]const u8 {
         .@"hardened-selinux" => try parts.append(alloc, "hardened-selinux"),
     }
     if (cfg.stage3.toolchain == .llvm) try parts.append(alloc, "llvm");
-    try parts.append(alloc, switch (cfg.system.init) {
-        .systemd => "systemd",
-        else => "openrc", // non-systemd stage3s ship openrc; alt inits swap later
-    });
+    if (cfg.stage3.nomultilib and cfg.arch == .amd64 and cfg.stage3.libc == .glibc)
+        try parts.append(alloc, "nomultilib");
+    try parts.append(alloc, stage3Init(cfg));
     return std.mem.join(alloc, "-", parts.items);
+}
+
+/// Alt inits have no stage3 of their own — the openrc tarball is the
+/// base and the init is swapped into the target later.
+fn stage3Init(cfg: *const Config) []const u8 {
+    return switch (cfg.system.init) {
+        .systemd => "systemd",
+        else => "openrc",
+    };
 }
 
 /// VALIDATE: returns a list of violations (empty = valid). `env` may be
@@ -500,6 +518,8 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
         try errs.append(alloc, "stage3.mirror contains characters outside URL charset");
     if (!urlSafe(cfg.makeconf.mirrors))
         try errs.append(alloc, "makeconf.mirrors contains characters outside URL charset");
+    if (!std.mem.eql(u8, cfg.stage3.variant, "auto") and !stage3StemOk(cfg.stage3.variant))
+        try errs.append(alloc, "stage3.variant is not a stage3 stem (lowercase [a-z0-9-] segments, e.g. hardened-selinux-systemd)");
     // Erase-disk schemes always format — wipe=false preserves nothing.
     if (!cfg.disk.wipe and cfg.disk.scheme != .alongside and cfg.disk.scheme != .manual)
         try errs.append(alloc, "disk.wipe=false has no effect on erase schemes — use alongside to preserve data");
@@ -753,8 +773,43 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
     if ((cfg.disk.luks or cfg.disk.lvm) and cfg.system.initramfs == .none)
         try errs.append(alloc, "luks/lvm root requires an initramfs (dracut|ugrd)");
 
-    if (cfg.stage3.libc == .musl and cfg.system.init == .systemd)
-        try errs.append(alloc, "systemd requires glibc — musl supports openrc/runit/s6/dinit");
+    // Stage3 availability matrix — every axes combination must name a
+    // tarball Gentoo actually autobuilds (releases/<arch>/autobuilds).
+    // amd64: glibc{,hardened,hardened-selinux,llvm,nomultilib} ×
+    // {openrc,systemd} plus musl{,-hardened,-llvm}; arm64 drops
+    // hardened/selinux/nomultilib; riscv64 ships rv64_lp64d[_musl]
+    // only. musl+systemd stage3s exist on all three arches.
+    // `stage3.variant` pins an explicit stem past this matrix.
+    {
+        const musl = cfg.stage3.libc == .musl;
+        const llvm = cfg.stage3.toolchain == .llvm;
+        const h = cfg.security.hardening;
+        if (llvm and h != .standard)
+            try errs.append(alloc, "no hardened-llvm stage3 — hardened toolchains ship gcc only");
+        if (musl and h == .@"hardened-selinux")
+            try errs.append(alloc, "no musl-selinux stage3 — musl-hardened is the ceiling");
+        if (musl and llvm and h == .hardened)
+            try errs.append(alloc, "no musl-hardened-llvm stage3 — musl variants are hardened or llvm, not both");
+        switch (cfg.arch) {
+            .amd64 => {
+                if (cfg.stage3.nomultilib and (llvm or h != .standard))
+                    try errs.append(alloc, "nomultilib stage3s exist only for the plain glibc+gcc toolchain — hardened+nomultilib is reachable via profile + world rebuild, not stage3");
+            },
+            .arm64 => {
+                if (!musl and h != .standard)
+                    try errs.append(alloc, "no arm64 glibc hardened stage3 — hardened on arm64 is musl-only");
+            },
+            .riscv64 => {
+                if (h != .standard)
+                    try errs.append(alloc, "no riscv64 hardened/selinux stage3");
+                if (llvm)
+                    try errs.append(alloc, "no riscv64 llvm stage3");
+            },
+            .detect => {}, // resolved post-detection; matrix re-checked then
+        }
+        // nomultilib is a no-op wherever the ABI is already single
+        // (musl, arm64, riscv64) — only amd64 glibc emits the token.
+    }
 
     if (cfg.security.secure_boot == .shim and resolveBootloader(cfg) != .grub)
         try errs.append(alloc, "secure_boot=shim is only supported with grub");
@@ -762,8 +817,6 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
     if (cfg.system.privilege == .none and cfg.root.lock_root)
         try errs.append(alloc, "privilege=none with lock_root leaves no admin path");
 
-    if (cfg.stage3.toolchain == .llvm and cfg.security.hardening == .@"hardened-selinux" and cfg.stage3.libc == .glibc)
-        try errs.append(alloc, "glibc+llvm+hardened-selinux has no stage3 stem; use hardened-llvm or gcc");
 
     // Login-path proof: some credential must survive to the finished
     // system, or sshd must be reachable with keys.
@@ -787,6 +840,16 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
     if (cfg.root.lock_root and cfg.system.privilege != .none and !wheel_login)
         try errs.append(alloc, "root.lock_root leaves no admin path: give a wheel member a password or SSH key (doas/sudo grant wheel only)");
 
+    if (cfg.boot_mode == .bios and (cfg.arch == .arm64 or cfg.arch == .riscv64))
+        try errs.append(alloc, "boot_mode=bios exists on amd64 only — arm64/riscv64 are UEFI");
+
+    const nvidia_prop = cfg.gpu.driver == .@"nvidia-open" or cfg.gpu.driver == .@"nvidia-drivers";
+    if (nvidia_prop) {
+        if (cfg.stage3.libc == .musl)
+            try errs.append(alloc, "proprietary NVIDIA drivers are glibc-only — musl gets nouveau");
+        if (cfg.arch == .riscv64)
+            try errs.append(alloc, "proprietary NVIDIA drivers are keyworded amd64/arm64 only");
+    }
     if (cfg.gpu.driver == .@"nvidia-open") {
         if (nvidia) |t| switch (t) {
             .absent => try errs.append(alloc, "gpu.driver=nvidia-open but no NVIDIA GPU detected"),
@@ -874,6 +937,21 @@ fn urlSafe(v: []const u8) bool {
         }
     }
     return true;
+}
+
+/// Stage3 stems are dash-joined lowercase words — the value lands in a
+/// pointer-file URL path, so anything with separators or traversal is
+/// refused rather than sanitized.
+fn stage3StemOk(v: []const u8) bool {
+    if (v.len == 0 or v.len > 96) return false;
+    if (v[0] == '-' or v[v.len - 1] == '-') return false;
+    for (v) |ch| {
+        switch (ch) {
+            'a'...'z', '0'...'9', '-', '_' => {},
+            else => return false,
+        }
+    }
+    return std.mem.indexOf(u8, v, "--") == null;
 }
 
 // ---- scheme=manual partition-spec helpers ----
@@ -1129,11 +1207,213 @@ test "stage3 stem resolution" {
     var doc = try toml.parse(std.testing.allocator,
         \\[stage3]
         \\libc = "musl"
+        \\[security]
+        \\hardening = "standard"
+        \\selinux = false
         \\[system]
         \\init = "dinit"
     , null);
     defer doc.deinit();
     const cfg = try decode(doc.arena.allocator(), doc);
     const stem = try stage3Stem(doc.arena.allocator(), &cfg);
-    try std.testing.expectEqualStrings("musl-hardened-selinux-openrc", stem);
+    try std.testing.expectEqualStrings("musl-openrc", stem);
+}
+
+// Stem word order and per-arch coverage must match Gentoo's real
+// autobuild names (see releases/<arch>/autobuilds/latest-stage3-*).
+test "stage3 stem matrix matches autobuilds" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { src: []const u8, stem: []const u8 }{
+        .{ .src = \\arch = "amd64"
+                 \\[security]
+                 \\hardening = "standard"
+                 \\selinux = false
+                 , .stem = "systemd" },
+        .{ .src = \\arch = "amd64"
+                 \\[system]
+                 \\init = "openrc"
+                 , .stem = "hardened-selinux-openrc" },
+        .{ .src = \\arch = "amd64"
+                 \\[system]
+                 \\init = "openrc"
+                 \\[security]
+                 \\hardening = "hardened"
+                 \\selinux = false
+                 , .stem = "hardened-openrc" },
+        .{ .src = \\arch = "amd64"
+                 \\[stage3]
+                 \\toolchain = "llvm"
+                 \\[security]
+                 \\hardening = "standard"
+                 \\selinux = false
+                 , .stem = "llvm-systemd" },
+        .{ .src = \\arch = "amd64"
+                 \\[stage3]
+                 \\nomultilib = true
+                 \\[system]
+                 \\init = "openrc"
+                 \\[security]
+                 \\hardening = "standard"
+                 \\selinux = false
+                 , .stem = "nomultilib-openrc" },
+        .{ .src = \\arch = "amd64"
+                 \\[stage3]
+                 \\libc = "musl"
+                 \\[security]
+                 \\hardening = "hardened"
+                 \\selinux = false
+                 , .stem = "musl-hardened-systemd" },
+        .{ .src = \\arch = "arm64"
+                 \\[stage3]
+                 \\libc = "musl"
+                 \\toolchain = "llvm"
+                 \\[security]
+                 \\hardening = "standard"
+                 \\selinux = false
+                 \\[system]
+                 \\init = "openrc"
+                 , .stem = "musl-llvm-openrc" },
+        // riscv carries musl in the ABI token — stem is init only
+        .{ .src = \\arch = "riscv64"
+                 \\[stage3]
+                 \\libc = "musl"
+                 \\[security]
+                 \\hardening = "standard"
+                 \\selinux = false
+                 , .stem = "systemd" },
+        // nomultilib is a no-op where the ABI is already single
+        .{ .src = \\arch = "arm64"
+                 \\[stage3]
+                 \\nomultilib = true
+                 \\[security]
+                 \\hardening = "standard"
+                 \\selinux = false
+                 \\[system]
+                 \\init = "openrc"
+                 , .stem = "openrc" },
+    };
+    for (cases) |tc| {
+        var doc = try toml.parse(alloc, tc.src, null);
+        defer doc.deinit();
+        const cfg = try decode(doc.arena.allocator(), doc);
+        const stem = try stage3Stem(doc.arena.allocator(), &cfg);
+        try std.testing.expectEqualStrings(tc.stem, stem);
+    }
+}
+
+// Build a minimal-but-valid config with the given stage3 axes for
+// matrix tests (disk + login path are fillers). The caller owns doc —
+// errs and cfg borrow from its arena.
+fn validCfg(alloc: Allocator, src: []const u8) !struct { doc: toml.Document, cfg: Config, errs: [][]const u8 } {
+    var doc = try toml.parse(alloc, src, null);
+    errdefer doc.deinit();
+    const cfg = try decode(doc.arena.allocator(), doc);
+    const errs = try validate(doc.arena.allocator(), &cfg, null);
+    return .{ .doc = doc, .cfg = cfg, .errs = errs };
+}
+
+const matrix_base =
+    \\arch = "{s}"
+    \\[disk]
+    \\device = "/dev/sda"
+    \\[stage3]
+    \\{s}
+    \\[system]
+    \\init = "{s}"
+    \\[security]
+    \\hardening = "{s}"
+    \\selinux = {}
+    \\[[users]]
+    \\name = "a"
+    \\password_hash = "$6$x$y"
+;
+
+test "validate stage3 variant matrix" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { arch: []const u8, s3: []const u8, init: []const u8, h: []const u8, se: bool, ok: bool }{
+        .{ .arch = "amd64", .s3 = "", .init = "systemd", .h = "hardened-selinux", .se = true, .ok = true },
+        .{ .arch = "amd64", .s3 = "libc = \"musl\"", .init = "systemd", .h = "standard", .se = false, .ok = true },
+        .{ .arch = "amd64", .s3 = "libc = \"musl\"\ntoolchain = \"llvm\"", .init = "openrc", .h = "standard", .se = false, .ok = true },
+        .{ .arch = "amd64", .s3 = "libc = \"musl\"", .init = "openrc", .h = "hardened", .se = false, .ok = true },
+        .{ .arch = "amd64", .s3 = "nomultilib = true", .init = "openrc", .h = "standard", .se = false, .ok = true },
+        .{ .arch = "amd64", .s3 = "libc = \"musl\"", .init = "openrc", .h = "hardened-selinux", .se = true, .ok = false }, // no musl-selinux
+        .{ .arch = "amd64", .s3 = "toolchain = \"llvm\"", .init = "systemd", .h = "hardened", .se = false, .ok = false }, // no glibc hardened-llvm
+        .{ .arch = "amd64", .s3 = "libc = \"musl\"\ntoolchain = \"llvm\"", .init = "openrc", .h = "hardened", .se = false, .ok = false }, // no musl-hardened-llvm
+        .{ .arch = "amd64", .s3 = "nomultilib = true", .init = "openrc", .h = "hardened", .se = false, .ok = false }, // no hardened-nomultilib
+        .{ .arch = "arm64", .s3 = "", .init = "systemd", .h = "standard", .se = false, .ok = true },
+        .{ .arch = "arm64", .s3 = "libc = \"musl\"", .init = "openrc", .h = "hardened", .se = false, .ok = true }, // musl-hardened exists on arm64
+        .{ .arch = "arm64", .s3 = "", .init = "systemd", .h = "hardened", .se = false, .ok = false }, // no arm64 glibc hardened
+        .{ .arch = "arm64", .s3 = "", .init = "systemd", .h = "hardened-selinux", .se = true, .ok = false }, // no arm64 selinux
+        .{ .arch = "riscv64", .s3 = "", .init = "systemd", .h = "standard", .se = false, .ok = true },
+        .{ .arch = "riscv64", .s3 = "libc = \"musl\"", .init = "openrc", .h = "standard", .se = false, .ok = true },
+        .{ .arch = "riscv64", .s3 = "", .init = "openrc", .h = "hardened", .se = false, .ok = false },
+        .{ .arch = "riscv64", .s3 = "toolchain = \"llvm\"", .init = "systemd", .h = "standard", .se = false, .ok = false },
+    };
+    for (cases) |tc| {
+        const src = try std.fmt.allocPrint(alloc, matrix_base, .{ tc.arch, tc.s3, tc.init, tc.h, tc.se });
+        defer alloc.free(src);
+        var r = try validCfg(alloc, src);
+        defer r.doc.deinit();
+        var stage3_err = false;
+        for (r.errs) |e| {
+            if (std.mem.indexOf(u8, e, "stage3") != null) stage3_err = true;
+        }
+        if (tc.ok) {
+            if (stage3_err) std.debug.print("unexpected stage3 err: {s}\n", .{r.errs[0]});
+            try std.testing.expect(!stage3_err);
+        } else {
+            if (!stage3_err) std.debug.print("expected stage3 err for {s}/{s}\n", .{ tc.arch, tc.s3 });
+            try std.testing.expect(stage3_err);
+        }
+    }
+}
+
+test "validate rejects proprietary nvidia on musl/riscv64" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { arch: []const u8, libc: []const u8, ok: bool }{
+        .{ .arch = "amd64", .libc = "glibc", .ok = true },
+        .{ .arch = "amd64", .libc = "musl", .ok = false },
+        .{ .arch = "riscv64", .libc = "glibc", .ok = false },
+        .{ .arch = "arm64", .libc = "glibc", .ok = true },
+    };
+    for (cases) |tc| {
+        const src = try std.fmt.allocPrint(alloc,
+            \\arch = "{s}"
+            \\[disk]
+            \\device = "/dev/sda"
+            \\[stage3]
+            \\libc = "{s}"
+            \\[gpu]
+            \\driver = "nvidia-drivers"
+            \\[security]
+            \\hardening = "standard"
+            \\selinux = false
+            \\[[users]]
+            \\name = "a"
+            \\password_hash = "$6$x$y"
+        , .{ tc.arch, tc.libc });
+        defer alloc.free(src);
+        var r = try validCfg(alloc, src);
+        defer r.doc.deinit();
+        var nv_err = false;
+        for (r.errs) |e| {
+            if (std.mem.indexOf(u8, e, "NVIDIA") != null) nv_err = true;
+        }
+        try std.testing.expect(nv_err != tc.ok);
+    }
+}
+
+test "validate rejects bad stage3.variant charset" {
+    var doc = try toml.parse(std.testing.allocator,
+        \\[stage3]
+        \\variant = "../evil"
+    , null);
+    defer doc.deinit();
+    const cfg = try decode(doc.arena.allocator(), doc);
+    const errs = try validate(doc.arena.allocator(), &cfg, null);
+    var seen = false;
+    for (errs) |e| {
+        if (std.mem.indexOf(u8, e, "variant") != null) seen = true;
+    }
+    try std.testing.expect(seen);
 }

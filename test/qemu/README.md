@@ -34,6 +34,8 @@ python3 test/qemu/verify.py    # phase B: boot disk, expect login, log in
 ```sh
 python3 test/qemu/scenario.py luks   # UEFI + disk.luks — phase B types the passphrase at the initramfs prompt
 python3 test/qemu/scenario.py bios   # SeaBIOS boot — exercises the BIOS layout + `limine bios-install`
+python3 test/qemu/scenario.py musl   # stage3-musl-hardened-openrc + efistub (limine-from-source would
+                                     # pull an llvm+clang build on musl — no binpkgs there)
 ```
 
 Each takes `ops-<scenario>.jsonl` next to this script and logs to

@@ -11,3 +11,5 @@ test/qemu/*.qcow2
 test/qemu/boot/
 test/qemu/*.log
 test/qemu/ops-*.jsonl.local
+test/qemu/*-run*.out
+test/qemu/*-vars.fd
