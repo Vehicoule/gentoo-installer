@@ -123,6 +123,7 @@ struct Step {
 enum Phase {
     Boot,    // waiting for hello/env
     Wizard,  // page events
+    Pending, // install op sent, awaiting first step/error — no buttons
     Running, // step events during install
     Done(bool),
     Failed, // install error mid-run — distinct from a clean dry run
@@ -142,6 +143,8 @@ struct Installer {
     plan: Option<String>,
     errors: Vec<String>,
     log: Vec<String>,
+    req_seq: u64,                       // monotonic request ids for set correlation
+    pending_sets: HashMap<u64, String>, // req -> field; rejected sets restore engine truth
 }
 
 impl Installer {
@@ -164,6 +167,14 @@ impl Installer {
                 )
             })
             .unwrap_or_else(|| ("string".into(), false))
+    }
+
+    /// Send a `set` op with a correlation `req`, remembering which field
+    /// it carries so a rejected edit can restore the engine's real value.
+    fn send_set(&mut self, field: &str, value: Value) {
+        self.req_seq += 1;
+        self.pending_sets.insert(self.req_seq, field.to_string());
+        send_op(json!({"op": "set", "req": self.req_seq, "field": field, "value": value}));
     }
 
     /// Send any buffered secret inputs (secrets aren't streamed per
@@ -208,12 +219,14 @@ impl Installer {
             return false;
         }
         // every confirm passed — only now send the secrets, so a blocked
-        // navigation never stores partial credentials engine-side
+        // navigation never stores partial credentials engine-side; drop
+        // our plaintext copies once the engine has them (they can't be
+        // displayed again anyway — the engine only echoes is_set=true)
         for name in fields {
-            let Some(val) = self.inputs.get(&name) else {
-                continue;
-            };
-            send_op(json!({"op": "set", "field": name, "value": val}));
+            if let Some(val) = self.inputs.remove(&name) {
+                self.confirm_inputs.remove(&name);
+                self.send_set(&name, Value::String(val));
+            }
         }
         true
     }
@@ -264,6 +277,8 @@ impl cosmic::app::Application for Installer {
             plan: None,
             errors: Vec::new(),
             log: vec![format!("spawn {}", engine_binary())],
+            req_seq: 0,
+            pending_sets: HashMap::new(),
         };
         (app, Task::none())
     }
@@ -302,7 +317,13 @@ impl cosmic::app::Application for Installer {
                 }
                 Some("page") => {
                     self.phase = Phase::Wizard;
-                    self.errors.clear();
+                    // clear leftover errors on real navigation only — a
+                    // same-page resync (after a rejected `set`) must keep
+                    // the error it was triggered to display
+                    let changed = self.page.as_ref().and_then(|p| p.get("page")) != v.get("page");
+                    if changed {
+                        self.errors.clear();
+                    }
                     // disk.device isn't on the review page — remember the
                     // engine-side value so Install can confirm it later.
                     if let Some(dev) = v
@@ -313,9 +334,6 @@ impl cosmic::app::Application for Installer {
                         .find(|f| f.get("name").and_then(Value::as_str) == Some("disk.device"))
                         .and_then(|f| f.get("value").and_then(Value::as_str))
                     {
-                        if self.disk_device != dev {
-                            self.install_confirm.clear();
-                        }
                         if self.disk_device != dev {
                             self.install_confirm.clear();
                         }
@@ -350,6 +368,19 @@ impl cosmic::app::Application for Installer {
                         // keep an in-progress user edit over the re-emitted value
                         self.inputs.entry(n).or_insert(s);
                     }
+                    // the page echo is authoritative for rendered fields —
+                    // drop optimistic enum picks so engine-coerced values
+                    // (e.g. libc=musl forcing init=openrc) can't show stale
+                    for f in v
+                        .get("fields")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        if let Some(n) = f.get("name").and_then(Value::as_str) {
+                            self.selected.remove(n);
+                        }
+                    }
                     self.page = Some(v);
                 }
                 Some("validate") => {
@@ -368,6 +399,12 @@ impl cosmic::app::Application for Installer {
                         .unwrap_or_default();
                     if v.get("ok").and_then(Value::as_bool) == Some(true) {
                         self.errors.clear();
+                    }
+                    // an install the engine's validation refuses arrives as
+                    // `validate`+errors, not `error` — leave Pending or the
+                    // UI would sit on 'Starting install…' forever
+                    if matches!(self.phase, Phase::Pending) && !self.errors.is_empty() {
+                        self.phase = Phase::Wizard;
                     }
                 }
                 // {"ev":"plan","cmds":[...]} — one generated command per entry
@@ -405,6 +442,16 @@ impl cosmic::app::Application for Installer {
                     );
                 }
                 Some("error") => {
+                    // a rejected `set` leaves the old engine value — drop the
+                    // unsent buffer and re-fetch the page so the field shows
+                    // what the engine actually has, not the refused edit
+                    if let Some(req) = v.get("req").and_then(Value::as_u64)
+                        && let Some(field) = self.pending_sets.remove(&req)
+                    {
+                        self.inputs.remove(&field);
+                        self.confirm_inputs.remove(&field);
+                        send_op(json!({"op": "page"}));
+                    }
                     self.errors.push(
                         v.get("error")
                             .and_then(Value::as_str)
@@ -413,11 +460,17 @@ impl cosmic::app::Application for Installer {
                     );
                     // doInstall reports failure via `error` and returns
                     // without a `done` — don't leave the UI on Installing…
-                    if matches!(self.phase, Phase::Running) {
+                    if matches!(self.phase, Phase::Pending | Phase::Running) {
                         self.phase = Phase::Failed;
                     }
                 }
-                Some("result") | Some("bye") => {}
+                Some("result") => {
+                    // accepted set — clear the correlation entry
+                    if let Some(req) = v.get("req").and_then(Value::as_u64) {
+                        self.pending_sets.remove(&req);
+                    }
+                }
+                Some("bye") => {}
                 _ => {}
             },
             Message::ConfirmInput(name, val) => {
@@ -437,16 +490,20 @@ impl cosmic::app::Application for Installer {
                     // buffered — flush_secrets sends it on the next action
                 } else {
                     let tv = self.typed_value(&name, &val);
-                    send_op(json!({"op": "set", "field": name, "value": tv}));
-                    // a successful answer-file load makes the engine jump
-                    // pages — re-fetch so the GUI shows what it's really on
+                    self.send_set(&name, tv);
+                    // a successful answer-file load replaces the whole engine
+                    // config and jumps to Review — every local buffer is now
+                    // stale, so clear before the re-fetch re-seeds
                     if name == "answer_file" {
+                        self.inputs.clear();
+                        self.confirm_inputs.clear();
+                        self.selected.clear();
                         send_op(json!({"op": "page"}));
                     }
                 }
             }
             Message::Toggle(name, val) => {
-                send_op(json!({"op": "set", "field": name, "value": val}));
+                self.send_set(&name, json!(val));
                 // `set` doesn't re-emit the page, but a toggle can change
                 // conditional fields (e.g. luks reveals its passphrase)
                 send_op(json!({"op": "page"}));
@@ -457,7 +514,7 @@ impl cosmic::app::Application for Installer {
                     self.disk_device = val.clone();
                     self.install_confirm.clear();
                 }
-                send_op(json!({"op": "set", "field": name, "value": val}));
+                self.send_set(&name, Value::String(val));
                 send_op(json!({"op": "page"}));
             }
             Message::Op("export_answer") => {
@@ -488,6 +545,10 @@ impl cosmic::app::Application for Installer {
                     return Task::none();
                 }
                 self.steps.clear();
+                // leave the wizard synchronously — the engine queues ops, so
+                // a second click before the first `step` would run the whole
+                // wipe again
+                self.phase = Phase::Pending;
                 send_op(json!({"op": "install", "dry_run": false, "confirm": confirm}));
             }
             Message::DryRun => {
@@ -497,6 +558,7 @@ impl cosmic::app::Application for Installer {
                     return Task::none();
                 }
                 self.steps.clear();
+                self.phase = Phase::Pending;
                 send_op(json!({"op": "install", "dry_run": true}));
             }
         }
@@ -516,8 +578,9 @@ impl cosmic::app::Application for Installer {
             Phase::Dead => {
                 col = col.push(widget::text::title2("Engine exited"));
             }
-            Phase::Running | Phase::Done(_) | Phase::Failed => {
+            Phase::Pending | Phase::Running | Phase::Done(_) | Phase::Failed => {
                 col = col.push(widget::text::title2(match self.phase {
+                    Phase::Pending => "Starting install…",
                     Phase::Running => "Installing…",
                     Phase::Done(true) => "Install complete — safe to reboot",
                     Phase::Done(false) => "Dry run complete",
