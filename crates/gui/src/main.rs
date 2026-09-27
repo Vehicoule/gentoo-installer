@@ -112,6 +112,8 @@ enum Message {
     Install,
     DryRun,
     Plan,
+    /// Enter pressed in a text field — used to commit answer_file loads.
+    Submit(String),
 }
 
 struct Step {
@@ -145,6 +147,7 @@ struct Installer {
     log: Vec<String>,
     req_seq: u64,                       // monotonic request ids for set correlation
     pending_sets: HashMap<u64, String>, // req -> field; rejected sets restore engine truth
+    last_answer_req: Option<u64>,       // newest outstanding answer_file set
 }
 
 impl Installer {
@@ -174,7 +177,19 @@ impl Installer {
     fn send_set(&mut self, field: &str, value: Value) {
         self.req_seq += 1;
         self.pending_sets.insert(self.req_seq, field.to_string());
+        if field == "answer_file" {
+            self.last_answer_req = Some(self.req_seq);
+        }
         send_op(json!({"op": "set", "req": self.req_seq, "field": field, "value": value}));
+    }
+
+    /// Send a buffered non-secret field once (answer_file): a load
+    /// replaces the whole engine config, so it only goes out on an
+    /// explicit commit — Enter in the field, or a destructive action.
+    fn flush_field(&mut self, name: &str) {
+        if let Some(val) = self.inputs.get(name).cloned() {
+            self.send_set(name, Value::String(val));
+        }
     }
 
     /// Send any buffered secret inputs (secrets aren't streamed per
@@ -279,6 +294,7 @@ impl cosmic::app::Application for Installer {
             log: vec![format!("spawn {}", engine_binary())],
             req_seq: 0,
             pending_sets: HashMap::new(),
+            last_answer_req: None,
         };
         (app, Task::none())
     }
@@ -450,7 +466,15 @@ impl cosmic::app::Application for Installer {
                     {
                         // answer_file rejects on every incomplete path while
                         // typing — keep the text so the user can finish it
-                        if field != "answer_file" {
+                        if field == "answer_file" {
+                            // keep the path editable; if this was the latest
+                            // attempt, resync so the page reflects the
+                            // config the engine actually ended with
+                            if Some(req) == self.last_answer_req {
+                                self.last_answer_req = None;
+                                send_op(json!({"op": "page"}));
+                            }
+                        } else {
                             self.inputs.remove(&field);
                             self.confirm_inputs.remove(&field);
                             send_op(json!({"op": "page"}));
@@ -474,9 +498,12 @@ impl cosmic::app::Application for Installer {
                         && let Some(field) = self.pending_sets.remove(&req)
                     {
                         // a confirmed answer-file load replaces the whole
-                        // engine config and jumps to Review — stale local
-                        // buffers are dropped now that the file parsed
-                        if field == "answer_file" {
+                        // engine config and jumps to Review — finalize only
+                        // when this reply is for the *latest* submitted path;
+                        // a stale success while a newer attempt is pending
+                        // must not navigate on an outdated load
+                        if field == "answer_file" && Some(req) == self.last_answer_req {
+                            self.last_answer_req = None;
                             self.inputs.clear();
                             self.confirm_inputs.clear();
                             self.selected.clear();
@@ -500,15 +527,18 @@ impl cosmic::app::Application for Installer {
                     self.disk_device = val.clone();
                     self.install_confirm.clear();
                 }
-                if ftype == "secret" {
-                    // buffered — flush_secrets sends it on the next action
+                if ftype == "secret" || name == "answer_file" {
+                    // buffered — secrets flush on the next action; the
+                    // answer-file path flushes on Enter (Submit) so a
+                    // half-typed path never loads an unintended file
                 } else {
                     let tv = self.typed_value(&name, &val);
                     self.send_set(&name, tv);
-                    // answer_file stays in inputs while typing — buffers
-                    // clear only on the correlated `result` (a failed load
-                    // keeps the path editable); see the result handler
                 }
+            }
+            Message::Submit(name) => {
+                // Enter in answer_file commits the buffered path
+                self.flush_field(&name);
             }
             Message::Toggle(name, val) => {
                 self.send_set(&name, json!(val));
@@ -552,6 +582,7 @@ impl cosmic::app::Application for Installer {
                         .push(format!("type '{confirm}' to confirm the install"));
                     return Task::none();
                 }
+                self.flush_field("answer_file");
                 self.steps.clear();
                 // leave the wizard synchronously — the engine queues ops, so
                 // a second click before the first `step` would run the whole
@@ -565,6 +596,7 @@ impl cosmic::app::Application for Installer {
                 if !self.flush_secrets() {
                     return Task::none();
                 }
+                self.flush_field("answer_file");
                 self.steps.clear();
                 self.phase = Phase::Pending;
                 send_op(json!({"op": "install", "dry_run": true}));
@@ -804,12 +836,20 @@ fn field_widget<'a>(
                 .map(String::as_str)
                 .or_else(|| value.as_str())
                 .unwrap_or("");
-            widget::text_input(label, cur)
-                .on_input({
+            let ti = widget::text_input(label, cur).on_input({
+                let n = name.to_string();
+                move |v| Message::Input(n.clone(), v)
+            });
+            let ti = if name == "answer_file" {
+                // Enter commits the buffered path to the engine
+                ti.on_submit({
                     let n = name.to_string();
-                    move |v| Message::Input(n.clone(), v)
+                    move |_| Message::Submit(n.clone())
                 })
-                .into()
+            } else {
+                ti
+            };
+            ti.into()
         }
     };
     col.push(control).into()
