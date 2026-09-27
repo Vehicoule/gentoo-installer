@@ -64,8 +64,23 @@ fn loadScript(alloc: Allocator, dir: std.Io.Dir, io: std.Io, where: []const u8, 
         while (it.next()) |seg|
             if (std.mem.eql(u8, seg, "..")) return presetErr("{s}: script path '{s}' escapes the preset dir", .{ where, rel });
     }
-    const st = dir.statFile(io, rel, .{}) catch
+    // No symlink component may leave the preset dir: stat each segment
+    // without following, so a shipped link to an outside file refuses.
+    var rest = rel;
+    while (std.mem.indexOfScalar(u8, rest, '/')) |slash| {
+        const comp = rest[0..slash];
+        const cst = dir.statFile(io, comp, .{ .follow_symlinks = false }) catch
+            return presetErr("{s}: script '{s}' not found", .{ where, rel });
+        if (cst.kind == .sym_link)
+            return presetErr("{s}: script path '{s}' contains a symlink", .{ where, rel });
+        rest = rest[slash + 1 ..];
+    }
+    const st = dir.statFile(io, rel, .{ .follow_symlinks = false }) catch
         return presetErr("{s}: script '{s}' not found", .{ where, rel });
+    if (st.kind == .sym_link)
+        return presetErr("{s}: script '{s}' is a symlink", .{ where, rel });
+    if (st.kind != .file)
+        return presetErr("{s}: script '{s}' is not a regular file", .{ where, rel });
     if (st.permissions.toMode() & 0o111 == 0)
         return presetErr("{s}: script '{s}' is not executable", .{ where, rel });
     return dir.readFileAlloc(io, rel, alloc, .limited(4 << 20)) catch
@@ -246,13 +261,14 @@ fn findRepo(preset: *const Preset, name: []const u8) Repo {
     return .{ .name = name };
 }
 
-/// A URI headed for a repos.conf line: https://, no whitespace or
-/// control chars (a newline would inject extra Portage directives).
+/// A URI headed for a repos.conf line: https://, ASCII printable only —
+/// no whitespace, controls, or high bytes (a newline would inject extra
+/// Portage directives; raw UTF-8 must arrive percent-encoded anyway).
 fn uriOk(u: []const u8) bool {
     if (!std.mem.startsWith(u8, u, "https://")) return false;
     if (u.len <= "https://".len) return false;
     for (u) |ch|
-        if (ch <= ' ' or ch == 0x7f) return false;
+        if (ch <= ' ' or ch >= 0x7f) return false;
     return true;
 }
 
