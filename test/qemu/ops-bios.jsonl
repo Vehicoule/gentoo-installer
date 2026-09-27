@@ -1,0 +1,9 @@
+{"op":"detect","req":0}
+{"op":"set","field":"boot_mode","value":"bios","req":1}
+{"op":"set","field":"disk.device","value":"/dev/vda","req":2}
+{"op":"set","field":"root.password","value":"TestRoot#2026","req":3}
+{"op":"set","field":"user.name","value":"gentoo","req":4}
+{"op":"set","field":"user.password","value":"TestUser#2026","req":5}
+{"op":"validate","req":6}
+{"op":"install","dry_run":false,"confirm":"vda","req":7}
+{"op":"quit"}

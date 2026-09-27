@@ -595,8 +595,8 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
         } else {
             if (esp_count > 0)
                 try errs.append(alloc, "disk.partitions lists an EF00 ESP under BIOS boot — ESPs are UEFI-only");
-            if (resolveBootloader(cfg) == .grub and biosboot_count == 0)
-                try errs.append(alloc, "BIOS + GRUB needs a type=\"EF02\" biosboot partition (grub embeds core.img there)");
+            if (biosboot_count == 0)
+                try errs.append(alloc, "BIOS boot needs a type=\"EF02\" biosboot partition (grub and limine both embed stage2 there — GPT has no post-MBR gap)");
             if (cfg.disk.luks and manualBootFs(cfg) == null and manualRootFs(cfg) != .ext4)
                 try errs.append(alloc, "BIOS limine cannot read LUKS or non-ext4 roots — add a separate /boot partition");
         }

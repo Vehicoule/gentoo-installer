@@ -432,6 +432,17 @@ fn espPartIdx(cfg: *const Config) ?u32 {
     return if (cfg.boot_mode == .uefi) 1 else null;
 }
 
+/// 1-based partition number of the EF02 BIOS-boot partition — index 1
+/// on guided BIOS layouts; under scheme=manual the EF02 row, if any.
+fn biosBootIdx(cfg: *const Config) ?u32 {
+    if (cfg.disk.scheme == .manual) {
+        for (cfg.disk.partitions, 0..) |p, i|
+            if (std.ascii.eqlIgnoreCase(p.ptype, "EF02")) return @intCast(i + 1);
+        return null;
+    }
+    return if (cfg.boot_mode == .bios) 1 else null;
+}
+
 /// Mount point of the ESP inside the target.
 fn espMountPoint(alloc: Allocator, cfg: *const Config) []const u8 {
     if (cfg.disk.scheme == .manual)
@@ -707,6 +718,11 @@ fn packageUse(alloc: Allocator, cfg: *const Config) ![]const u8 {
         else => {},
     }
     if (cfg.system.uki) try w.writeAll("sys-kernel/installkernel uki\n");
+    // LUKS unlock in a systemd initramfs runs through systemd-cryptsetup,
+    // which Gentoo only builds under USE=cryptsetup — stage3s ship without
+    // it, so the flag must be set and systemd rebuilt before dracut runs.
+    if (cfg.disk.luks and cfg.system.init == .systemd)
+        try w.writeAll("sys-apps/systemd cryptsetup\n");
     return aw.written();
 }
 
@@ -842,14 +858,46 @@ fn planKernel(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !St
         .chroot = true,
         .desc = "firmware + CPU microcode",
     } });
+    // Block-stack userspace must exist in the TARGET before the kernel
+    // emerge — installkernel's dracut hook runs in-chroot and the
+    // crypt/lvm dracut modules need their tools there.
+    if (cfg.disk.luks or cfg.disk.lvm) {
+        var stack: std.ArrayList([]const u8) = .empty;
+        try stack.append(alloc, "emerge");
+        try stack.appendSlice(alloc, &.{ "--oneshot", "--newuse" });
+        if (cfg.disk.luks) try stack.append(alloc, "sys-fs/cryptsetup");
+        if (cfg.disk.lvm) try stack.append(alloc, "sys-fs/lvm2");
+        // USE=cryptsetup (package.use/installer) only takes effect on a
+        // rebuilt systemd — the stage3's binpkg predates it.
+        if (cfg.disk.luks and cfg.system.init == .systemd)
+            try stack.append(alloc, "sys-apps/systemd");
+        try c.append(alloc, .{ .exec = .{ .argv = stack.items, .chroot = true, .desc = "cryptsetup/lvm2 for initramfs" } });
+    }
     // The initramfs generator must exist before the kernel emerges —
     // the kernel package's installkernel hooks call it.
     switch (cfg.system.initramfs) {
-        .dracut => try c.append(alloc, .{ .exec = .{
-            .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-kernel/dracut" }),
-            .chroot = true,
-            .desc = "dracut initramfs (early microcode on)",
-        } }),
+        .dracut => {
+            // dracut's crypt/lvm modules are hostonly-conditional — a
+            // chrooted generic build omits them unless asked, which
+            // leaves a LUKS/LVM root unattachable at boot.
+            var mods: std.ArrayList(u8) = .empty;
+            if (cfg.disk.luks or cfg.disk.lvm) {
+                try mods.appendSlice(alloc, "add_dracutmodules+=\" ");
+                if (cfg.disk.luks) try mods.appendSlice(alloc, "crypt ");
+                if (cfg.disk.lvm) try mods.appendSlice(alloc, "lvm ");
+                try mods.appendSlice(alloc, "\"\n");
+                if (cfg.disk.luks)
+                    // the crypt module only ships /etc/crypttab in
+                    // hostonly mode — pull it explicitly.
+                    try mods.appendSlice(alloc, "install_items+=\" /etc/crypttab \"\n");
+                try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/dracut.conf.d/installer.conf", mods.items));
+            }
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-kernel/dracut" }),
+                .chroot = true,
+                .desc = "dracut initramfs (early microcode on)",
+            } });
+        },
         .ugrd => try c.append(alloc, .{ .exec = .{
             .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-kernel/ugrd" }),
             .chroot = true,
@@ -1226,10 +1274,20 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, seed: u128) !Step {
                     .desc = s(alloc, "limine EFI binary ({s})", .{efiBootFile(cfg)}),
                 } });
             } else {
-                // must run the TARGET's limine binary (host may lack it);
-                // /dev is rbind-mounted into the chroot at enter-chroot.
+                // limine-bios.sys must exist on a partition BEFORE
+                // bios-install — it embeds a hint to the stage3's
+                // location into the BIOS-boot partition's stages.
                 try c.append(alloc, .{ .exec = .{
-                    .argv = try alloc.dupe([]const u8, &.{ "limine", "bios-install", cfg.disk.device }),
+                    .argv = try alloc.dupe([]const u8, &.{ "cp", "/usr/share/limine/limine-bios.sys", "/boot/limine-bios.sys" }),
+                    .chroot = true,
+                    .desc = "limine BIOS stage3 payload",
+                } });
+                // GPT has no post-MBR gap — stage2 lives in the EF02
+                // partition, passed by 1-based index (validation
+                // guarantees one exists on BIOS configs).
+                const bbp = biosBootIdx(cfg).?;
+                try c.append(alloc, .{ .exec = .{
+                    .argv = try alloc.dupe([]const u8, &.{ "limine", "bios-install", cfg.disk.device, s(alloc, "{}", .{bbp}) }),
                     .chroot = true,
                     .desc = "limine BIOS stages",
                 } });

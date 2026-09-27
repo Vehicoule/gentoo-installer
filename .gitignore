@@ -5,3 +5,9 @@ target/
 *.swp
 .DS_Store
 zig-pkg/
+# QEMU test artifacts (large, locally fetched)
+test/qemu/*.iso
+test/qemu/*.qcow2
+test/qemu/boot/
+test/qemu/*.log
+test/qemu/ops-*.jsonl.local

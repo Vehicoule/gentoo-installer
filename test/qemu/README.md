@@ -27,6 +27,23 @@ python3 test/qemu/install.py   # phase A: live ISO + headless install (~15 min)
 python3 test/qemu/verify.py    # phase B: boot disk, expect login, log in
 ```
 
+## Variant scenarios (M5)
+
+`scenario.py` runs the same two-phase drive for non-default configs:
+
+```sh
+python3 test/qemu/scenario.py luks   # UEFI + disk.luks — phase B types the passphrase at the initramfs prompt
+python3 test/qemu/scenario.py bios   # SeaBIOS boot — exercises the BIOS layout + `limine bios-install`
+```
+
+Each takes `ops-<scenario>.jsonl` next to this script and logs to
+`<scenario>-a.log` / `<scenario>-b.log`. `bios` drops OVMF so SeaBIOS is
+the firmware on both phases.
+
+Pexpect note: never expect a bare marker the typed command also contains
+(`echo GOT` echoes `GOT` into the stream and matches early). Emit
+`echo MARK-$?` and expect `MARK-0` instead.
+
 Phase A fails loud with guest-side forensics (findmnt, /boot+ESP listing,
 installer stderr tail) if the install errors mid-run. Phase B is green when
 the serial console shows `gentoo login:` and the configured user can log in
