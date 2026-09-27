@@ -185,7 +185,9 @@ impl Installer {
 
     /// Send a buffered non-secret field once (answer_file): a load
     /// replaces the whole engine config, so it only goes out on an
-    /// explicit commit — Enter in the field, or a destructive action.
+    /// explicit commit — Enter in the field. Install/DryRun deliberately
+    /// do NOT flush it: an install must run on the configuration the
+    /// user reviewed, never on a path they haven't committed.
     fn flush_field(&mut self, name: &str) {
         if let Some(val) = self.inputs.get(name).cloned() {
             self.send_set(name, Value::String(val));
@@ -508,7 +510,26 @@ impl cosmic::app::Application for Installer {
                             self.confirm_inputs.clear();
                             self.selected.clear();
                             send_op(json!({"op": "page"}));
+                            // the loaded config may target a different disk
+                            // — refresh disk_device so the install confirm
+                            // gate checks the imported target
+                            send_op(json!({"op": "get_config"}));
                         }
+                    }
+                }
+                Some("config") => {
+                    // answer-file load refresh — adopt the imported target
+                    // disk and force re-confirmation against it
+                    if let Some(dev) = v
+                        .get("config")
+                        .and_then(|c| c.get("disk"))
+                        .and_then(|d| d.get("device"))
+                        .and_then(Value::as_str)
+                        && !dev.is_empty()
+                        && self.disk_device != dev
+                    {
+                        self.disk_device = dev.to_string();
+                        self.install_confirm.clear();
                     }
                 }
                 Some("bye") => {}
@@ -570,6 +591,11 @@ impl cosmic::app::Application for Installer {
                 }
             }
             Message::Install => {
+                if self.last_answer_req.is_some() {
+                    self.errors
+                        .push("answer file is loading — wait for the Review refresh".into());
+                    return Task::none();
+                }
                 if !self.flush_secrets() {
                     return Task::none();
                 }
@@ -582,7 +608,6 @@ impl cosmic::app::Application for Installer {
                         .push(format!("type '{confirm}' to confirm the install"));
                     return Task::none();
                 }
-                self.flush_field("answer_file");
                 self.steps.clear();
                 // leave the wizard synchronously — the engine queues ops, so
                 // a second click before the first `step` would run the whole
@@ -591,12 +616,16 @@ impl cosmic::app::Application for Installer {
                 send_op(json!({"op": "install", "dry_run": false, "confirm": confirm}));
             }
             Message::DryRun => {
+                if self.last_answer_req.is_some() {
+                    self.errors
+                        .push("answer file is loading — wait for the Review refresh".into());
+                    return Task::none();
+                }
                 // dry-run needs no confirm token — the engine skips
                 // destructive gates entirely and only exercises the plan
                 if !self.flush_secrets() {
                     return Task::none();
                 }
-                self.flush_field("answer_file");
                 self.steps.clear();
                 self.phase = Phase::Pending;
                 send_op(json!({"op": "install", "dry_run": true}));
