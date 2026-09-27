@@ -85,23 +85,31 @@ Purpose: the Gentoo-specific choice — init system, stage3 flavor, profile.
 | Field | Type | Default | Validation |
 |---|---|---|---|
 | init | enum `openrc\|systemd\|runit\|s6\|dinit` | `systemd` | all first-class options (alt inits get an "early support" badge, not a gate) — see init-backend note in DESIGN.md |
-| libc | enum `glibc\|musl` | `glibc` | `musl` disables systemd (needs glibc); runit/s6/dinit fine on musl |
+| libc | enum `glibc\|musl` | `glibc` | musl-systemd stage3s exist upstream but are experimental |
 | toolchain | enum `gcc\|llvm` | `gcc` | `llvm` ⇒ `llvm-*`/`musl-llvm-*` stage3 |
+| nomultilib | bool (amd64 only) | `false` | plain glibc+gcc only — no 32-bit compat libs |
 | hardening | enum `standard\|hardened\|hardened+selinux` | `hardened+selinux` | per user direction: hardening on by default; see caveat below |
 | profile | enum/string (expert override) | derived | must exist in `eselect profile list` for the variant |
 | binhost | bool | `true` | official binpkg host; signature-verified |
 
-Variant selection is **axes-based** — libc × toolchain × hardening map to
-a stage3 stem (e.g. glibc+llvm+hardened ⇒ `hardened-llvm-*`; musl+llvm ⇒
-`musl-llvm-*`). Caveat the UI must convey: *hardening is baked into the
-stage3's toolchain* (hardened gcc/clang defaults), so it can't be applied
-on top of a standard stage3 — selecting it selects a different tarball.
-SELinux policy, by contrast, is additive (sec-policy/*, refpolicy,
-`security.selinux=true`).
+Variant selection is **axes-based** — libc × toolchain × hardening ×
+nomultilib map to a stage3 stem, but only combinations Gentoo actually
+autobuilds are legal (stem order `<musl><hardened|hardened-selinux><llvm><nomultilib><init>`):
+glibc gets `hardened`/`hardened-selinux`/`llvm`/`nomultilib`, musl gets
+`hardened`/`llvm` — the rest (musl+selinux, glibc hardened-llvm,
+musl-hardened-llvm, hardened-nomultilib, …) have no tarball and the axes
+are disabled, not merely warned. Off-amd64 the matrix narrows: arm64
+ships no glibc hardening variants; riscv64 ships only
+`rv64_lp64d[_musl]` (musl is part of the ABI token). Caveat the UI must
+convey: *hardening is baked into the stage3's toolchain* (hardened
+gcc/clang defaults), so it can't be applied on top of a standard stage3
+— selecting it selects a different tarball. SELinux policy, by contrast,
+is additive (sec-policy/*, refpolicy, `security.selinux=true`).
 
-Init constraints (encoded, surfaced as disabled options): `musl` ⇒
-systemd unavailable; `*-systemd` stage3 flavors ⇒ `init=systemd`;
-runit/s6/dinit on any libc (post-stage3 init swap for non-openrc).
+Init constraints (encoded, surfaced as disabled options): `*-systemd`
+stage3 flavors ⇒ `init=systemd`; runit/s6/dinit on any libc
+(post-stage3 init swap for non-openrc); musl+systemd is allowed but
+flagged experimental.
 
 Profile preview: show the fully resolved profile name (e.g.
 `default/linux/amd64/23.0/desktop/systemd`) so users see exactly what

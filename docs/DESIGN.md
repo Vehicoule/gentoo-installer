@@ -219,10 +219,12 @@ shrink_mib  = 61440               # shrink only: space to free for the new insta
 
 [stage3]
 # axes-based selection; variant stem is resolved from these
-libc        = "glibc"            # glibc | musl (musl disables systemd)
+libc        = "glibc"            # glibc | musl — musl-systemd stage3s
+                               # exist upstream (experimental)
 toolchain   = "gcc"              # gcc | llvm
+nomultilib  = false             # amd64+glibc only; no 32-bit compat libs
 variant     = "hardened-selinux-systemd"  # resolved stem; per-arch
-                               # availability via the axes table
+                               # availability via the matrix below
 mirror      = "https://distfiles.gentoo.org"
 
 [system]
@@ -237,7 +239,11 @@ keymap      = "us"
 kernel      = "dist-bin"         # dist-bin | dist | manual
 bootloader  = "auto"             # auto | grub | systemd-boot | efistub | limine | refind
                                # auto always resolves to limine (uniform
-                               # BIOS+UEFI); the rest are explicit Advanced picks
+                               # BIOS+UEFI); the rest are explicit Advanced picks.
+                               # NOTE: limine's ebuild BDEPENDs on llvm+clang+lld
+                               # unconditionally — cheap where binhost serves
+                               # them, a multi-hour source build on musl; an
+                               # explicit efistub pick avoids that entirely.
 initramfs   = "dracut"           # dracut | ugrd | none
 uki         = false              # unified kernel image
 binhost     = true               # official gentoo binhost
@@ -262,10 +268,14 @@ driver      = "auto"             # auto | nouveau | nvidia-open | nvidia-drivers
                                # generation-aware: nvidia-open on Turing+
                                # (GTX 16xx/RTX 20xx+), nvidia-drivers or
                                # nouveau on older silicon. VALIDATE rejects
-                               # nvidia-open on pre-Turing. nvidia-* picks
-                               # appear only when NVIDIA is detected — imply
-                               # ACCEPT_LICENSE=+NVIDIA + module signing
-                               # under secure_boot
+                               # nvidia-open on pre-Turing and any nvidia-*
+                               # pick on musl or riscv64 (glibc-only pkgs).
+                               # nvidia-* picks appear only when NVIDIA is
+                               # detected — imply ACCEPT_LICENSE=+NVIDIA,
+                               # nvidia-drm.modeset=1 on the cmdline, and
+                               # module signing (MODULES_SIGN_*) under
+                               # secure_boot=sbctl — keys are created
+                               # before the drivers emerge
 
 [network]
 manager     = "networkmanager"   # networkmanager | dhcpcd | netifrc | systemd-networkd
@@ -320,18 +330,28 @@ global = {}                      # "flag" = true|false (unset = profile default)
 update_world = true
 ```
 
-### Stage3 variant matrix (amd64 names shown; mapped per-arch)
+### Stage3 variant matrix
 
-`openrc`, `systemd`, `desktop-openrc`, `desktop-systemd`,
-`nomultilib-*`, `hardened-*`, `hardened-selinux-*`, `musl-*`,
-`musl-hardened-*`, `musl-llvm-*`, `llvm-*`, `openrc-splitusr`, `x32-*`.
+Axes must resolve to a tarball Gentoo actually autobuilds — validated
+against `releases/<arch>/autobuilds` (the stem is the filename suffix
+after the arch/ABI token, before the datestamp):
 
-Selection is **axes-based**: `libc × toolchain × hardening × init` map to
-a stage3 stem (glibc+llvm+hardened ⇒ `hardened-llvm-*`; musl+llvm ⇒
-`musl-llvm-*`; plain glibc+gcc+systemd ⇒ `systemd`). Hardening is baked
-into the stage3 toolchain — it cannot be applied atop a standard stage3
-— while SELinux policy is additive (sec-policy/*, refpolicy). Defaults:
-glibc, gcc, `hardened+selinux`, per project direction.
+| arch | shipped stems |
+|---|---|
+| amd64 | `{,hardened-,hardened-selinux-,llvm-,nomultilib-,musl-,musl-hardened-,musl-llvm-}{openrc,systemd}` |
+| arm64 | `{,llvm-,musl-,musl-hardened-,musl-llvm-}{openrc,systemd}` — no glibc hardened/selinux/nomultilib |
+| riscv64 | `rv64_lp64d[_musl]-{openrc,systemd}` — musl lives in the ABI token; plain lp64d otherwise |
+
+Stem word order on amd64/arm64 is `<musl><hardened|hardened-selinux><llvm><nomultilib><init>`
+(musl+systemd stage3s exist upstream but are experimental; `nomultilib`
+is amd64+glibc-only — musl and the other arches are already single-ABI).
+Hardening is baked into the stage3 toolchain — it cannot be applied atop
+a standard stage3 — while SELinux policy is additive (sec-policy/*,
+refpolicy). The same axes resolve the portage profile:
+`default/linux/<arch>/23.0/<stem with no-multilib spelling, openrc is the
+bare base>`; riscv profiles live at
+`default/linux/riscv/23.0/rv64/lp64d[/musl][/systemd]`.
+Defaults: glibc, gcc, `hardened+selinux`, per project direction.
 
 The userland is GNU on every stem (glibc or musl libc + coreutils):
 portage ebuilds assume GNU/POSIX tools throughout the tree, so leaner
