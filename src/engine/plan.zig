@@ -3,8 +3,10 @@
 //! The wizard's "after" preview renders exactly this plan.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const config = @import("config.zig");
 const detect = @import("detect.zig");
+const preset = @import("preset.zig");
 const Allocator = std.mem.Allocator;
 const Config = config.Config;
 
@@ -39,6 +41,9 @@ pub const Step = struct {
     id: []const u8, // stable id for the journal/protocol
     title: []const u8,
     cmds: []const Cmd,
+    /// Preset [[extra_steps]] skippable=true: a failed command logs a
+    /// warning and the run continues instead of aborting.
+    skippable: bool = false,
 };
 
 pub const Plan = struct {
@@ -100,13 +105,17 @@ fn step(alloc: Allocator, id: []const u8, title: []const u8, cmds: std.ArrayList
 /// dependent commands are still emitted with placeholders.
 pub const Sets = struct {
     atoms: []const []const u8 = &.{},
-    repos: []const []const u8 = &.{},
+    repos: []const preset.Repo = &.{},
 };
 
 /// `disk_seed` namespaces the partition GUIDs this plan assigns — pass a
 /// fixed value in tests; null draws a random per-install seed so two
 /// installer-produced disks never collide on PARTUUID.
-pub fn build(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, pkg_sets: Sets, disk_seed: ?u128) !Plan {
+///
+/// `pre` contributes [[extra_steps]] (inserted after their `after`
+/// anchor; earliest allowed is enter-chroot) and [hooks].post_install
+/// (last chroot step before finish/unmount).
+pub fn build(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, pkg_sets: Sets, pre: ?*const preset.Preset, disk_seed: ?u128) !Plan {
     const seed = disk_seed orelse blk: {
         var buf: [16]u8 = undefined;
         const rc = std.os.linux.getrandom(&buf, buf.len, 0);
@@ -143,9 +152,73 @@ pub fn build(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, pkg_
     try steps.append(alloc, try planServices(alloc, cfg, env));
     try steps.append(alloc, try planPackages(alloc, cfg, pkg_sets));
     try steps.append(alloc, try planBootloader(alloc, cfg, env, seed));
+    // [hooks].post_install: last thing inside the chroot, before
+    // finish's unmount. The script ships inside the preset; the plan
+    // stages it into the target and runs it there.
+    if (pre) |p| {
+        if (p.post_install) |script| {
+            var c: std.ArrayList(Cmd) = .empty;
+            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/tmp/gi-post-install.sh", .content = script, .mode = 0o755 } });
+            try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "/bin/sh", "/tmp/gi-post-install.sh" }), .chroot = true, .desc = "preset post-install hook" } });
+            try c.append(alloc, argv(alloc, &.{ "rm", "-f", "/mnt/gentoo/tmp/gi-post-install.sh" }, "cleanup hook script"));
+            try steps.append(alloc, .{ .id = "post-install", .title = "Preset post-install hook", .cmds = c.items });
+        }
+    }
     try steps.append(alloc, try planFinish(alloc, cfg));
 
+    // Preset [[extra_steps]]: each inserts right after its `after`
+    // anchor. The anchor must be a pipeline step at or after
+    // enter-chroot (earlier steps have no target userland yet).
+    if (pre) |p| {
+        for (p.extra_steps) |ex| {
+            if (!stepNameOk(ex.name)) return error.BadExtraStep;
+            const anchor = findStepIndex(steps.items, ex.after) orelse {
+                if (!builtin.is_test)
+                    std.log.err("preset extra_step '{s}': unknown anchor '{s}'", .{ ex.name, ex.after });
+                return error.BadExtraStep;
+            };
+            const floor = findStepIndex(steps.items, "enter-chroot") orelse 0;
+            if (anchor < floor) {
+                if (!builtin.is_test)
+                    std.log.err("preset extra_step '{s}': anchor '{s}' is before enter-chroot", .{ ex.name, ex.after });
+                return error.BadExtraStep;
+            }
+            var c: std.ArrayList(Cmd) = .empty;
+            const spath = s(alloc, "/mnt/gentoo/tmp/gi-extra-{s}.sh", .{ex.name});
+            try c.append(alloc, .{ .write_file = .{ .path = spath, .content = ex.script, .mode = 0o755 } });
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "/bin/sh", s(alloc, "/tmp/gi-extra-{s}.sh", .{ex.name}) }),
+                .chroot = true,
+                .desc = if (ex.description.len > 0) ex.description else ex.name,
+            } });
+            try c.append(alloc, argv(alloc, &.{ "rm", "-f", spath }, "cleanup extra-step script"));
+            // Keep declaration order when several steps share an anchor.
+            var pos = anchor + 1;
+            while (pos < steps.items.len and std.mem.startsWith(u8, steps.items[pos].id, "preset-")) pos += 1;
+            try steps.insert(alloc, pos, .{
+                .id = s(alloc, "preset-{s}", .{ex.name}),
+                .title = if (ex.description.len > 0) ex.description else s(alloc, "Preset step: {s}", .{ex.name}),
+                .cmds = c.items,
+                .skippable = ex.skippable,
+            });
+        }
+    }
+
     return .{ .steps = steps.items };
+}
+
+fn findStepIndex(steps: []const Step, id: []const u8) ?usize {
+    for (steps, 0..) |st, i| if (std.mem.eql(u8, st.id, id)) return i;
+    return null;
+}
+
+/// Extra-step names become a tmp path + journal id — keep them tame.
+fn stepNameOk(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64) return false;
+    for (name) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and ch != '-' and ch != '_') return false;
+    }
+    return true;
 }
 
 // ------------------------------------------------------------------ //
@@ -1749,17 +1822,29 @@ fn altSvcCmd(name: []const u8) ?[]const u8 {
 fn planPackages(alloc: Allocator, cfg: *const Config, sets: Sets) !Step {
     var c: std.ArrayList(Cmd) = .empty;
     // overlay repos a set asked for (e.g. cosmic) — enable + sync first.
+    // A preset [[repos]] entry with sync_uri is unknown to eselect: write
+    // the repos.conf file and sync it directly instead.
     for (sets.repos) |repo| {
-        try c.append(alloc, .{ .exec = .{
-            .argv = try alloc.dupe([]const u8, &.{ "eselect", "repository", "enable", repo }),
-            .chroot = true,
-            .desc = s(alloc, "enable {s} overlay", .{repo}),
-        } });
-        try c.append(alloc, .{ .exec = .{
-            .argv = try alloc.dupe([]const u8, &.{ "emerge", "--sync", repo }),
-            .chroot = true,
-            .desc = s(alloc, "sync {s} overlay", .{repo}),
-        } });
+        if (repo.sync_uri) |uri| {
+            try c.append(alloc, wf(alloc, s(alloc, "/mnt/gentoo/etc/portage/repos.conf/{s}.conf", .{repo.name}),
+                s(alloc, "[{s}]\nlocation = /var/db/repos/{s}\nsync-type = git\nsync-uri = {s}\nauto-sync = yes\n", .{ repo.name, repo.name, uri })));
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "emaint", "sync", "-r", repo.name }),
+                .chroot = true,
+                .desc = s(alloc, "sync {s} overlay (sync_uri)", .{repo.name}),
+            } });
+        } else {
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "eselect", "repository", "enable", repo.name }),
+                .chroot = true,
+                .desc = s(alloc, "enable {s} overlay", .{repo.name}),
+            } });
+            try c.append(alloc, .{ .exec = .{
+                .argv = try alloc.dupe([]const u8, &.{ "emaint", "sync", "-r", repo.name }),
+                .chroot = true,
+                .desc = s(alloc, "sync {s} overlay", .{repo.name}),
+            } });
+        }
     }
     var atoms: std.ArrayList([]const u8) = .empty;
     try atoms.appendSlice(alloc, sets.atoms);
@@ -2318,7 +2403,7 @@ test "golden plan: uefi + luks + lvm + btrfs + limine" {
     defer arena.deinit();
     const alloc = arena.allocator();
     const cfg = try config.decode(alloc, doc);
-    const plan = try build(alloc, &cfg, null, .{}, 0x0123456789abcdef0123456789abcdef);
+    const plan = try build(alloc, &cfg, null, .{}, null, 0x0123456789abcdef0123456789abcdef);
 
     const expected_ids = [_][]const u8{
         "detect",         "partition",    "mount",           "stage3",
@@ -2382,7 +2467,7 @@ test "persistent ids: fstab + kernel args use PARTUUID, exec paths use /dev" {
     var cfg = try config.decode(alloc, doc);
     cfg.boot_mode = .uefi;
     const seed: u128 = 0xdeadbeefcafebabe0123456789abcdef;
-    const plan = try build(alloc, &cfg, null, .{}, seed);
+    const plan = try build(alloc, &cfg, null, .{}, null, seed);
 
     // UEFI + swap-partition: esp=1, swap=2, root=3. Assert each fstab
     // entry carries ITS partition's GUID, not just any PARTUUID.
@@ -2538,7 +2623,7 @@ test "proprietary nvidia: modeset arg, signed modules, sbctl before emerge" {
     defer arena.deinit();
     const alloc = arena.allocator();
     const cfg = try config.decode(alloc, doc);
-    const plan = try build(alloc, &cfg, null, .{}, null);
+    const plan = try build(alloc, &cfg, null, .{}, null, null);
 
     var saw_modeset = false;
     var saw_sign_key = false;
@@ -2657,7 +2742,7 @@ test "alt inits: init= cmdline + supervisor scaffolding" {
         const alloc = arena.allocator();
         var cfg = try config.decode(alloc, doc);
         if (std.mem.eql(u8, tc.init, "runit")) cfg.system.init = .runit;
-        const plan = try build(alloc, &cfg, null, .{}, null);
+        const plan = try build(alloc, &cfg, null, .{}, null, null);
         var saw_arg = false;
         var saw_scaffold = false;
         var saw_sysinit = false;
@@ -2749,7 +2834,7 @@ test "alongside: preserve table, shrink ext4, reuse ESP, menu merge" {
         .os_hint = "linux",
     };
 
-    const plan = try build(alloc, &cfg, &env, .{}, 0x0123456789abcdef0123456789abcdef);
+    const plan = try build(alloc, &cfg, &env, .{}, null, 0x0123456789abcdef0123456789abcdef);
 
     var saw_zap = false;
     var saw_resize = false;
@@ -2822,4 +2907,56 @@ test "alongside: preserve table, shrink ext4, reuse ESP, menu merge" {
     try std.testing.expect(saw_efibootmgr);
     try std.testing.expect(saw_efi_gentoo);
     try std.testing.expect(saw_chainload_note);
+}
+
+test "preset extra_steps insert after anchor; post_install before finish" {
+    const toml_mod = @import("toml.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const doc = try toml_mod.parse(alloc,
+        \\arch = "amd64"
+        \\boot_mode = "uefi"
+        \\[disk]
+        \\device = "/dev/vda"
+        \\scheme = "efi-swap-root"
+    , null);
+    const cfg = try config.decode(alloc, doc);
+
+    var p: preset.Preset = .{ .doc = doc };
+    const extra: []const preset.ExtraStep = &.{
+        .{ .name = "motd", .after = "system-config", .script = "echo hi > /etc/motd\n", .skippable = true, .description = "seed motd" },
+        .{ .name = "second", .after = "system-config", .script = "true\n" },
+    };
+    p.extra_steps = extra;
+    p.post_install = "echo done\n";
+
+    const pl = try build(alloc, &cfg, null, .{}, &p, null);
+    const idxOf = struct {
+        fn f(steps: []const Step, id: []const u8) usize {
+            for (steps, 0..) |st, i| if (std.mem.eql(u8, st.id, id)) return i;
+            unreachable;
+        }
+    }.f;
+    const sc = idxOf(pl.steps, "system-config");
+    try std.testing.expectEqualStrings("preset-motd", pl.steps[sc + 1].id);
+    try std.testing.expectEqualStrings("preset-second", pl.steps[sc + 2].id);
+    try std.testing.expect(pl.steps[sc + 1].skippable);
+    try std.testing.expect(!pl.steps[sc + 2].skippable);
+    // script staged into the target then run in the chroot
+    const cmds = pl.steps[sc + 1].cmds;
+    try std.testing.expectEqualStrings("/mnt/gentoo/tmp/gi-extra-motd.sh", cmds[0].write_file.path);
+    try std.testing.expectEqual(0o755, cmds[0].write_file.mode);
+    try std.testing.expect(cmds[1].exec.chroot);
+    // post-install sits between bootloader and finish
+    const fin = idxOf(pl.steps, "finish");
+    try std.testing.expectEqualStrings("post-install", pl.steps[fin - 1].id);
+
+    // Refusals: unknown anchor + anchor before enter-chroot.
+    var bad: preset.Preset = .{ .doc = doc };
+    bad.extra_steps = &.{.{ .name = "x", .after = "no-such-step", .script = "true\n" }};
+    try std.testing.expectError(error.BadExtraStep, build(alloc, &cfg, null, .{}, &bad, null));
+    var early: preset.Preset = .{ .doc = doc };
+    early.extra_steps = &.{.{ .name = "x", .after = "stage3", .script = "true\n" }};
+    try std.testing.expectError(error.BadExtraStep, build(alloc, &cfg, null, .{}, &early, null));
 }

@@ -274,7 +274,7 @@ pub const Tui = struct {
             t.status = std.fmt.allocPrint(t.alloc, "set resolution: {s}", .{ps.errs[0]}) catch "set resolution failed";
             return;
         }
-        const p = try engine.plan.build(t.alloc, &t.wiz.cfg, if (t.wiz.env) |*e| e else null, ps.sets, null);
+        const p = try engine.plan.build(t.alloc, &t.wiz.cfg, if (t.wiz.env) |*e| e else null, ps.sets, t.wiz.preset, null);
         t.plan_lines.clearRetainingCapacity();
         var aw: std.Io.Writer.Allocating = .init(t.alloc);
         try engine.runner.run(t.io, t.alloc, p, .{ .mode = .dry_run, .out = &aw.writer });
@@ -296,7 +296,7 @@ pub const Tui = struct {
             t.mode = .failed;
             return;
         }
-        const p = engine.plan.build(t.alloc, &t.wiz.cfg, if (t.wiz.env) |*e| e else null, ps.sets, null) catch |e| {
+        const p = engine.plan.build(t.alloc, &t.wiz.cfg, if (t.wiz.env) |*e| e else null, ps.sets, t.wiz.preset, null) catch |e| {
             t.status = std.fmt.allocPrint(t.alloc, "plan failed: {s}", .{@errorName(e)}) catch "plan failed";
             t.mode = .failed;
             return;

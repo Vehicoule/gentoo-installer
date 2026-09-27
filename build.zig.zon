@@ -1,6 +1,6 @@
 .{
     .name = .gentoo_installer,
-    .version = "0.0.0",
+    .version = "1.0.0",
     .fingerprint = 0xff38eed1a0751a99,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{

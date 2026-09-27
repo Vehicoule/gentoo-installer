@@ -7,6 +7,24 @@ const std = @import("std");
 const toml = @import("toml.zig");
 const Allocator = std.mem.Allocator;
 
+/// A [[repos]] overlay entry: `eselect repository enable <name>` when
+/// sync_uri is null; otherwise the engine writes a repos.conf file and
+/// syncs it directly (upstream eselect doesn't know the repo).
+pub const Repo = struct {
+    name: []const u8,
+    sync_uri: ?[]const u8 = null,
+};
+
+/// A [[extra_steps]] pipeline extension. `script` is the file's
+/// *contents*, read at preset load (assets resolve against dir).
+pub const ExtraStep = struct {
+    name: []const u8,
+    after: []const u8,
+    description: []const u8 = "",
+    skippable: bool = false,
+    script: []const u8,
+};
+
 pub const Preset = struct {
     id: []const u8 = "gentoo",
     name: []const u8 = "Gentoo",
@@ -15,6 +33,14 @@ pub const Preset = struct {
     /// "system.init"). The wizard hides them; VALIDATE rejects configs
     /// that diverge from the locked default.
     locks: []const []const u8 = &.{},
+    /// Directory the preset.toml lives in (script assets resolve here).
+    dir: []const u8 = "",
+    repos: []const Repo = &.{},
+    extra_steps: []const ExtraStep = &.{},
+    /// [hooks].post_install script contents — runs last in the chroot,
+    /// before the finish step unmounts.
+    post_install: ?[]const u8 = null,
+    engine_min: ?[]const u8 = null,
 
     pub fn deinit(p: *Preset) void {
         p.doc.deinit();
@@ -23,13 +49,33 @@ pub const Preset = struct {
 
 pub const LoadError = error{ BadPreset, InvalidToml, OutOfMemory };
 
+fn presetErr(comptime fmt: []const u8, args: anytype) LoadError {
+    std.log.err("preset: " ++ fmt, args);
+    return error.BadPreset;
+}
+
+/// Read a script asset relative to the preset dir; refuse missing or
+/// non-executable files rather than half-applying.
+fn loadScript(alloc: Allocator, dir: std.Io.Dir, io: std.Io, where: []const u8, rel: []const u8) LoadError![]const u8 {
+    const st = dir.statFile(io, rel, .{}) catch
+        return presetErr("{s}: script '{s}' not found", .{ where, rel });
+    if (st.permissions.toMode() & 0o111 == 0)
+        return presetErr("{s}: script '{s}' is not executable", .{ where, rel });
+    return dir.readFileAlloc(io, rel, alloc, .limited(4 << 20)) catch
+        presetErr("{s}: cannot read script '{s}'", .{ where, rel });
+}
+
 pub fn load(alloc: Allocator, path: []const u8, io: std.Io) LoadError!Preset {
     // Accept a preset directory (containing preset.toml) or a file path.
     var file_path = path;
+    var dir_path: []const u8 = ".";
     if (std.Io.Dir.cwd().openDir(io, path, .{}) catch null) |dir| {
         dir.close(io);
+        dir_path = path;
         file_path = std.fmt.allocPrint(alloc, "{s}/preset.toml", .{path}) catch return error.OutOfMemory;
-    }
+    } else if (std.fs.path.dirname(path)) |d| dir_path = d;
+    const preset_dir = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch
+        return error.BadPreset;
     const text = std.Io.Dir.cwd().readFileAlloc(io, file_path, alloc, .limited(4 << 20)) catch
         return error.BadPreset;
     var perr: toml.ParseError = undefined;
@@ -38,7 +84,7 @@ pub fn load(alloc: Allocator, path: []const u8, io: std.Io) LoadError!Preset {
             std.log.err("preset {s}:{}: {s}", .{ file_path, perr.line, perr.msg });
         return e;
     };
-    var p: Preset = .{ .doc = doc };
+    var p: Preset = .{ .doc = doc, .dir = dir_path };
     // identity lives in the [preset] table (presets/*.toml); bare-root
     // id/name accepted for hand-written minimal presets.
     const ident: *const toml.Value.Table = if (doc.root.get("preset")) |v|
@@ -51,7 +97,11 @@ pub fn load(alloc: Allocator, path: []const u8, io: std.Io) LoadError!Preset {
     if (ident.get("name")) |v| {
         if (v == .string) p.name = v.string;
     }
-    // [locks] fields = ["system.init", ...]
+    if (ident.get("engine_min")) |v| {
+        if (v == .string) p.engine_min = v.string;
+    }
+    // [locks] fields = ["system.init", ...] — each must have a matching
+    // [defaults] value or the lock can never be satisfied.
     if (doc.root.get("locks")) |v| {
         if (v == .table) {
             if (v.table.get("fields")) |f| {
@@ -65,6 +115,78 @@ pub fn load(alloc: Allocator, path: []const u8, io: std.Io) LoadError!Preset {
             }
         }
     }
+    const defaults_tbl: ?toml.Value.Table = blk: {
+        const v = doc.root.get("defaults") orelse break :blk null;
+        break :blk switch (v) {
+            .table => |t| t,
+            else => null,
+        };
+    };
+    for (p.locks) |lock_path| {
+        const has_default = if (defaults_tbl) |d| lookup(d, lock_path) != null else false;
+        if (!has_default)
+            return presetErr("[locks] '{s}' has no matching [defaults] value", .{lock_path});
+    }
+    // [[repos]] name + optional sync_uri (git URI for a direct sync).
+    if (doc.root.get("repos")) |v| {
+        if (v == .array) {
+            var repos: std.ArrayList(Repo) = .empty;
+            for (v.array) |item| {
+                if (item != .table) continue;
+                const nv = item.table.get("name") orelse continue;
+                if (nv != .string) continue;
+                var r: Repo = .{ .name = nv.string };
+                if (item.table.get("sync_uri")) |sv| {
+                    if (sv != .string)
+                        return presetErr("repo '{s}': sync_uri must be a string", .{r.name});
+                    if (sv.string.len == 0) continue; // "" = eselect enable
+                    if (!std.mem.startsWith(u8, sv.string, "https://"))
+                        return presetErr("repo '{s}': sync_uri must be an https:// URI", .{r.name});
+                    r.sync_uri = sv.string;
+                }
+                try repos.append(alloc, r);
+            }
+            p.repos = repos.items;
+        }
+    }
+    // [[extra_steps]] journaled pipeline extensions.
+    if (doc.root.get("extra_steps")) |v| {
+        if (v == .array) {
+            var exs: std.ArrayList(ExtraStep) = .empty;
+            for (v.array) |item| {
+                if (item != .table) continue;
+                const t = item.table;
+                const nv = t.get("name") orelse return presetErr("extra_steps entry missing 'name'", .{});
+                if (nv != .string) return presetErr("extra_steps: 'name' must be a string", .{});
+                const av = t.get("after") orelse return presetErr("extra_steps '{s}': missing 'after'", .{nv.string});
+                if (av != .string) return presetErr("extra_steps '{s}': 'after' must be a string", .{nv.string});
+                const sv = t.get("script") orelse return presetErr("extra_steps '{s}': missing 'script'", .{nv.string});
+                if (sv != .string) return presetErr("extra_steps '{s}': 'script' must be a string", .{nv.string});
+                var ex: ExtraStep = .{
+                    .name = nv.string,
+                    .after = av.string,
+                    .script = try loadScript(alloc, preset_dir, io, "extra_steps", sv.string),
+                };
+                if (t.get("description")) |dv| {
+                    if (dv == .string) ex.description = dv.string;
+                }
+                if (t.get("skippable")) |bv| {
+                    if (bv == .boolean) ex.skippable = bv.boolean;
+                }
+                try exs.append(alloc, ex);
+            }
+            p.extra_steps = exs.items;
+        }
+    }
+    // [hooks] post_install = "scripts/x.sh"
+    if (doc.root.get("hooks")) |v| {
+        if (v == .table) {
+            if (v.table.get("post_install")) |hv| {
+                if (hv == .string)
+                    p.post_install = try loadScript(alloc, preset_dir, io, "hooks.post_install", hv.string);
+            }
+        }
+    }
     return p;
 }
 
@@ -73,15 +195,20 @@ pub fn load(alloc: Allocator, path: []const u8, io: std.Io) LoadError!Preset {
 /// preset's [defaults] value. Divergence is a validation error.
 pub fn checkLocks(alloc: Allocator, preset: *const Preset, user_doc: *const toml.Document) ![][]const u8 {
     var errs: std.ArrayList([]const u8) = .empty;
-    const defaults = blk: {
-        const v = preset.doc.root.get("defaults") orelse return errs.items;
+    const defaults: ?toml.Value.Table = blk: {
+        const v = preset.doc.root.get("defaults") orelse break :blk null;
         break :blk switch (v) {
             .table => |t| t,
-            else => return errs.items,
+            else => null,
         };
     };
     for (preset.locks) |path| {
-        const want = lookup(defaults, path) orelse continue;
+        const want = (if (defaults) |d| lookup(d, path) else null) orelse {
+            // A lock with no default can't be satisfied — the preset is
+            // malformed, not the config.
+            try errs.append(alloc, std.fmt.allocPrint(alloc, "preset lock: '{s}' has no matching [defaults] value", .{path}) catch @panic("oom"));
+            continue;
+        };
         const got = lookup(user_doc.root, path);
         if (got == null) continue; // unset → default wins, fine
         if (!valueEq(got.?, want))
@@ -92,8 +219,31 @@ pub fn checkLocks(alloc: Allocator, preset: *const Preset, user_doc: *const toml
 
 pub const ResolvedSets = struct {
     atoms: [][]const u8,
-    repos: [][]const u8,
+    repos: []const Repo,
 };
+
+fn findRepo(preset: *const Preset, name: []const u8) Repo {
+    for (preset.repos) |r|
+        if (std.mem.eql(u8, r.name, name)) return r;
+    // Not declared in [[repos]] — a repo eselect knows already.
+    return .{ .name = name };
+}
+
+/// Dotted-numeric version compare: have < want. An unparseable
+/// component fails closed (treated as "too old") — a preset can't
+/// smuggle a bogus engine_min past the check.
+pub fn versionLt(have: []const u8, want: []const u8) bool {
+    var hi = std.mem.splitScalar(u8, have, '.');
+    var wi = std.mem.splitScalar(u8, want, '.');
+    while (true) {
+        const h = hi.next();
+        const w = wi.next();
+        if (h == null and w == null) return false;
+        const hn = std.fmt.parseInt(u32, h orelse "0", 10) catch return true;
+        const wn = std.fmt.parseInt(u32, w orelse "0", 10) catch return true;
+        if (hn != wn) return hn < wn;
+    }
+}
 
 /// Resolve `packages.sets` names against the preset's [[package_sets]]
 /// (id → atoms + repos, honouring `extends`). `names == null` means the
@@ -102,7 +252,7 @@ pub const ResolvedSets = struct {
 /// validation-style error list the caller surfaces.
 pub fn resolveSets(alloc: Allocator, preset: ?*const Preset, names: ?[]const []const u8) !struct { resolved: ResolvedSets, errs: [][]const u8 } {
     var atoms: std.ArrayList([]const u8) = .empty;
-    var repos: std.ArrayList([]const u8) = .empty;
+    var repos: std.ArrayList(Repo) = .empty;
     // dedupe atoms/repos across extends chains (a child may restate
     // parent entries)
     var atoms_seen: std.StringHashMap(void) = .init(alloc);
@@ -180,7 +330,7 @@ pub fn resolveSets(alloc: Allocator, preset: ?*const Preset, names: ?[]const []c
                                 continue;
                             }
                             try repos_seen.put(item.string, {});
-                            try repos.append(alloc, item.string);
+                            try repos.append(alloc, findRepo(preset.?, item.string));
                         }
                     };
             }
@@ -323,4 +473,38 @@ test "defaults merge" {
     const sys = udoc.root.get("system").?.table;
     try std.testing.expectEqualStrings("user-host", sys.get("hostname").?.string);
     try std.testing.expectEqualStrings("dinit", sys.get("init").?.string);
+}
+
+test "versionLt dotted compare" {
+    try std.testing.expect(!versionLt("1.0.0", "1.0.0"));
+    try std.testing.expect(versionLt("1.0.0", "1.0.1"));
+    try std.testing.expect(versionLt("0.9", "1.0"));
+    try std.testing.expect(!versionLt("1.0", "1.0.0"));
+    try std.testing.expect(versionLt("1.0", "1.0.1"));
+    try std.testing.expect(versionLt("1.0.0", "bogus")); // unparseable want → refuse
+}
+
+test "resolveSets maps repos to [[repos]] sync_uri" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const src =
+        \\[[repos]]
+        \\name = "mine"
+        \\sync_uri = "https://git.example/mine.git"
+        \\[[package_sets]]
+        \\id = "s1"
+        \\atoms = ["app-misc/foo"]
+        \\repos = ["mine", "gentoo-known"]
+    ;
+    const doc = try toml.parse(alloc, src, null);
+    var p: Preset = .{ .doc = doc };
+    p.repos = &.{.{ .name = "mine", .sync_uri = "https://git.example/mine.git" }};
+    defer p.deinit();
+    const rs = try resolveSets(alloc, &p, &.{"s1"});
+    try std.testing.expectEqual(0, rs.errs.len);
+    try std.testing.expectEqual(2, rs.resolved.repos.len);
+    try std.testing.expectEqualStrings("https://git.example/mine.git", rs.resolved.repos[0].sync_uri.?);
+    try std.testing.expectEqualStrings("gentoo-known", rs.resolved.repos[1].name);
+    try std.testing.expect(rs.resolved.repos[1].sync_uri == null);
 }

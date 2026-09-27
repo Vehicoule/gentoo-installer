@@ -133,6 +133,10 @@ pub fn run(io: std.Io, alloc: Allocator, p: plan.Plan, opts: Options) !void {
                         } else |err| {
                             journal.cmdWriteFile(step.id, w, "fail");
                             if (opts.on_step) |cb| cb(opts.ctx, i + 1, p.steps.len, step.id, "failed");
+                            if (step.skippable) {
+                                try out.print("     warning: skippable step failed — continuing\n", .{});
+                                break;
+                            }
                             return err;
                         }
                     }
@@ -156,6 +160,10 @@ pub fn run(io: std.Io, alloc: Allocator, p: plan.Plan, opts: Options) !void {
                             ew.interface.print("command failed ({s}): {s}\n", .{ e.desc, @errorName(err) }) catch {};
                             ew.interface.flush() catch {};
                             if (opts.on_step) |cb| cb(opts.ctx, i + 1, p.steps.len, step.id, "failed");
+                            if (step.skippable) {
+                                try out.print("     warning: skippable step failed — continuing\n", .{});
+                                break;
+                            }
                             return err;
                         };
                         journal.cmdExec(step.id, e, "ok");
