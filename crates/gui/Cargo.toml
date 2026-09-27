@@ -1,0 +1,11 @@
+[package]
+name = "gentoo-installer-gui"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "libcosmic GUI frontend for gentoo-installer (headless NDJSON protocol)"
+
+[dependencies]
+# libcosmic has no crates.io releases — COSMIC apps pin a master commit.
+cosmic = { git = "https://github.com/pop-os/libcosmic", package = "libcosmic", rev = "03d7dcb832" }
+serde_json = "1"

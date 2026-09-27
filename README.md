@@ -13,6 +13,21 @@ extra steps.
 Early stage — see [docs/DESIGN.md](docs/DESIGN.md) for the architecture, config model,
 headless protocol, and roadmap.
 
-## Status
+## Building
 
-Nothing to install yet. Build instructions land with the first milestone.
+Engine + TUI (Zig 0.16.x):
+
+```sh
+zig build            # zig-out/bin/gentoo-installer  (tui | headless | run | plan | validate | detect)
+zig build test
+```
+
+GUI (Rust + libcosmic, pins a libcosmic git rev in `crates/gui/Cargo.toml`):
+
+```sh
+cargo build -p gentoo-installer-gui   # binary: target/debug/gentoo-installer-gui
+```
+
+The GUI spawns `gentoo-installer headless` — set `GI_BIN=/path/to/binary` to
+point it at a built engine, otherwise it looks for `zig-out/bin/gentoo-installer`
+relative to the workspace.
