@@ -1,0 +1,17 @@
+{"op":"detect","req":0}
+{"op":"set","field":"disk.device","value":"/dev/vda","req":1}
+{"op":"set","field":"disk.scheme","value":"alongside","req":2}
+{"op":"set","field":"disk.space_src","value":"shrink","req":3}
+{"op":"set","field":"disk.shrink_part","value":"/dev/vda2","req":4}
+{"op":"set","field":"disk.shrink_mib","value":10240,"req":5}
+{"op":"set","field":"disk.root_fs","value":"ext4","req":6}
+{"op":"set","field":"system.init","value":"openrc","req":7}
+{"op":"set","field":"system.binhost","value":false,"req":8}
+{"op":"set","field":"system.bootloader","value":"efistub","req":9}
+{"op":"set","field":"network.manager","value":"dhcpcd","req":10}
+{"op":"set","field":"root.password","value":"@ROOT_PASS@","req":11}
+{"op":"set","field":"user.name","value":"@USER@","req":12}
+{"op":"set","field":"user.password","value":"@USER_PASS@","req":13}
+{"op":"validate","req":14}
+{"op":"install","dry_run":false,"confirm":"vda","req":15}
+{"op":"quit"}

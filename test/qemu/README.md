@@ -36,6 +36,8 @@ python3 test/qemu/scenario.py luks   # UEFI + disk.luks — phase B types the pa
 python3 test/qemu/scenario.py bios   # SeaBIOS boot — exercises the BIOS layout + `limine bios-install`
 python3 test/qemu/scenario.py musl   # stage3-musl-hardened-openrc + efistub (limine-from-source would
                                      # pull an llvm+clang build on musl — no binpkgs there)
+python3 test/qemu/scenario.py dinit  # init=dinit + limine — gi-sysinit stage-1, dinit.d units;
+                                     # phase A adds a dinit ttyS0 service (no inittab on alt inits)
 ```
 
 Each takes `ops-<scenario>.jsonl` next to this script and logs to

@@ -13,11 +13,40 @@ pub const Gpu = struct {
     device_id: u32,
 };
 
+pub const PartInfo = struct {
+    num: u32, // GPT entry number
+    path: []const u8, // "/dev/sda3"
+    /// blkid TYPE (ntfs/ext4/btrfs/vfat/swap/BitLocker/crypto_LUKS/…); "" when unknown.
+    fs: []const u8 = "",
+    /// PART_ENTRY_UUID (the PARTUUID kernel/fstab resolve by).
+    partuuid: []const u8 = "",
+    esp: bool = false, // PART_ENTRY_TYPE is the EFI System Partition GUID
+    start_sector: u64 = 0,
+    size_bytes: u64 = 0,
+    /// Filesystem probe results — 0 means "couldn't determine" (tool
+    /// absent, fs dirty, unreadable). Shrink validation refuses
+    /// unprobed filesystems rather than guessing.
+    fs_size_bytes: u64 = 0,
+    fs_free_bytes: u64 = 0,
+};
+
+/// An unallocated gap between partitions, sector-exact (end inclusive).
+/// Both bounds are already clamped to the GPT usable range and MiB
+/// alignment, so sgdisk can take them verbatim.
+pub const FreeRegion = struct {
+    start_sector: u64,
+    end_sector: u64,
+};
+
 pub const DiskInfo = struct {
     name: []const u8, // "sda"
     path: []const u8, // "/dev/sda"
     size_bytes: u64,
     removable: bool,
+    /// Partition-table label — "gpt", "dos", … ("" when unknown).
+    label: []const u8 = "",
+    parts: []const PartInfo = &.{},
+    free_regions: []const FreeRegion = &.{},
 };
 
 pub const Env = struct {
@@ -32,6 +61,10 @@ pub const Env = struct {
     gpus: []const Gpu,
     disks: []const DiskInfo,
     net_reachable: bool,
+    /// Installed-OS hint for the wizard's `alongside` visibility:
+    /// "windows" when ntfs/BitLocker shows up, "linux" when an ESP or
+    /// foreign linux fs exists, "" on empty disks.
+    os_hint: []const u8 = "",
 };
 
 fn readSmall(alloc: Allocator, io: std.Io, path: []const u8) ?[]const u8 {
@@ -125,6 +158,24 @@ pub fn detect(alloc: Allocator, io: std.Io) !Env {
     env.gpus = try detectGpus(alloc, io);
     env.disks = try detectDisks(alloc, io);
     env.net_reachable = detectNet(alloc, io);
+    // Installed-OS heuristic for `alongside` visibility: Windows when
+    // ntfs/BitLocker partitions exist, generic linux when a foreign
+    // linux fs or an ESP does, nothing on a blank disk.
+    var saw_ntfs = false;
+    var saw_linux = false;
+    var saw_esp = false;
+    for (env.disks) |d| {
+        for (d.parts) |p| {
+            if (std.mem.eql(u8, p.fs, "ntfs") or std.mem.eql(u8, p.fs, "BitLocker"))
+                saw_ntfs = true
+            else if (p.esp)
+                saw_esp = true
+            else if (std.mem.startsWith(u8, p.fs, "ext") or std.mem.eql(u8, p.fs, "btrfs") or
+                std.mem.eql(u8, p.fs, "xfs") or std.mem.eql(u8, p.fs, "f2fs"))
+                saw_linux = true;
+        }
+    }
+    env.os_hint = if (saw_ntfs) "windows" else if (saw_linux or saw_esp) "linux" else "";
     return env;
 }
 
@@ -211,6 +262,173 @@ pub fn nvidiaIsTuringPlus(gpu: Gpu) bool {
     return gpu.device_id >= 0x1e00;
 }
 
+/// Run a probe tool and capture stdout (bounded). Best-effort: any
+/// spawn/exit failure returns null — callers treat it as "unprobed".
+fn capture(alloc: Allocator, io: std.Io, argv: []const []const u8) ?[]const u8 {
+    var child = std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    }) catch return null;
+    var buf: std.ArrayList(u8) = .empty;
+    const cs = child.stdout.?;
+    var rbuf: [8192]u8 = undefined;
+    var r = cs.reader(io, &rbuf);
+    while (true) {
+        const chunk = r.interface.peekGreedy(1) catch break;
+        if (chunk.len == 0) break;
+        if (buf.items.len < (256 << 10)) {
+            const room = (256 << 10) - buf.items.len;
+            buf.appendSlice(alloc, chunk[0..@min(room, chunk.len)]) catch break;
+        }
+        r.interface.toss(chunk.len);
+    }
+    cs.close(io);
+    child.stdout = null;
+    const term = child.wait(io) catch return null;
+    switch (term) {
+        .exited => |code| if (code != 0) return null,
+        else => return null,
+    }
+    return buf.items;
+}
+
+/// Parse "KEY=value" export output (blkid -o export / parted-free style
+/// probes we don't need a shell for). Returns the value for `key`.
+fn exportField(out: []const u8, key: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, out, '\n');
+    while (it.next()) |line| {
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        if (std.mem.eql(u8, trim(line[0..eq]), key)) return trim(line[eq + 1 ..]);
+    }
+    return null;
+}
+
+/// Numeric field out of a tool's report (dumpe2fs -h, ntfsresize -i):
+/// first digit-run on the line containing `key` after the colon.
+fn reportNum(out: []const u8, key: []const u8) ?u64 {
+    var it = std.mem.splitScalar(u8, out, '\n');
+    while (it.next()) |line| {
+        const idx = std.mem.indexOf(u8, line, key) orelse continue;
+        var rest = line[idx + key.len ..];
+        // skip past ':' and any non-digits
+        var i: usize = 0;
+        while (i < rest.len and !std.ascii.isDigit(rest[i])) i += 1;
+        var j = i;
+        while (j < rest.len and std.ascii.isDigit(rest[j])) j += 1;
+        if (j > i) return std.fmt.parseInt(u64, rest[i..j], 10) catch null;
+        _ = &rest;
+    }
+    return null;
+}
+
+/// Filesystem size + free bytes for a shrinkable candidate, via
+/// read-only probes. ntfs needs ntfs3g's ntfsresize; btrfs needs a
+/// read-only mount (nologreplay never writes) for `filesystem usage`.
+fn probeFs(alloc: Allocator, io: std.Io, p: *PartInfo) void {
+    if (std.mem.startsWith(u8, p.fs, "ext")) {
+        const out = capture(alloc, io, &.{ "dumpe2fs", "-h", p.path }) orelse return;
+        const blocks = reportNum(out, "Block count") orelse return;
+        const free_blocks = reportNum(out, "Free blocks") orelse return;
+        const bsz = reportNum(out, "Block size") orelse return;
+        p.fs_size_bytes = blocks * bsz;
+        p.fs_free_bytes = free_blocks * bsz;
+    } else if (std.mem.eql(u8, p.fs, "ntfs")) {
+        const out = capture(alloc, io, &.{ "ntfsresize", "--info", "--force", p.path }) orelse return;
+        const cur = reportNum(out, "Current volume size") orelse return;
+        const min = reportNum(out, "You might resize at") orelse cur;
+        p.fs_size_bytes = cur;
+        p.fs_free_bytes = if (cur > min) cur - min else 0;
+    } else if (std.mem.eql(u8, p.fs, "btrfs")) {
+        // btrfs resizes only while mounted; nologreplay keeps it RO-safe.
+        const out = capture(alloc, io, &.{ "sh", "-c", std.fmt.allocPrint(alloc, "mkdir -p /run/gi-probe && mount -o ro,nologreplay {s} /run/gi-probe && btrfs filesystem usage -b /run/gi-probe; rc=$?; umount /run/gi-probe 2>/dev/null; exit $rc", .{p.path}) catch return }) orelse return;
+        const sz = reportNum(out, "Device size") orelse p.size_bytes;
+        const free = reportNum(out, "Free (estimated)") orelse return;
+        p.fs_size_bytes = sz;
+        p.fs_free_bytes = free;
+    }
+}
+
+/// Enumerate GPT/MBR partitions of one disk via sysfs + blkid.
+fn detectParts(alloc: Allocator, io: std.Io, name: []const u8) ![]const PartInfo {
+    var out: std.ArrayList(PartInfo) = .empty;
+    const disk_dir = try std.fmt.allocPrint(alloc, "/sys/block/{s}", .{name});
+    var dir = std.Io.Dir.cwd().openDir(io, disk_dir, .{ .iterate = true }) catch return out.items;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        const pnum_path = try std.fmt.allocPrint(alloc, "{s}/{s}/partition", .{ disk_dir, entry.name });
+        const num_raw = readSmall(alloc, io, pnum_path) orelse continue;
+        const num = std.fmt.parseInt(u32, trim(num_raw), 10) catch continue;
+        const start_raw = readSmall(alloc, io, try std.fmt.allocPrint(alloc, "{s}/{s}/start", .{ disk_dir, entry.name }));
+        const size_raw = readSmall(alloc, io, try std.fmt.allocPrint(alloc, "{s}/{s}/size", .{ disk_dir, entry.name }));
+        const start = if (start_raw) |r| std.fmt.parseInt(u64, trim(r), 10) catch 0 else 0;
+        const secs = if (size_raw) |r| std.fmt.parseInt(u64, trim(r), 10) catch 0 else 0;
+
+        var p: PartInfo = .{
+            .num = num,
+            .path = try std.fmt.allocPrint(alloc, "/dev/{s}", .{entry.name}),
+            .start_sector = start,
+            .size_bytes = secs * 512,
+        };
+        // blkid low-level probe: fs TYPE + PART_ENTRY_* GPT metadata.
+        if (capture(alloc, io, &.{ "blkid", "-p", "-o", "export", p.path })) |b| {
+            if (exportField(b, "TYPE")) |t| p.fs = try alloc.dupe(u8, t);
+            if (exportField(b, "PART_ENTRY_UUID")) |u| p.partuuid = try alloc.dupe(u8, u);
+            if (exportField(b, "PART_ENTRY_TYPE")) |t| {
+                // blkid prints the bare GUID (sometimes 0x-prefixed).
+                const tv = if (std.mem.startsWith(u8, t, "0x") or std.mem.startsWith(u8, t, "0X")) t[2..] else t;
+                p.esp = std.ascii.eqlIgnoreCase(tv, "c12a7328-f81f-11d2-ba4b-00a0c93ec93b");
+            }
+        }
+        probeFs(alloc, io, &p);
+        try out.append(alloc, p);
+    }
+    std.mem.sort(PartInfo, out.items, {}, struct {
+        fn lt(_: void, a: PartInfo, b: PartInfo) bool {
+            return a.num < b.num;
+        }
+    }.lt);
+    return out.items;
+}
+
+/// Unallocated regions of a GPT disk, computed from the partition map
+/// (no parted needed). Bounds are the standard usable range [34,
+/// sectors-34), each clamped to MiB alignment so sgdisk accepts them.
+fn freeRegions(alloc: Allocator, disk: *const DiskInfo) ![]const FreeRegion {
+    var gaps: std.ArrayList(FreeRegion) = .empty;
+    if (!std.mem.eql(u8, disk.label, "gpt")) return gaps.items;
+    const total_sectors = disk.size_bytes / 512;
+    if (total_sectors < 4096) return gaps.items;
+    const usable_end = total_sectors - 34;
+    var by_start: std.ArrayList(PartInfo) = .empty;
+    try by_start.appendSlice(alloc, disk.parts);
+    std.mem.sort(PartInfo, by_start.items, {}, struct {
+        fn lt(_: void, a: PartInfo, b: PartInfo) bool {
+            return a.start_sector < b.start_sector;
+        }
+    }.lt);
+    var cursor: u64 = 34;
+    for (by_start.items) |p| {
+        if (p.start_sector > cursor and p.start_sector > 0)
+            try gaps.append(alloc, .{ .start_sector = cursor, .end_sector = p.start_sector - 1 });
+        const end = p.start_sector + p.size_bytes / 512;
+        if (end > cursor) cursor = end;
+    }
+    if (usable_end > cursor) try gaps.append(alloc, .{ .start_sector = cursor, .end_sector = usable_end - 1 });
+    // MiB-align each gap.
+    var out: std.ArrayList(FreeRegion) = .empty;
+    for (gaps.items) |g| {
+        const s_aligned = (g.start_sector + 2047) / 2048 * 2048;
+        const e_aligned = (g.end_sector + 1) / 2048 * 2048;
+        if (e_aligned > s_aligned + 1)
+            try out.append(alloc, .{ .start_sector = s_aligned, .end_sector = e_aligned - 1 });
+    }
+    return out.items;
+}
+
 fn detectDisks(alloc: Allocator, io: std.Io) ![]const DiskInfo {
     var out: std.ArrayList(DiskInfo) = .empty;
     var dir = std.Io.Dir.cwd().openDir(io, "/sys/block", .{ .iterate = true }) catch return out.items;
@@ -238,12 +456,20 @@ fn detectDisks(alloc: Allocator, io: std.Io) ![]const DiskInfo {
         else
             false;
 
-        try out.append(alloc, .{
+        var di: DiskInfo = .{
             .name = try alloc.dupe(u8, name),
             .path = try std.fmt.allocPrint(alloc, "/dev/{s}", .{name}),
             .size_bytes = sectors * 512,
             .removable = removable,
-        });
+        };
+        // Table label (gpt/dos) + partition map: alongside needs both.
+        if (capture(alloc, io, &.{ "blkid", "-p", "-o", "export", di.path })) |b| {
+            if (exportField(b, "PTTYPE")) |t|
+                di.label = try alloc.dupe(u8, t);
+        }
+        di.parts = try detectParts(alloc, io, name);
+        di.free_regions = try freeRegions(alloc, &di);
+        try out.append(alloc, di);
     }
     return out.items;
 }
@@ -275,9 +501,19 @@ pub fn envFieldsJson(alloc: Allocator, env: *const Env, w: *std.Io.Writer) !void
     try w.writeAll("],\"disks\":[");
     for (env.disks, 0..) |d, i| {
         if (i > 0) try w.writeAll(",");
-        try w.print("{{\"name\":\"{s}\",\"path\":\"{s}\",\"size_gib\":{},\"removable\":{}}}", .{ d.name, d.path, d.size_bytes / (1 << 30), d.removable });
+        try w.print("{{\"name\":\"{s}\",\"path\":\"{s}\",\"size_gib\":{},\"removable\":{},\"label\":\"{s}\",\"parts\":[", .{ d.name, d.path, d.size_bytes / (1 << 30), d.removable, d.label });
+        for (d.parts, 0..) |p, j| {
+            if (j > 0) try w.writeAll(",");
+            try w.print("{{\"num\":{},\"path\":\"{s}\",\"fs\":\"{s}\",\"partuuid\":\"{s}\",\"esp\":{},\"start_sector\":{},\"size_mib\":{},\"fs_size_mib\":{},\"fs_free_mib\":{}}}", .{ p.num, p.path, p.fs, p.partuuid, p.esp, p.start_sector, p.size_bytes >> 20, p.fs_size_bytes >> 20, p.fs_free_bytes >> 20 });
+        }
+        try w.writeAll("],\"free\":[");
+        for (d.free_regions, 0..) |g, j| {
+            if (j > 0) try w.writeAll(",");
+            try w.print("{{\"start\":{},\"end\":{}}}", .{ g.start_sector, g.end_sector });
+        }
+        try w.writeAll("]}");
     }
-    try w.writeAll("],\"cpu_flags\":[");
+    try w.print("],\"os_hint\":\"{s}\",\"cpu_flags\":[", .{env.os_hint});
     for (env.cpu_flags, 0..) |f, i| {
         if (i > 0) try w.writeAll(",");
         try w.print("\"{s}\"", .{f});

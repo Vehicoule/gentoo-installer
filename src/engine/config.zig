@@ -458,10 +458,12 @@ fn stage3Init(cfg: *const Config) []const u8 {
     };
 }
 
+const detect = @import("detect.zig");
+
 /// VALIDATE: returns a list of violations (empty = valid). `env` may be
 /// null when hardware detection hasn't run (unattended dry-run still
-/// checks what it can).
-pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]const u8 {
+/// checks what it can); alongside's disk-level rules only fire with env.
+pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier, env: ?*const detect.Env) ![][]const u8 {
     var errs: std.ArrayList([]const u8) = .empty;
 
     if (cfg.disk.device.len == 0)
@@ -669,9 +671,9 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
     // the keymap-name charset.
     if (!keymapOk(cfg.system.keymap))
         try errs.append(alloc, fmt(alloc, "keymap '{s}' has characters outside the keymap charset", .{cfg.system.keymap}));
-    // zram needs an init backend: systemd-generator or OpenRC zram-init.
-    if (cfg.disk.swap == .zram and cfg.system.init != .systemd and cfg.system.init != .openrc)
-        try errs.append(alloc, "disk.swap=zram requires systemd or openrc (other init backends land in M6)");
+    // zram works on every init — systemd via zram-generator; all others
+    // run `openrc boot` in stage-1 which executes the generated
+    // init.d/zram runscript.
     // No official Gentoo binhost exists for riscv64.
     if (cfg.system.binhost and cfg.arch == .riscv64)
         try errs.append(alloc, "system.binhost has no upstream binpackages for riscv64");
@@ -758,6 +760,65 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
             try errs.append(alloc, "alongside+shrink requires disk.shrink_part");
         if (cfg.disk.space_src == .shrink and cfg.disk.shrink_mib == 0)
             try errs.append(alloc, "alongside+shrink requires disk.shrink_mib");
+        if (cfg.boot_mode == .bios)
+            try errs.append(alloc, "disk.scheme=alongside requires UEFI — BIOS chainloading of foreign OSes isn't supported; use a spare disk");
+        if (cfg.disk.boot_part)
+            try errs.append(alloc, "disk.boot_part is meaningless under alongside — the existing ESP is reused");
+        // bootctl unconditionally writes EFI/BOOT/BOOTX64.EFI — on a
+        // shared ESP that hijacks the firmware's fallback loader.
+        if (cfg.system.bootloader == .@"systemd-boot")
+            try errs.append(alloc, "scheme=alongside + systemd-boot is refused: bootctl always claims EFI/BOOT/BOOTX64.EFI on the shared ESP — pick limine/grub/efistub/rEFInd");
+        if (env) |e| blk: {
+            const disk = for (e.disks) |*di| {
+                if (std.mem.eql(u8, di.path, cfg.disk.device)) break di;
+            } else null;
+            const d = disk orelse {
+                try errs.append(alloc, fmt(alloc, "disk.device {s} not among detected disks", .{cfg.disk.device}));
+                break :blk;
+            };
+            if (!std.mem.eql(u8, d.label, "gpt"))
+                try errs.append(alloc, fmt(alloc, "disk.scheme=alongside requires a GPT disk (detected label: '{s}')", .{d.label}));
+            var esp: ?*const detect.PartInfo = null;
+            var shrink_p: ?*const detect.PartInfo = null;
+            for (d.parts) |*p| {
+                if (p.esp) esp = p;
+                if (std.mem.eql(u8, p.path, cfg.disk.shrink_part)) shrink_p = p;
+            }
+            if (esp == null)
+                try errs.append(alloc, fmt(alloc, "disk.scheme=alongside needs an existing ESP on {s} — none detected", .{cfg.disk.device}));
+            switch (cfg.disk.space_src) {
+                .shrink => {
+                    const p = shrink_p orelse {
+                        if (cfg.disk.shrink_part.len > 0)
+                            try errs.append(alloc, fmt(alloc, "disk.shrink_part {s} isn't a partition on {s}", .{ cfg.disk.shrink_part, cfg.disk.device }));
+                        break :blk;
+                    };
+                    if (std.mem.eql(u8, p.fs, "BitLocker"))
+                        try errs.append(alloc, fmt(alloc, "{s} is BitLocker — decrypt it in Windows first", .{p.path}))
+                    else if (std.mem.eql(u8, p.fs, "ntfs") or std.mem.startsWith(u8, p.fs, "ext") or std.mem.eql(u8, p.fs, "btrfs")) {
+                        if (p.fs_size_bytes == 0) {
+                            try errs.append(alloc, fmt(alloc, "couldn't probe free space on {s} ({s}) — the fs may be dirty; fsck/chkdsk it first", .{ p.path, p.fs }));
+                        } else {
+                            // fs must keep 512 MiB reserve past the shrink.
+                            const need = (@as(u64, cfg.disk.shrink_mib) + 512) << 20;
+                            if (p.fs_free_bytes < need)
+                                try errs.append(alloc, fmt(alloc, "{s} has only {} MiB free — shrink_mib {} + reserve won't fit", .{ p.path, p.fs_free_bytes >> 20, cfg.disk.shrink_mib }));
+                            if (cfg.disk.shrink_mib < 8192 + (if (cfg.disk.swap == .partition) cfg.disk.swap_mib else 0))
+                                try errs.append(alloc, fmt(alloc, "disk.shrink_mib must cover the install (≥8192 MiB{s})", .{if (cfg.disk.swap == .partition) " + swap_mib" else ""}));
+                        }
+                    } else
+                        try errs.append(alloc, fmt(alloc, "{s} is '{s}' — only ntfs/ext/btrfs shrink (xfs/f2fs/luks/lvm can't)", .{ p.path, p.fs }));
+                },
+                .@"free-space" => {
+                    const need: u64 = (8192 + @as(u64, if (cfg.disk.swap == .partition) cfg.disk.swap_mib else 0)) << 20;
+                    var ok = false;
+                    for (d.free_regions) |g| {
+                        if ((g.end_sector - g.start_sector + 1) * 512 >= need) ok = true;
+                    }
+                    if (!ok) try errs.append(alloc, fmt(alloc, "no contiguous free region ≥{} MiB on {s} — shrink a partition or pick another disk", .{ need >> 20, cfg.disk.device }));
+                },
+            }
+        }
     }
 
     if (cfg.boot_mode == .bios) {
@@ -813,6 +874,12 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
 
     if (cfg.security.secure_boot == .shim and resolveBootloader(cfg) != .grub)
         try errs.append(alloc, "secure_boot=shim is only supported with grub");
+    if (cfg.security.secure_boot == .shim and cfg.arch == .riscv64)
+        try errs.append(alloc, "secure_boot=shim needs a shim-signed arch — riscv64 has none; use secure_boot=sbctl");
+    // mokutil --root-pw enrolls with the root password — shim needs
+    // root to have one (a locked/hashless root has no enrollment cred).
+    if (cfg.security.secure_boot == .shim and (cfg.root.password_hash == null or cfg.root.lock_root))
+        try errs.append(alloc, "secure_boot=shim requires root.password — mokutil --root-pw uses it as the MOK enrollment password");
 
     if (cfg.system.privilege == .none and cfg.root.lock_root)
         try errs.append(alloc, "privilege=none with lock_root leaves no admin path");
@@ -864,6 +931,11 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier) ![][]
         try errs.append(alloc, "security.selinux=true requires hardening=hardened-selinux (policy + toolchain live in that stage3)");
     if (!cfg.security.selinux and cfg.security.hardening == .@"hardened-selinux")
         try errs.append(alloc, "security.selinux=false contradicts hardening=hardened-selinux — use hardening=hardened");
+
+    // dinit comes from the GURU overlay, keyworded ~amd64 only — nothing
+    // to emerge on other arches until a keyworded ebuild/overlay exists.
+    if (cfg.system.init == .dinit and cfg.arch != .amd64)
+        try errs.append(alloc, "init=dinit is amd64-only for now (GURU sys-apps/dinit is ~amd64)");
 
     // locale must be a member of locales
     var found = false;
@@ -1157,7 +1229,7 @@ test "validate rejects bios+systemd-boot" {
     , null);
     defer doc.deinit();
     const cfg = try decode(doc.arena.allocator(), doc);
-    const errs = try validate(doc.arena.allocator(), &cfg, null);
+    const errs = try validate(doc.arena.allocator(), &cfg, null, null);
     try std.testing.expect(errs.len > 0);
 }
 
@@ -1170,7 +1242,7 @@ test "validate rejects a short luks passphrase from a file" {
     , null);
     defer doc.deinit();
     const cfg = try decode(doc.arena.allocator(), doc);
-    const errs = try validate(doc.arena.allocator(), &cfg, null);
+    const errs = try validate(doc.arena.allocator(), &cfg, null, null);
     var seen = false;
     for (errs) |e| {
         if (std.mem.indexOf(u8, e, "luks_passphrase") != null) seen = true;
@@ -1195,7 +1267,7 @@ test "validate login-path proof" {
     , null);
     defer doc.deinit();
     const cfg = try decode(doc.arena.allocator(), doc);
-    const errs = try validate(doc.arena.allocator(), &cfg, null);
+    const errs = try validate(doc.arena.allocator(), &cfg, null, null);
     var has_login_err = false;
     for (errs) |e| {
         if (std.mem.indexOf(u8, e, "login path") != null) has_login_err = true;
@@ -1308,7 +1380,7 @@ fn validCfg(alloc: Allocator, src: []const u8) !struct { doc: toml.Document, cfg
     var doc = try toml.parse(alloc, src, null);
     errdefer doc.deinit();
     const cfg = try decode(doc.arena.allocator(), doc);
-    const errs = try validate(doc.arena.allocator(), &cfg, null);
+    const errs = try validate(doc.arena.allocator(), &cfg, null, null);
     return .{ .doc = doc, .cfg = cfg, .errs = errs };
 }
 
@@ -1410,10 +1482,110 @@ test "validate rejects bad stage3.variant charset" {
     , null);
     defer doc.deinit();
     const cfg = try decode(doc.arena.allocator(), doc);
-    const errs = try validate(doc.arena.allocator(), &cfg, null);
+    const errs = try validate(doc.arena.allocator(), &cfg, null, null);
     var seen = false;
     for (errs) |e| {
         if (std.mem.indexOf(u8, e, "variant") != null) seen = true;
     }
     try std.testing.expect(seen);
+}
+
+fn alongsideTestEnv(alloc: std.mem.Allocator) !detect.Env {
+    const parts = try alloc.dupe(detect.PartInfo, &.{
+        .{ .num = 1, .path = "/dev/sda1", .fs = "vfat", .partuuid = "ESP-UUID", .esp = true, .start_sector = 2048, .size_bytes = 512 << 20 },
+        .{ .num = 2, .path = "/dev/sda2", .fs = "ntfs", .partuuid = "P2", .start_sector = 1050624, .size_bytes = 100 << 30, .fs_size_bytes = 100 << 30, .fs_free_bytes = 60 << 30 },
+        .{ .num = 3, .path = "/dev/sda3", .fs = "xfs", .partuuid = "P3", .start_sector = 210766848, .size_bytes = 20 << 30, .fs_size_bytes = 20 << 30, .fs_free_bytes = 15 << 30 },
+    });
+    const disks = try alloc.dupe(detect.DiskInfo, &.{.{
+        .name = "sda",
+        .path = "/dev/sda",
+        .size_bytes = 256 << 30,
+        .removable = false,
+        .label = "gpt",
+        .parts = parts,
+        .free_regions = &.{.{ .start_sector = 260000768, .end_sector = 500000000 }},
+    }});
+    return .{
+        .boot_mode = .uefi,
+        .arch = .amd64,
+        .ram_mib = 8192,
+        .cpu_count = 2,
+        .cpu_vendor = "x",
+        .cpu_flags = &.{},
+        .nics = &.{},
+        .gpus = &.{},
+        .disks = disks,
+        .net_reachable = true,
+        .os_hint = "windows",
+    };
+}
+
+test "validate alongside: UEFI/GPT/ESP/shrinkable-fs rules" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const env = try alongsideTestEnv(alloc);
+
+    // happy path: shrink the ntfs part
+    var doc = try toml.parse(alloc,
+        \\boot_mode = "uefi"
+        \\arch = "amd64"
+        \\[disk]
+        \\device = "/dev/sda"
+        \\scheme = "alongside"
+        \\wipe = false
+        \\space_src = "shrink"
+        \\shrink_part = "/dev/sda2"
+        \\shrink_mib = 20000
+        \\swap = "zram"
+        \\[[users]]
+        \\name = "a"
+        \\password_hash = "$6$xyz"
+    , null);
+    defer doc.deinit();
+    const cfg = try decode(alloc, doc);
+    const ok = try validate(alloc, &cfg, null, &env);
+    for (ok) |e| std.debug.print("err: {s}\n", .{e});
+    try std.testing.expectEqual(@as(usize, 0), ok.len);
+
+    // BIOS refuses
+    var cfg2 = cfg;
+    cfg2.boot_mode = .bios;
+    const errs2 = try validate(alloc, &cfg2, null, &env);
+    var saw_bios = false;
+    for (errs2) |e| if (std.mem.indexOf(u8, e, "UEFI") != null) {
+        saw_bios = true;
+    };
+    try std.testing.expect(saw_bios);
+
+    // wipe=true refused
+    var cfg3 = cfg;
+    cfg3.disk.wipe = true;
+    const errs3 = try validate(alloc, &cfg3, null, &env);
+    var saw_wipe = false;
+    for (errs3) |e| if (std.mem.indexOf(u8, e, "wipe") != null) {
+        saw_wipe = true;
+    };
+    try std.testing.expect(saw_wipe);
+
+    // unshrinkable fs refused
+    var cfg4 = cfg;
+    cfg4.disk.shrink_part = "/dev/sda3"; // xfs
+    const errs4 = try validate(alloc, &cfg4, null, &env);
+    var saw_fs = false;
+    for (errs4) |e| if (std.mem.indexOf(u8, e, "xfs") != null or std.mem.indexOf(u8, e, "shrink") != null) {
+        saw_fs = true;
+    };
+    try std.testing.expect(saw_fs);
+
+    // free-space src uses the detected region
+    var cfg5 = cfg;
+    cfg5.disk.space_src = .@"free-space";
+    cfg5.disk.shrink_part = "";
+    const ok5 = try validate(alloc, &cfg5, null, &env);
+    try std.testing.expectEqual(@as(usize, 0), ok5.len);
+
+    // env=null → preview mode skips the env-gated checks
+    const ok6 = try validate(alloc, &cfg, null, null);
+    try std.testing.expectEqual(@as(usize, 0), ok6.len);
 }

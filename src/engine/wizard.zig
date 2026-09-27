@@ -92,9 +92,20 @@ fn cfg_space(w: *const Wizard) config.SpaceSrc {
     return w.cfg.disk.space_src;
 }
 fn hasOtherOs(w: *const Wizard) bool {
-    _ = w;
-    // OS probing lands with dual-boot (M6) — until then `alongside`
-    // stays hidden and unexecutable.
+    // UEFI-only feature; detection's os_hint lights up on ntfs/BitLocker
+    // or an existing ESP/linux root on the selected disk.
+    if (w.cfg.boot_mode != .uefi) return false;
+    const e = w.env orelse return false;
+    if (e.os_hint.len == 0) return false;
+    for (e.disks) |d| {
+        if (!std.mem.eql(u8, d.path, w.cfg.disk.device)) continue;
+        for (d.parts) |p| {
+            if (p.esp) return true;
+            if (std.mem.eql(u8, p.fs, "ntfs") or std.mem.eql(u8, p.fs, "BitLocker") or
+                std.mem.startsWith(u8, p.fs, "ext") or std.mem.eql(u8, p.fs, "btrfs")) return true;
+        }
+        return false;
+    }
     return false;
 }
 fn rootByPassword(w: *const Wizard) bool {
@@ -107,6 +118,10 @@ fn hasNvidia(w: *const Wizard) bool {
 }
 fn systemdInit(w: *const Wizard) bool {
     return w.cfg.system.init == .systemd;
+}
+fn systemdBootOk(w: *const Wizard) bool {
+    // bootctl claims EFI/BOOT/BOOTX64.EFI unconditionally — no shared ESP.
+    return w.cfg.system.init == .systemd and w.cfg.disk.scheme != .alongside;
 }
 fn notSystemd(w: *const Wizard) bool {
     return w.cfg.system.init != .systemd;
@@ -179,7 +194,7 @@ const disk_fields = [_]Field{
         .{ .v = "free-space", .label = "Use free space" },
         .{ .v = "shrink", .label = "Shrink a partition" },
     }, .visible = isAlongside },
-    .{ .name = "disk.shrink_part", .ftype = .string, .label = "Partition to shrink", .visible = shrinkSrc },
+    .{ .name = "disk.shrink_part", .ftype = .@"enum", .label = "Partition to shrink", .visible = shrinkSrc },
     .{ .name = "disk.shrink_mib", .ftype = .int, .label = "Shrink by (MiB)", .visible = shrinkSrc },
     // Free-form table for scheme=manual: one row per entry, fields
     // `size:type:name:fs:mount` (';' or newline separated). size is
@@ -256,7 +271,7 @@ const system_fields = [_]Field{
         .{ .v = "auto", .label = "Automatic (limine)", .help = "recommended — works on BIOS and UEFI" },
         .{ .v = "limine", .label = "Limine" },
         .{ .v = "grub", .label = "GRUB" },
-        .{ .v = "systemd-boot", .label = "systemd-boot", .visible = systemdInit },
+        .{ .v = "systemd-boot", .label = "systemd-boot", .visible = systemdBootOk },
         .{ .v = "efistub", .label = "efistub (firmware entry)", .visible = isUefi },
         .{ .v = "refind", .label = "rEFInd", .visible = isUefi },
     } },
@@ -511,7 +526,10 @@ pub const Wizard = struct {
         if (f.confirm) try out.writeAll(",\"confirm\":true");
         // disk.device options are the detected disks — dynamic.
         const dev_opts = std.mem.eql(u8, f.name, "disk.device");
-        if (f.options.len > 0 or dev_opts) {
+        // disk.shrink_part options are the detected shrinkable
+        // partitions on the selected disk — dynamic too.
+        const shrink_opts = std.mem.eql(u8, f.name, "disk.shrink_part");
+        if (f.options.len > 0 or dev_opts or shrink_opts) {
             try out.writeAll(",\"options\":[");
             var first = true;
             if (dev_opts and w.env != null) {
@@ -523,6 +541,24 @@ pub const Wizard = struct {
                     try out.writeAll("\",\"label\":\"");
                     jesc(out, d.name);
                     try out.print(" · {} GiB\"}}", .{d.size_bytes / (1 << 30)});
+                }
+            }
+            if (shrink_opts and w.env != null) {
+                for (w.env.?.disks) |d| {
+                    if (!std.mem.eql(u8, d.path, w.cfg.disk.device)) continue;
+                    for (d.parts) |p| {
+                        const shrinkable = std.mem.eql(u8, p.fs, "ntfs") or
+                            std.mem.startsWith(u8, p.fs, "ext") or std.mem.eql(u8, p.fs, "btrfs");
+                        if (!shrinkable) continue;
+                        if (!first) try out.writeAll(",");
+                        first = false;
+                        try out.writeAll("{\"v\":\"");
+                        jesc(out, p.path);
+                        try out.writeAll("\",\"label\":\"");
+                        const base = std.fs.path.basename(p.path);
+                        jesc(out, base);
+                        try out.print(" · {s} · {} GiB free\"}}", .{ p.fs, p.fs_free_bytes >> 30 });
+                    }
                 }
             }
             for (f.options) |o| {
@@ -1072,7 +1108,7 @@ pub const Wizard = struct {
     /// Errors whose field prefix belongs to `pg` — the whole-config
     /// validator stays the single source of truth.
     pub fn pageErrors(w: *Wizard, alloc: Allocator, nvidia: ?config.NvidiaTier, pg: *const Page) ![][]const u8 {
-        const all = try config.validate(alloc, &w.cfg, nvidia);
+        const all = try config.validate(alloc, &w.cfg, nvidia, if (w.env) |*e| e else null);
         var out: std.ArrayList([]const u8) = .empty;
         for (all) |e| {
             for (pg.prefixes) |p| {
@@ -1739,7 +1775,15 @@ fn setEnum(cfg: *Config, ef: EField, s: []const u8) WizardError!void {
         },
     }
     // keep derived flags consistent
-    if (ef.tag == .scheme) cfg.disk.scheme_explicit = true;
+    if (ef.tag == .scheme) {
+        cfg.disk.scheme_explicit = true;
+        // alongside never wipes; an erase scheme always does. Flipping
+        // keeps the pair valid instead of erroring at Review time.
+        if (cfg.disk.scheme == .alongside) {
+            cfg.disk.wipe = false;
+            cfg.disk.boot_part = false;
+        } else if (cfg.disk.scheme != .manual) cfg.disk.wipe = true;
+    }
     if (ef.tag == .init) {
         // musl-systemd stage3s exist (experimental upstream) — no libc
         // coercion. systemd-networkd does still require systemd.
