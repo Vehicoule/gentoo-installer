@@ -1117,6 +1117,17 @@ fn planChroot(alloc: Allocator) !Step {
     var c: std.ArrayList(Cmd) = .empty;
     for ([_][]const u8{ "/proc", "/sys", "/dev", "/run" }) |p|
         try c.append(alloc, argv(alloc, &.{ "mount", "--rbind", p, s(alloc, "/mnt/gentoo{s}", .{p}) }, s(alloc, "bind {s}", .{p})));
+    // Minimal/hand-rolled live envs can expose /dev/null & friends at 0600/0660
+    // root:root or lack devpts, which breaks portage's userpriv/userfetch
+    // children (they reopen os.devnull and allocate ptys). Normalize; no-op on
+    // regular live media.
+    try c.append(alloc, argv(alloc, &.{
+        "sh", "-c",
+        "chmod a+rw /mnt/gentoo/dev/null /mnt/gentoo/dev/zero /mnt/gentoo/dev/full" ++
+        " /mnt/gentoo/dev/random /mnt/gentoo/dev/urandom /mnt/gentoo/dev/tty 2>/dev/null; " ++
+        "mkdir -p /mnt/gentoo/dev/pts; " ++
+        "mountpoint -q /mnt/gentoo/dev/pts 2>/dev/null || mount -t devpts devpts /mnt/gentoo/dev/pts 2>/dev/null; :",
+    }, "normalize device nodes + devpts inside chroot"));
     try c.append(alloc, argv(alloc, &.{ "cp", "--dereference", "/etc/resolv.conf", "/mnt/gentoo/etc/" }, "dns into target"));
     try c.append(alloc, .{ .note = "subsequent chroot cmds run as: chroot /mnt/gentoo <cmd>" });
     return step(alloc, "enter-chroot", "Enter chroot", c);
