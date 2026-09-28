@@ -404,11 +404,24 @@ pub const Wizard = struct {
     /// computed by nextInFlow())
     page_idx: usize = 0,
     detected_boot: ?config.BootMode = null,
+    /// Cached `steps[]` payload for the review page — plan.build is not
+    /// cheap enough to run per emitPage (the TUI re-emits per keypress).
+    /// Invalidated on every config/env/preset mutation.
+    steps_json: ?[]u8 = null,
+
+    fn invalidateSteps(w: *Wizard) void {
+        if (w.steps_json) |s| w.alloc.free(s);
+        w.steps_json = null;
+    }
 
     pub fn init(alloc: Allocator, io: std.Io, cfg: Config) Wizard {
         var w = Wizard{ .alloc = alloc, .io = io, .cfg = cfg };
         w.applyExpressDefaults();
         return w;
+    }
+
+    pub fn deinit(w: *Wizard) void {
+        w.invalidateSteps();
     }
 
     /// Express flow picks the opinionated set the distro preset locks:
@@ -548,13 +561,19 @@ pub const Wizard = struct {
 
     /// The step ids+titles the review page previews — the resolved plan
     /// without its commands. Emit nothing when the config can't plan
-    /// (the validate event names why).
+    /// (the validate event names why). The fragment is cached — a TUI
+    /// redraw must not re-run the whole planner per keypress.
     fn emitSteps(w: *Wizard, out: *std.Io.Writer) !void {
+        if (w.steps_json) |c| {
+            try out.writeAll(c);
+            return;
+        }
         // Resolved only to list step ids+titles — plan allocations die
         // with this arena, the emitted JSON outlives nothing.
         var arena = std.heap.ArenaAllocator.init(w.alloc);
         defer arena.deinit();
         const a = arena.allocator();
+        var aw: std.Io.Writer.Allocating = .init(a);
         const ps = w.pkgSets(a) catch {
             try out.writeAll("]");
             return;
@@ -564,14 +583,19 @@ pub const Wizard = struct {
             return;
         };
         for (p.steps, 0..) |s, i| {
-            if (i > 0) try out.writeAll(",");
-            try out.writeAll("{\"id\":\"");
-            jesc(out, s.id);
-            try out.writeAll("\",\"title\":\"");
-            jesc(out, s.title);
-            try out.writeAll("\"}");
+            if (i > 0) try aw.writer.writeAll(",");
+            try aw.writer.writeAll("{\"id\":\"");
+            jesc(&aw.writer, s.id);
+            try aw.writer.writeAll("\",\"title\":\"");
+            jesc(&aw.writer, s.title);
+            try aw.writer.writeAll("\"}");
         }
-        try out.writeAll("]");
+        try aw.writer.writeAll("]");
+        const json = aw.written();
+        if (w.alloc.dupe(u8, json)) |d| {
+            w.steps_json = d;
+        } else |_| {}
+        try out.writeAll(json);
     }
 
     /// Grouped "label: value" summary of the whole config for the
@@ -823,6 +847,7 @@ pub const Wizard = struct {
         // it itself or the disk page can never validate on BIOS.
         if (w.flow == .express and w.cfg.boot_mode == .bios)
             w.cfg.disk.boot_part = true;
+        w.invalidateSteps();
     }
 
     /// Merge the attached preset's `[defaults]` under cfg and pin any
@@ -841,6 +866,7 @@ pub const Wizard = struct {
                 if (tomlToJson(w.alloc, tv)) |jv| setPath(w, path, jv) catch {};
             }
         }
+        w.invalidateSteps();
     }
 
     /// Does the preset lock this field? A locked field only accepts the
@@ -890,6 +916,7 @@ pub const Wizard = struct {
             w.page_idx = prev_page;
             return e;
         };
+        w.invalidateSteps();
     }
 
     /// Every locked path on the CURRENT cfg must equal the preset
@@ -1249,6 +1276,7 @@ pub const Wizard = struct {
         // Re-apply the probed env: implicit boot_mode/scheme follow the
         // live firmware exactly like they did before the file loaded.
         if (w.env) |e| w.applyEnv(e);
+        w.invalidateSteps();
         // jump to review
         for (pages, 0..) |pg, i| {
             if (std.mem.eql(u8, pg.id, "review")) {
@@ -2395,6 +2423,7 @@ test "every page emits valid JSON in both flows" {
     const alloc = arena.allocator();
     inline for (.{ Flow.express, Flow.advanced }) |fl| {
         var w = testWizard();
+        defer w.deinit();
         w.flow = fl;
         w.cfg.disk.luks = true; // widen visible field set
         w.cfg.disk.luks_passphrase = "sup3rsecret";
@@ -2648,4 +2677,18 @@ test "export refuses an existing symlink that escapes cwd" {
     std.Io.Dir.cwd().symLink(testing.io, "/etc/passwd", link, .{}) catch return;
     defer std.Io.Dir.cwd().deleteFile(testing.io, link) catch {};
     try testing.expectError(error.PathEscape, w.exportAnswer(link));
+}
+
+test "errorPage attributes errors to their owning page" {
+    // manual-table errors carry the disk.partitions: lead — they belong
+    // to installation type, not the page the substring happens to name
+    try testing.expectEqualStrings("install_type", errorPage("disk.partitions: scheme=manual needs at least one entry").?);
+    try testing.expectEqualStrings("install_type", errorPage("disk.partitions: the EF00 ESP row needs fs=\"vfat\"").?);
+    try testing.expectEqualStrings("install_type", errorPage("disk.partitions: BIOS boot needs a type=\"EF02\" biosboot partition (grub and limine both embed stage2 there — GPT has no post-MBR gap)").?);
+    try testing.expectEqualStrings("install_type", errorPage("disk.partitions: GRUB + LUKS under scheme=manual needs a mount=\"/boot\" row — grub cannot read kernels inside the encrypted root").?);
+    // field tokens land on their owning page too
+    try testing.expectEqualStrings("disk", errorPage("disk.device is required (e.g. /dev/vda)").?);
+    try testing.expectEqualStrings("accounts", errorPage("no surviving login path: set a password_hash, or sshd=true plus ssh_authorized_keys").?);
+    // unscoped: no prefix and no field name → null, frontends gate-show
+    try testing.expect(errorPage("stage3 tarball is too small to be a system") == null);
 }

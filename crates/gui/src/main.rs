@@ -2,7 +2,7 @@
 //! protocol (docs/protocol.md). The Zig engine is spawned as a subprocess;
 //! ops go to its stdin, events arrive on stdout.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
@@ -182,7 +182,8 @@ struct Installer {
     log: Vec<String>,
     req_seq: u64,                       // monotonic request ids for set correlation
     pending_sets: HashMap<u64, String>, // req -> field; rejected sets restore engine truth
-    last_answer_req: Option<u64>,       // newest outstanding answer_file set
+    pending_gates: HashSet<u64>, // req -> whole-config gate op (plan); a validate carrying one unscopes its errors
+    last_answer_req: Option<u64>, // newest outstanding answer_file set
 }
 
 impl Installer {
@@ -334,6 +335,7 @@ impl cosmic::app::Application for Installer {
             log: vec![format!("spawn {}", engine_binary())],
             req_seq: 0,
             pending_sets: HashMap::new(),
+            pending_gates: HashSet::new(),
             last_answer_req: None,
         };
         (app, Task::none())
@@ -525,7 +527,16 @@ impl cosmic::app::Application for Installer {
                     // `validate`+errors, not `error` — leave Pending or the
                     // UI would sit on 'Starting install…' forever; that gate
                     // applies to the whole config so all errors surface
-                    let gate = matches!(self.phase, Phase::Pending) && !errs.is_empty();
+                    // an install/plan refusal is a whole-config gate —
+                    // the Pending phase covers install; plan/export go
+                    // out req-tagged so this validate answers them
+                    let gate_req = v
+                        .get("req")
+                        .and_then(Value::as_u64)
+                        .map(|r| self.pending_gates.remove(&r))
+                        .unwrap_or(false);
+                    let gate =
+                        (matches!(self.phase, Phase::Pending) || gate_req) && !errs.is_empty();
                     self.errors = if v.get("ok").and_then(Value::as_bool) == Some(true) {
                         Vec::new()
                     } else {
@@ -709,7 +720,12 @@ impl cosmic::app::Application for Installer {
             }
             Message::Plan => {
                 if self.flush_secrets() {
-                    send_op(json!({"op": "plan"}));
+                    // req-tagged: a refused plan comes back as
+                    // `validate`+errors — the tag marks it a
+                    // whole-config gate so its errors surface unscoped
+                    self.req_seq += 1;
+                    self.pending_gates.insert(self.req_seq);
+                    send_op(json!({"op": "plan", "req": self.req_seq}));
                 }
             }
             Message::Install => {

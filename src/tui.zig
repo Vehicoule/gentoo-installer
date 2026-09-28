@@ -67,6 +67,9 @@ pub const Tui = struct {
     scroll: usize = 0,
     /// pending digit for the `g<N>` nav jump — 0 = no jump armed.
     goto_armed: bool = false,
+    /// set by the review-page whole-config gate — refreshErrors shows
+    /// every error, not just this page's, until the user navigates.
+    gate_errors: bool = false,
 
     pub fn init(alloc: Allocator, io: std.Io) Tui {
         return .{
@@ -315,9 +318,10 @@ pub const Tui = struct {
         const mine = try t.wiz.pageErrors(fa, nvidiaTier(&t.wiz), t.wiz.currentPage());
         t.errors.clearRetainingCapacity();
         // only this page's errors surface — global noise on every
-        // screen is the incoherence we're removing.
+        // screen is the incoherence we're removing; a pending gate
+        // (review's install/export refusal) lists the whole config.
         for (errs) |e| {
-            var on_page = false;
+            var on_page = t.gate_errors;
             for (mine) |m| {
                 if (std.mem.eql(u8, e, m)) on_page = true;
             }
@@ -326,6 +330,7 @@ pub const Tui = struct {
     }
 
     fn doNext(t: *Tui) !void {
+        t.gate_errors = false;
         if (try t.wiz.next(t.alloc, nvidiaTier(&t.wiz))) {
             t.focus = 0;
             t.errors.clearRetainingCapacity();
@@ -348,6 +353,7 @@ pub const Tui = struct {
         var aw: std.Io.Writer.Allocating = .init(t.alloc);
         defer aw.deinit();
         t.wiz.gotoPage(&aw.writer, null, id) catch return;
+        t.gate_errors = false;
         t.focus = 0;
         t.scroll = 0;
         try t.refreshPage();
@@ -358,6 +364,7 @@ pub const Tui = struct {
             try t.doNext();
         } else if (std.mem.eql(u8, act, "back")) {
             t.wiz.back();
+            t.gate_errors = false;
             t.focus = 0;
             try t.refreshPage();
         } else if (std.mem.eql(u8, act, "quit")) {
@@ -385,6 +392,10 @@ pub const Tui = struct {
         if (errs.len == 0) return true;
         t.errors.clearRetainingCapacity();
         for (errs) |e| try t.errors.append(t.alloc, .{ .field = wizard.errorField(e), .msg = e, .on_page = true });
+        // refreshErrors runs per keypress — without this flag it would
+        // re-scope the gate list to the review page (no prefixes → all
+        // hidden) and the user couldn't see what blocks the install.
+        t.gate_errors = true;
         t.status = "fix the listed problems first";
         return false;
     }
@@ -578,7 +589,9 @@ fn drawRail(t: *Tui, win: vaxis.Window, fa: Allocator, h: u16) !void {
         const sty: vaxis.Style = if (cur) accent else if (done_) ok_style else dim;
         // clip long titles rather than bleeding over the divider
         const title = if (n.title.len > 17) n.title[0..16] else n.title;
-        const ln = try std.fmt.allocPrint(fa, " {d} {s} {s}", .{ i + 1, glyph, title });
+        // tenth entry shows 0 — the key handler maps '0' to index 9,
+        // and only single digits are accepted
+        const ln = try std.fmt.allocPrint(fa, " {d} {s} {s}", .{ (i + 1) % 10, glyph, title });
         _ = win.print(&.{.{ .text = ln, .style = sty }}, .{ .row_offset = row });
         row += 1;
     }
@@ -704,7 +717,7 @@ fn draw(t: *Tui, win: vaxis.Window) !void {
             if (li >= t.scroll and row < h -| 7) {
                 var gi: []const u8 = "";
                 for (t.pv.nav, 0..) |n, i| {
-                    if (std.mem.eql(u8, n.id, g.edit)) gi = try std.fmt.allocPrint(fa, "  (g{d} to edit)", .{i + 1});
+                    if (std.mem.eql(u8, n.id, g.edit)) gi = try std.fmt.allocPrint(fa, "  (g{d} to edit)", .{(i + 1) % 10});
                 }
                 _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " {s}{s}", .{ g.title, gi }), .style = accent }}, .{ .row_offset = row, .col_offset = cx });
                 row += 1;
@@ -808,7 +821,14 @@ fn draw(t: *Tui, win: vaxis.Window) !void {
         if (!e.on_page) continue;
         const unattributed = e.field == null or !fieldOnPage(t.pv, e.field.?);
         if (!unattributed) continue;
-        if (n_banner > 2) break;
+        if (n_banner > 2) {
+            var more: usize = 0;
+            for (t.errors.items) |e2| {
+                if (e2.on_page and (e2.field == null or !fieldOnPage(t.pv, e2.field.?))) more += 1;
+            }
+            _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, "  … {} problems", .{more}), .style = err_style }}, .{ .row_offset = h -| 6 + n_banner, .col_offset = cx });
+            break;
+        }
         _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " {s}", .{e.msg}), .style = err_style }}, .{ .row_offset = h -| 6 + n_banner, .col_offset = cx });
         n_banner += 1;
     }
