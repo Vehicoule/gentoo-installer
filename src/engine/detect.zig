@@ -501,7 +501,7 @@ pub fn envFieldsJson(alloc: Allocator, env: *const Env, w: *std.Io.Writer) !void
     try w.writeAll("],\"disks\":[");
     for (env.disks, 0..) |d, i| {
         if (i > 0) try w.writeAll(",");
-        try w.print("{{\"name\":\"{s}\",\"path\":\"{s}\",\"size_gib\":{},\"removable\":{},\"label\":\"{s}\",\"parts\":[", .{ d.name, d.path, d.size_bytes / (1 << 30), d.removable, d.label });
+        try w.print("{{\"name\":\"{s}\",\"path\":\"{s}\",\"size_gib\":{},\"size_mib\":{},\"removable\":{},\"label\":\"{s}\",\"parts\":[", .{ d.name, d.path, d.size_bytes / (1 << 30), d.size_bytes >> 20, d.removable, d.label });
         for (d.parts, 0..) |p, j| {
             if (j > 0) try w.writeAll(",");
             try w.print("{{\"num\":{},\"path\":\"{s}\",\"fs\":\"{s}\",\"partuuid\":\"{s}\",\"esp\":{},\"start_sector\":{},\"size_mib\":{},\"fs_size_mib\":{},\"fs_free_mib\":{}}}", .{ p.num, p.path, p.fs, p.partuuid, p.esp, p.start_sector, p.size_bytes >> 20, p.fs_size_bytes >> 20, p.fs_free_bytes >> 20 });

@@ -662,7 +662,14 @@ fn drawModal(t: *Tui, win: vaxis.Window, fa: Allocator, w: u16, h: u16) !void {
     if (t.wiz.env) |env| {
         for (env.disks) |d| {
             if (std.mem.eql(u8, d.path, dev)) {
-                dev_line = try std.fmt.allocPrint(fa, "{s} · {} GiB{s}", .{ dev, d.size_bytes / (1 << 30), if (d.removable) " (removable)" else "" });
+                // match the disk list's precision — sub-GiB disks read
+                // MiB, not "0 GiB"
+                dev_line = if (d.size_bytes >= (1 << 30))
+                    try std.fmt.allocPrint(fa, "{s} · {} GiB{s}", .{ dev, d.size_bytes / (1 << 30), if (d.removable) " (removable)" else "" })
+                else if (d.size_bytes > 0)
+                    try std.fmt.allocPrint(fa, "{s} · {} MiB{s}", .{ dev, d.size_bytes >> 20, if (d.removable) " (removable)" else "" })
+                else
+                    dev;
                 break;
             }
         }
@@ -1092,7 +1099,7 @@ fn renderValue(w: *std.Io.Writer, f: FieldView, t: *Tui, i: usize) !void {
             }
         },
         .object => try w.writeAll("{…}"),
-        else => try w.writeAll("(unset)"),
+        else => try w.writeAll("(not set)"),
     }
 }
 

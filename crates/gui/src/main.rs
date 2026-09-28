@@ -184,7 +184,7 @@ struct Installer {
     pending_sets: HashMap<u64, String>, // req -> field; rejected sets restore engine truth
     pending_gates: HashSet<u64>, // req -> whole-config gate op (plan); a validate carrying one unscopes its errors
     last_answer_req: Option<u64>, // newest outstanding answer_file set
-    /// detected disks from the `env` event — path → GiB size, so the
+    /// detected disks from the `env` event — path → MiB size, so the
     /// destructive confirm panel can say what it's wiping.
     disks: HashMap<String, u64>,
     /// current page index + count from the page event — rail footer.
@@ -389,7 +389,16 @@ impl cosmic::app::Application for Installer {
                                 .filter_map(|d| {
                                     Some((
                                         d.get("path").and_then(Value::as_str)?.to_string(),
-                                        d.get("size_gib").and_then(Value::as_u64)?,
+                                        // prefer MiB — a sub-GiB disk
+                                        // floors to "0 GiB" and reads
+                                        // as broken
+                                        d.get("size_mib").and_then(Value::as_u64).or_else(
+                                            || {
+                                                d.get("size_gib")
+                                                    .and_then(Value::as_u64)
+                                                    .map(|g| g * 1024)
+                                            },
+                                        )?,
                                     ))
                                 })
                                 .collect()
@@ -1070,11 +1079,12 @@ impl Installer {
                     .unwrap_or(&self.disk_device)
                     .to_string();
                 let dev = self.disk_device.clone();
-                // "25 GiB" says what is being erased — the bare path is
+                // the size says what is being erased — the bare path is
                 // too easy to skim past
                 let dev_shown = match self.disks.get(&dev) {
-                    Some(g) => format!("{dev} · {g} GiB"),
-                    None => dev.clone(),
+                    Some(&m) if m >= 1024 => format!("{dev} · {} GiB", m / 1024),
+                    Some(&m) if m > 0 => format!("{dev} · {m} MiB"),
+                    _ => dev.clone(),
                 };
                 let mut panel = widget::column::with_capacity(3).spacing(spacing.space_xs);
                 panel = panel.push(
@@ -1119,16 +1129,18 @@ impl Installer {
                     "install" => {
                         let dry = widget::button::standard("Dry run").on_press(Message::DryRun);
                         row = row.push(dry);
-                        let b = widget::button::destructive("Install");
                         let base = self
                             .disk_device
                             .rsplit('/')
                             .next()
                             .unwrap_or(&self.disk_device);
+                        // destructive styling only when armed — an
+                        // unarmed red button reads as clickable while
+                        // the gate silently eats the click
                         if !base.is_empty() && self.install_confirm == base {
-                            b.on_press(Message::Install)
+                            widget::button::destructive("Install").on_press(Message::Install)
                         } else {
-                            b
+                            widget::button::standard("Install")
                         }
                     }
                     _ => continue,
