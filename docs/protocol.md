@@ -75,7 +75,7 @@ journal. (`repair` in-protocol is the same engine path as the
 | `env` | `boot`, `arch`, `ram_mib`, `net`, `disks[]`, `oses[]`, `esps[]`, `gpus[]`, `live_media` | after `detect`; also pushed when hotplug changes disks |
 | `config` | `config` (secrets masked) | `get_config` reply |
 | `page` | `page` (name), `index`, `of`, `title`, `section`, `subtitle`, `nav[]`, `fields[]`, `actions[]`; review adds `summary[]`, `steps[]` | navigation replies |
-| `validate` | `errors[]{field?,message}`, `warnings[]` | after `set`, `next`, `validate` |
+| `validate` | `errors[]{field?,page?,message}`, `warnings[]` | after `set`, `next`, `validate` |
 | `plan` | `ops[]` (the partitioning doc's op list), `cmds[]` preview | `plan` reply |
 | `step` | `i`, `of`, `name`, `state`(started/done/failed/skipped), `secs?` | pipeline progress |
 | `progress` | `step`, `bytes?`, `pct?`, `label` | sub-step detail (downloads, rsync, emerge ETA) |
@@ -125,9 +125,11 @@ they render read-only, off-flow pages are unreachable by `goto`) — and
 `steps[]` — `{id, title}` of every plan step,
 so the install view can draw the timeline before `step` events arrive.
 
-`validate` errors carry `field`: the dotted config path the message
-belongs to (frontend renders it under that field), or `null` for
-page-level errors rendered as a banner.
+`validate` errors carry `field` (the dotted config path the message
+belongs to — render under that input) and `page` (the wizard page that
+owns the fix — frontends show the error only there); both may be `null`
+for unscoped/global errors, which frontends surface at the
+whole-config gate (install/export refusal) rather than on a page.
 
 ## Secrets
 

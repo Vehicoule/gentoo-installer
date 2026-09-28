@@ -354,6 +354,28 @@ pub fn errorField(err: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Owning page id for a whole-config validate error — the same
+/// attribution pageErrors applies in-process, exposed on the wire so
+/// headless frontends can scope errors to the page that can fix them.
+/// Prefix match mirrors pageErrors; a schema-field token falls back
+/// to the field's owning page. null = unscoped (frontends surface it
+/// only at the whole-config gate).
+pub fn errorPage(err: []const u8) ?[]const u8 {
+    for (pages) |pg| {
+        for (pg.prefixes) |p| {
+            if (std.mem.indexOf(u8, err, p) != null) return pg.id;
+        }
+    }
+    if (errorField(err)) |f| {
+        for (pages) |pg| {
+            for (pg.fields) |fld| {
+                if (std.mem.eql(u8, fld.name, f)) return pg.id;
+            }
+        }
+    }
+    return null;
+}
+
 pub const pages = [_]Page{
     .{ .id = "welcome", .title = "Welcome", .section = "Get started", .subtitle = "keyboard + install mode", .essential = true, .fields = &welcome_fields, .prefixes = &.{"system.keymap"} },
     .{ .id = "disk", .title = "Disk", .section = "Storage", .subtitle = "pick the disk Gentoo installs onto", .essential = true, .fields = &disk_fields, .prefixes = &.{ "disk.device", "boot_mode" } },
@@ -433,20 +455,20 @@ pub const Wizard = struct {
     /// `next` / `back`, so a schema lookup can't park the wizard on an
     /// unvalidated page. Off-flow pages emit `"index":0`.
     pub fn emitPage(w: *Wizard, out: *std.Io.Writer, req: ?u64, name: ?[]const u8) !void {
-        var pg = w.currentPage();
-        var idx: usize = w.flowIndex() + 1; // 1-based; 0 = outside the flow
+        var pi: usize = w.page_idx;
         if (name) |nm| {
-            var pi: ?usize = null;
+            var found: ?usize = null;
             for (pages, 0..) |p2, i| {
                 if (std.mem.eql(u8, p2.id, nm)) {
-                    pi = i;
+                    found = i;
                     break;
                 }
             }
-            const p2 = pi orelse return error.BadValue;
-            pg = &pages[p2];
-            idx = if (w.flowPos(p2)) |v| v + 1 else 0;
+            pi = found orelse return error.BadValue;
         }
+        const pg = &pages[pi];
+        const fpos = w.flowPos(pi); // null = outside the current flow
+        const idx: usize = if (fpos) |v| v + 1 else 0;
         try out.writeAll("{\"ev\":\"page\",");
         if (req) |r| try out.print("\"req\":{},", .{r});
         try out.print("\"page\":\"{s}\",\"index\":{},\"of\":{},\"title\":\"", .{ pg.id, idx, w.flowLen() });
@@ -478,7 +500,7 @@ pub const Wizard = struct {
             try out.writeAll("]");
         }
         try out.writeAll(",\"actions\":[");
-        try w.emitActions(out);
+        try w.emitActions(out, fpos, pi);
         try out.writeAll("]}\n");
     }
 
@@ -636,11 +658,18 @@ pub const Wizard = struct {
         return 0;
     }
 
-    fn emitActions(w: *const Wizard, out: *std.Io.Writer) !void {
-        const last = w.flowIndex() == w.flowLen() - 1;
+    /// Actions for the *emitted* page — `fpos` is its flow position
+    /// (null on an off-flow peek) and `pi` its `pages` index, so a peek
+    /// never reports the current page's buttons.
+    fn emitActions(w: *const Wizard, out: *std.Io.Writer, fpos: ?usize, pi: usize) !void {
+        const pos = fpos orelse {
+            // off-flow peek — no flow position to navigate from/to
+            try out.writeAll("\"back\",\"quit\"");
+            return;
+        };
         try out.writeAll("\"back\"");
-        if (w.page_idx == 0) try out.writeAll(",\"quit\"");
-        if (!last) {
+        if (pi == 0) try out.writeAll(",\"quit\"");
+        if (pos < w.flowLen() - 1) {
             try out.writeAll(",\"next\"");
         } else {
             // review page
@@ -679,7 +708,11 @@ pub const Wizard = struct {
                     jesc(out, d.path);
                     try out.writeAll("\",\"label\":\"");
                     jesc(out, d.name);
-                    try out.print(" · {} GiB\"}}", .{d.size_bytes / (1 << 30)});
+                    if (d.size_bytes / (1 << 30) > 0) {
+                        try out.print(" · {} GiB\"}}", .{d.size_bytes / (1 << 30)});
+                    } else {
+                        try out.print(" · {} MiB\"}}", .{d.size_bytes / (1 << 20)});
+                    }
                 }
             }
             if (shrink_opts and w.env != null) {
@@ -696,7 +729,11 @@ pub const Wizard = struct {
                         try out.writeAll("\",\"label\":\"");
                         const base = std.fs.path.basename(p.path);
                         jesc(out, base);
-                        try out.print(" · {s} · {} GiB free\"}}", .{ p.fs, p.fs_free_bytes >> 30 });
+                        if (p.fs_free_bytes >> 30 > 0) {
+                            try out.print(" · {s} · {} GiB free\"}}", .{ p.fs, p.fs_free_bytes >> 30 });
+                        } else {
+                            try out.print(" · {s} · {} MiB free\"}}", .{ p.fs, p.fs_free_bytes >> 20 });
+                        }
                     }
                 }
             }

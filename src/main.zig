@@ -767,6 +767,14 @@ fn writeValidate(out: *std.Io.Writer, req: ?u64, errs: []const []const u8) !void
         } else {
             try out.writeAll("null");
         }
+        try out.writeAll(",\"page\":");
+        if (engine.wizard.errorPage(e)) |pgid| {
+            try out.writeAll("\"");
+            jsonEsc(out, pgid);
+            try out.writeAll("\"");
+        } else {
+            try out.writeAll("null");
+        }
         try out.writeAll(",\"message\":\"");
         jsonEsc(out, e);
         try out.writeAll("\"}");

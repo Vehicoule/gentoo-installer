@@ -134,6 +134,26 @@ struct NavItem {
     state: String,
 }
 
+/// One `validate` error. The engine attributes each to its owning
+/// wizard page (`page`); entries with `local` are GUI-generated and
+/// always render wherever they were raised. A null `page` (unscoped
+/// engine error) stays hidden until the whole-config gate fires.
+struct VErr {
+    message: String,
+    page: Option<String>,
+    local: bool,
+}
+
+impl VErr {
+    fn local(message: String) -> Self {
+        Self {
+            message,
+            page: None,
+            local: true,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Phase {
     Boot,    // waiting for hello/env
@@ -157,7 +177,8 @@ struct Installer {
     steps: Vec<Step>,
     nav: Vec<NavItem>, // page rail mirrored from the engine's nav state
     plan: Option<String>,
-    errors: Vec<String>,
+    errors: Vec<VErr>,
+    errors_unscoped: bool, // install/export gate showed every error, not just this page's
     log: Vec<String>,
     req_seq: u64,                       // monotonic request ids for set correlation
     pending_sets: HashMap<u64, String>, // req -> field; rejected sets restore engine truth
@@ -240,8 +261,9 @@ impl Installer {
                     .map(String::as_str)
                     .unwrap_or("");
                 if c != val.as_str() {
-                    self.errors
-                        .push(format!("confirmation does not match for {name}"));
+                    self.errors.push(VErr::local(format!(
+                        "confirmation does not match for {name}"
+                    )));
                     ok = false;
                 }
             }
@@ -308,6 +330,7 @@ impl cosmic::app::Application for Installer {
             nav: Vec::new(),
             plan: None,
             errors: Vec::new(),
+            errors_unscoped: false,
             log: vec![format!("spawn {}", engine_binary())],
             req_seq: 0,
             pending_sets: HashMap::new(),
@@ -332,7 +355,8 @@ impl cosmic::app::Application for Installer {
                 } else if l == "__eof" {
                     self.phase = Phase::Dead;
                 } else if let Some(e) = l.strip_prefix("__spawn_error:") {
-                    self.errors.push(format!("cannot start engine: {e}"));
+                    self.errors
+                        .push(VErr::local(format!("cannot start engine: {e}")));
                 } else if let Some(e) = l.strip_prefix("__stderr:") {
                     self.log.push(format!("engine: {e}"));
                     if self.log.len() > 64 {
@@ -356,6 +380,7 @@ impl cosmic::app::Application for Installer {
                     let changed = self.page.as_ref().and_then(|p| p.get("page")) != v.get("page");
                     if changed {
                         self.errors.clear();
+                        self.errors_unscoped = false;
                     }
                     // disk.device isn't on the review page — remember the
                     // engine-side value so Install can confirm it later.
@@ -468,26 +493,46 @@ impl cosmic::app::Application for Installer {
                     self.page = Some(v);
                 }
                 Some("validate") => {
-                    self.errors = v
+                    let errs: Vec<VErr> = v
                         .get("errors")
                         .and_then(Value::as_array)
                         .map(|a| {
                             a.iter()
                                 .filter_map(|e| {
-                                    e.as_str()
-                                        .or_else(|| e.get("message").and_then(Value::as_str))
-                                        .map(String::from)
+                                    if let Some(s) = e.as_str() {
+                                        return Some(VErr {
+                                            message: s.to_string(),
+                                            page: None,
+                                            local: false,
+                                        });
+                                    }
+                                    Some(VErr {
+                                        message: e
+                                            .get("message")
+                                            .and_then(Value::as_str)?
+                                            .to_string(),
+                                        page: e
+                                            .get("page")
+                                            .and_then(Value::as_str)
+                                            .map(String::from),
+                                        local: false,
+                                    })
                                 })
                                 .collect()
                         })
                         .unwrap_or_default();
-                    if v.get("ok").and_then(Value::as_bool) == Some(true) {
-                        self.errors.clear();
-                    }
                     // an install the engine's validation refuses arrives as
                     // `validate`+errors, not `error` — leave Pending or the
-                    // UI would sit on 'Starting install…' forever
-                    if matches!(self.phase, Phase::Pending) && !self.errors.is_empty() {
+                    // UI would sit on 'Starting install…' forever; that gate
+                    // applies to the whole config so all errors surface
+                    let gate = matches!(self.phase, Phase::Pending) && !errs.is_empty();
+                    self.errors = if v.get("ok").and_then(Value::as_bool) == Some(true) {
+                        Vec::new()
+                    } else {
+                        errs
+                    };
+                    self.errors_unscoped = gate;
+                    if gate {
                         self.phase = Phase::Wizard;
                     }
                 }
@@ -552,12 +597,15 @@ impl cosmic::app::Application for Installer {
                             send_op(json!({"op": "page"}));
                         }
                     }
-                    self.errors.push(
-                        v.get("error")
+                    self.errors.push(VErr {
+                        message: v
+                            .get("error")
                             .and_then(Value::as_str)
                             .unwrap_or("unknown")
                             .to_string(),
-                    );
+                        page: None,
+                        local: true,
+                    });
                     // doInstall reports failure via `error` and returns
                     // without a `done` — don't leave the UI on Installing…
                     if matches!(self.phase, Phase::Pending | Phase::Running) {
@@ -666,8 +714,9 @@ impl cosmic::app::Application for Installer {
             }
             Message::Install => {
                 if self.last_answer_req.is_some() {
-                    self.errors
-                        .push("answer file is loading — wait for the Review refresh".into());
+                    self.errors.push(VErr::local(
+                        "answer file is loading — wait for the Review refresh".into(),
+                    ));
                     return Task::none();
                 }
                 if !self.flush_secrets() {
@@ -678,8 +727,9 @@ impl cosmic::app::Application for Installer {
                 let dev = self.disk_device.clone();
                 let confirm = dev.rsplit('/').next().unwrap_or(&dev).to_string();
                 if self.install_confirm != confirm || confirm.is_empty() {
-                    self.errors
-                        .push(format!("type '{confirm}' to confirm the install"));
+                    self.errors.push(VErr::local(format!(
+                        "type '{confirm}' to confirm the install"
+                    )));
                     return Task::none();
                 }
                 // reset the seeded timeline — step events light it up by id
@@ -694,8 +744,9 @@ impl cosmic::app::Application for Installer {
             }
             Message::DryRun => {
                 if self.last_answer_req.is_some() {
-                    self.errors
-                        .push("answer file is loading — wait for the Review refresh".into());
+                    self.errors.push(VErr::local(
+                        "answer file is loading — wait for the Review refresh".into(),
+                    ));
                     return Task::none();
                 }
                 // dry-run needs no confirm token — the engine skips
@@ -822,7 +873,7 @@ impl Installer {
             }
         }
         for e in &self.errors {
-            col = col.push(error_text(e));
+            col = col.push(error_text(&e.message));
         }
         if let Some(plan) = &self.plan {
             col = col
@@ -962,8 +1013,20 @@ impl Installer {
             col = col.push(row);
         }
 
-        for e in &self.errors {
-            col = col.push(error_text(e));
+        // only this page's errors surface — engine-attributed via
+        // `page`, GUI-local always; the whole-config gate shows all
+        let cur_id = self
+            .page
+            .as_ref()
+            .and_then(|p| p.get("page"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        for e in self
+            .errors
+            .iter()
+            .filter(|e| self.errors_unscoped || e.local || e.page.as_deref() == Some(cur_id))
+        {
+            col = col.push(error_text(&e.message));
         }
         if let Some(plan) = &self.plan {
             col = col
