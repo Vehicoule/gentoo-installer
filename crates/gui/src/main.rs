@@ -114,14 +114,15 @@ enum Message {
     Plan,
     /// Enter pressed in a text field — used to commit answer_file loads.
     Submit(String),
-    /// Sidebar rail entry clicked — engine `goto` (backward jumps keep
-    /// flow order; forward hops land on the page and `next` resolves the
-    /// skipped pages from there).
+    /// Sidebar rail entry clicked — engine `goto` (backward hops only;
+    /// the engine refuses forward/off-flow pages).
     Goto(String),
 }
 
 struct Step {
+    /// engine step id — `step` events key on it (`name` in the wire event)
     name: String,
+    title: String,
     state: String,
 }
 
@@ -413,6 +414,27 @@ impl cosmic::app::Application for Installer {
                             self.selected.remove(n);
                         }
                     }
+                    // review's steps[] seeds the install timeline —
+                    // upcoming stages are drawn 'todo' before any step
+                    // event arrives
+                    if let Some(steps) = v.get("steps").and_then(Value::as_array) {
+                        self.steps = steps
+                            .iter()
+                            .map(|s| Step {
+                                name: s
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
+                                title: s
+                                    .get("title")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string(),
+                                state: "todo".into(),
+                            })
+                            .collect();
+                    }
                     self.nav = v
                         .get("nav")
                         .and_then(Value::as_array)
@@ -493,7 +515,11 @@ impl cosmic::app::Application for Installer {
                     if let Some(s) = self.steps.iter_mut().find(|s| s.name == name) {
                         s.state = state;
                     } else {
-                        self.steps.push(Step { name, state });
+                        self.steps.push(Step {
+                            title: name.clone(),
+                            name,
+                            state,
+                        });
                     }
                 }
                 Some("done") => {
@@ -656,7 +682,10 @@ impl cosmic::app::Application for Installer {
                         .push(format!("type '{confirm}' to confirm the install"));
                     return Task::none();
                 }
-                self.steps.clear();
+                // reset the seeded timeline — step events light it up by id
+                for s in &mut self.steps {
+                    s.state = "todo".into();
+                }
                 // leave the wizard synchronously — the engine queues ops, so
                 // a second click before the first `step` would run the whole
                 // wipe again
@@ -674,7 +703,9 @@ impl cosmic::app::Application for Installer {
                 if !self.flush_secrets() {
                     return Task::none();
                 }
-                self.steps.clear();
+                for s in &mut self.steps {
+                    s.state = "todo".into();
+                }
                 self.phase = Phase::Pending;
                 send_op(json!({"op": "install", "dry_run": true}));
             }
@@ -767,7 +798,12 @@ impl Installer {
                     };
                     let mut row = widget::row::with_capacity(2).spacing(spacing.space_s);
                     row = row.push(widget::text(mark).width(Length::Fixed(20.0)));
-                    let name = widget::text(s.name.clone());
+                    let shown = if s.title.is_empty() {
+                        s.name.clone()
+                    } else {
+                        s.title.clone()
+                    };
+                    let name = widget::text(shown);
                     let name = if s.state == "started" {
                         name.class(theme::Text::Accent)
                     } else {

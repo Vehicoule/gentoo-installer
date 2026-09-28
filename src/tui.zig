@@ -347,7 +347,7 @@ pub const Tui = struct {
         const id = t.pv.nav[i].id;
         var aw: std.Io.Writer.Allocating = .init(t.alloc);
         defer aw.deinit();
-        t.wiz.emitPage(&aw.writer, null, id) catch return;
+        t.wiz.gotoPage(&aw.writer, null, id) catch return;
         t.focus = 0;
         t.scroll = 0;
         try t.refreshPage();
@@ -738,14 +738,24 @@ fn draw(t: *Tui, win: vaxis.Window) !void {
         try renderValue(&vbuf.writer, f, t, i);
         _ = win.print(&.{.{ .text = vbuf.written(), .style = sty }}, .{ .row_offset = row, .col_offset = cx + @min(26, w / 4) });
         row += 1;
-        // focused enum expands inline: option list w/ current marked
+        // focused enum expands inline: option list w/ current marked;
+        // the window follows the selection so options past the first
+        // six stay visible while cycling.
         if (is_focus and std.mem.eql(u8, f.ftype, "enum") and f.options.len > 0 and t.mode == .form) {
             const cur = switch (f.value) {
                 .string => |s| s,
                 else => "",
             };
             const show = @min(f.options.len, 6);
-            for (f.options[0..show]) |o| {
+            var cur_i: usize = 0;
+            for (f.options, 0..) |o, opt_i| {
+                if (std.mem.eql(u8, o.v, cur)) {
+                    cur_i = opt_i;
+                    break;
+                }
+            }
+            const oi = if (f.options.len <= show) 0 else @min(cur_i -| 2, f.options.len - show);
+            for (f.options[oi .. oi + show]) |o| {
                 if (row > 2 + max_rows) break;
                 const on = std.mem.eql(u8, o.v, cur);
                 var obuf: std.Io.Writer.Allocating = .init(fa);

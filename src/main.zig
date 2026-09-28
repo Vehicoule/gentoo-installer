@@ -549,9 +549,10 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
                 if (at_eof) break;
                 continue;
             };
-            wiz.emitPage(out, req, pgname) catch |e| {
+            wiz.gotoPage(out, req, pgname) catch |e| {
                 try writeErr(out, req, switch (e) {
                     error.BadValue => "unknown page",
+                    error.PageUnreachable => "page not reachable — rail jumps go to done/current pages only",
                     else => "page failed",
                 });
             };

@@ -416,39 +416,40 @@ pub const Wizard = struct {
         return &pages[w.page_idx];
     }
 
-    /// Emit the `page` event for the current (or named) page.
-    pub fn emitPage(w: *Wizard, out: *std.Io.Writer, req: ?u64, name: ?[]const u8) !void {
-        if (name) |nm| {
-            var target: ?usize = null;
-            for (pages, 0..) |pg, i| {
-                if (std.mem.eql(u8, pg.id, nm)) {
-                    target = i;
-                    break;
-                }
-            }
-            const pi = target orelse return error.BadValue;
-            // goto is a backward hop only — it must sit on the current
-            // flow and at-or-before the current page. A forward jump
-            // would land on Review with the gate pages unvalidated
-            // (install/export actions armed on an incomplete config),
-            // and an off-flow page (Advanced-only under Express) has
-            // no route back.
-            var buf: [pages.len]usize = undefined;
-            const order = w.flowOrder(&buf);
-            var ti: ?usize = null;
-            for (order, 0..) |opi, i| {
-                if (opi == pi) {
-                    ti = i;
-                    break;
-                }
-            }
-            if (ti == null or ti.? > w.flowIndex()) return error.BadValue;
-            w.page_idx = pi;
+    /// Position of a `pages` index within the current flow — null for
+    /// pages the flow hides (Advanced-only under Express).
+    fn flowPos(w: *const Wizard, pi: usize) ?usize {
+        var buf: [pages.len]usize = undefined;
+        const order = w.flowOrder(&buf);
+        for (order, 0..) |opi, i| {
+            if (opi == pi) return i;
         }
-        const pg = w.currentPage();
+        return null;
+    }
+
+    /// Emit the `page` event for the current (or named) page. A named
+    /// page is a *peek*: its schema is emitted but the wizard's
+    /// position is unchanged — navigation goes through `gotoPage` /
+    /// `next` / `back`, so a schema lookup can't park the wizard on an
+    /// unvalidated page. Off-flow pages emit `"index":0`.
+    pub fn emitPage(w: *Wizard, out: *std.Io.Writer, req: ?u64, name: ?[]const u8) !void {
+        var pg = w.currentPage();
+        var idx: usize = w.flowIndex() + 1; // 1-based; 0 = outside the flow
+        if (name) |nm| {
+            var pi: ?usize = null;
+            for (pages, 0..) |p2, i| {
+                if (std.mem.eql(u8, p2.id, nm)) {
+                    pi = i;
+                    break;
+                }
+            }
+            const p2 = pi orelse return error.BadValue;
+            pg = &pages[p2];
+            idx = if (w.flowPos(p2)) |v| v + 1 else 0;
+        }
         try out.writeAll("{\"ev\":\"page\",");
         if (req) |r| try out.print("\"req\":{},", .{r});
-        try out.print("\"page\":\"{s}\",\"index\":{},\"of\":{},\"title\":\"", .{ pg.id, w.flowIndex() + 1, w.flowLen() });
+        try out.print("\"page\":\"{s}\",\"index\":{},\"of\":{},\"title\":\"", .{ pg.id, idx, w.flowLen() });
         jesc(out, pg.title);
         try out.writeAll("\",\"section\":\"");
         jesc(out, pg.section);
@@ -479,6 +480,26 @@ pub const Wizard = struct {
         try out.writeAll(",\"actions\":[");
         try w.emitActions(out);
         try out.writeAll("]}\n");
+    }
+
+    /// `goto` — restricted rail jump: the target must sit on the
+    /// current flow at-or-before the current page. A forward hop would
+    /// land on Review with the gate pages unvalidated (install/export
+    /// actions armed on an incomplete config), and an off-flow page
+    /// (Advanced-only under Express) has no route back.
+    pub fn gotoPage(w: *Wizard, out: *std.Io.Writer, req: ?u64, name: []const u8) !void {
+        var pi: ?usize = null;
+        for (pages, 0..) |pg, i| {
+            if (std.mem.eql(u8, pg.id, name)) {
+                pi = i;
+                break;
+            }
+        }
+        const p2 = pi orelse return error.BadValue;
+        const ti = w.flowPos(p2) orelse return error.PageUnreachable;
+        if (ti > w.flowIndex()) return error.PageUnreachable;
+        w.page_idx = p2;
+        try w.emitPage(out, req, null);
     }
 
     /// nav-rail entries for every page in the current flow — done /
