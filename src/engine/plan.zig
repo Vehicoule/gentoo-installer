@@ -1090,6 +1090,12 @@ fn planPortage(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, se
         };
         try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/package.accept_keywords/installer", s(alloc, "sys-boot/limine {s}\n", .{kw})));
     }
+    // Packages that are stable on amd64 but ~arch-only elsewhere. Keywords
+    // for other arches are inert on the current one, so emit the union.
+    if (cfg.disk.swap == .zram and cfg.system.init == .systemd)
+        try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/package.accept_keywords/zram", "sys-apps/zram-generator ~arm64 ~riscv\n"));
+    if (cfg.system.privilege == .doas)
+        try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/package.accept_keywords/doas", "app-admin/doas ~riscv\n"));
     try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/repos.conf/gentoo.conf", "[gentoo]\nlocation = /var/db/repos/gentoo\nsync-type = webrsync\n"));
     if (cfg.system.binhost) {
         // Gentoo ships binhosts per arch+ABI dir; riscv64 has none.
