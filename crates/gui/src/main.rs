@@ -184,6 +184,12 @@ struct Installer {
     pending_sets: HashMap<u64, String>, // req -> field; rejected sets restore engine truth
     pending_gates: HashSet<u64>, // req -> whole-config gate op (plan); a validate carrying one unscopes its errors
     last_answer_req: Option<u64>, // newest outstanding answer_file set
+    /// detected disks from the `env` event — path → GiB size, so the
+    /// destructive confirm panel can say what it's wiping.
+    disks: HashMap<String, u64>,
+    /// current page index + count from the page event — rail footer.
+    page_index: usize,
+    page_of: usize,
 }
 
 impl Installer {
@@ -337,6 +343,9 @@ impl cosmic::app::Application for Installer {
             pending_sets: HashMap::new(),
             pending_gates: HashSet::new(),
             last_answer_req: None,
+            disks: HashMap::new(),
+            page_index: 0,
+            page_of: 0,
         };
         (app, Task::none())
     }
@@ -372,10 +381,34 @@ impl cosmic::app::Application for Installer {
                 Some("hello") => {}
                 Some("env") => {
                     self.log.push("env detected".into());
+                    self.disks = v
+                        .get("disks")
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|d| {
+                                    Some((
+                                        d.get("path").and_then(Value::as_str)?.to_string(),
+                                        d.get("size_gib").and_then(Value::as_u64)?,
+                                    ))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     send_op(json!({"op": "page"}));
                 }
                 Some("page") => {
                     self.phase = Phase::Wizard;
+                    self.page_index = v
+                        .get("index")
+                        .and_then(Value::as_u64)
+                        .map(|n| n as usize)
+                        .unwrap_or(0);
+                    self.page_of = v
+                        .get("of")
+                        .and_then(Value::as_u64)
+                        .map(|n| n as usize)
+                        .unwrap_or(0);
                     // clear leftover errors on real navigation only — a
                     // same-page resync (after a rejected `set`) must keep
                     // the error it was triggered to display
@@ -823,6 +856,16 @@ impl Installer {
             };
             col = col.push(btn);
         }
+        // position footer — "N of M" under the rail so progress is
+        // readable at a glance without scanning glyph states
+        if self.page_of > 0 {
+            col = col.push(widget::container(widget::text("")).height(Length::Fixed(12.0)));
+            col = col.push(widget::divider::horizontal::light());
+            col = col.push(widget::text::caption(format!(
+                "page {} of {}",
+                self.page_index, self.page_of
+            )));
+        }
         widget::container(col)
             .width(Length::Fixed(240.0))
             .height(Length::Fill)
@@ -844,15 +887,51 @@ impl Installer {
                 col = col.push(widget::text::title2("Engine exited"));
             }
             _ => {
+                let done_n = self
+                    .steps
+                    .iter()
+                    .filter(|s| s.state == "done" || s.state == "skipped")
+                    .count();
+                let total = self.steps.len();
                 let title = match self.phase {
-                    Phase::Pending => "Starting install…",
-                    Phase::Running => "Installing…",
-                    Phase::Done(true) => "Install complete — safe to reboot",
-                    Phase::Done(false) => "Dry run complete",
-                    Phase::Failed => "Installation failed",
+                    Phase::Pending => "Starting install…".to_string(),
+                    Phase::Running => format!("Installing… ({done_n}/{total})"),
+                    Phase::Done(true) => "Install complete — safe to reboot".to_string(),
+                    Phase::Done(false) => "Dry run complete".to_string(),
+                    Phase::Failed => "Installation failed".to_string(),
                     _ => unreachable!(),
                 };
-                col = col.push(widget::text::title2(title));
+                let title_el: Element<Message> = match self.phase {
+                    Phase::Done(_) => widget::text::title2(title)
+                        .class(theme::Text::Custom(|t| cosmic::iced::widget::text::Style {
+                            color: Some(t.cosmic().success.base.into()),
+                            ..Default::default()
+                        }))
+                        .into(),
+                    Phase::Failed => widget::text::title2(title)
+                        .class(theme::Text::Custom(|t| cosmic::iced::widget::text::Style {
+                            color: Some(t.cosmic().destructive.base.into()),
+                            ..Default::default()
+                        }))
+                        .into(),
+                    _ => widget::text::title2(title).into(),
+                };
+                col = col.push(title_el);
+                // progress bar — determinate once steps are known;
+                // pending spins until the first step event lands
+                if matches!(self.phase, Phase::Pending) {
+                    col = col.push(
+                        widget::progress_bar::indeterminate_linear()
+                            .width(Length::Fill)
+                            .girth(Length::Fixed(6.0)),
+                    );
+                } else if total > 0 {
+                    col = col.push(
+                        widget::progress_bar::determinate_linear(done_n as f32 / total as f32)
+                            .width(Length::Fill)
+                            .girth(Length::Fixed(6.0)),
+                    );
+                }
                 // step timeline — a card per install stage, marked by state
                 let mut steps_col =
                     widget::column::with_capacity(self.steps.len()).spacing(spacing.space_xxs);
@@ -864,7 +943,26 @@ impl Installer {
                         _ => ("…", false),
                     };
                     let mut row = widget::row::with_capacity(2).spacing(spacing.space_s);
-                    row = row.push(widget::text(mark).width(Length::Fixed(20.0)));
+                    let mark_txt: Element<Message> = if done || s.state == "skipped" {
+                        widget::text(mark)
+                            .width(Length::Fixed(20.0))
+                            .class(theme::Text::Custom(|t| cosmic::iced::widget::text::Style {
+                                color: Some(t.cosmic().success.base.into()),
+                                ..Default::default()
+                            }))
+                            .into()
+                    } else if s.state == "failed" {
+                        widget::text(mark)
+                            .width(Length::Fixed(20.0))
+                            .class(theme::Text::Custom(|t| cosmic::iced::widget::text::Style {
+                                color: Some(t.cosmic().destructive.base.into()),
+                                ..Default::default()
+                            }))
+                            .into()
+                    } else {
+                        widget::text(mark).width(Length::Fixed(20.0)).into()
+                    };
+                    row = row.push(mark_txt);
                     let shown = if s.title.is_empty() {
                         s.name.clone()
                     } else {
@@ -876,7 +974,6 @@ impl Installer {
                     } else {
                         name
                     };
-                    let _ = done;
                     row = row.push(name);
                     steps_col = steps_col.push(row);
                 }
@@ -888,12 +985,11 @@ impl Installer {
                 );
             }
         }
-        for e in &self.errors {
-            col = col.push(error_text(&e.message));
+        if !self.errors.is_empty() {
+            col = col.push(error_panel(self.errors.iter().map(|e| e.message.as_str())));
         }
         if let Some(plan) = &self.plan {
-            col = col
-                .push(widget::scrollable(widget::text(plan).size(11)).height(Length::Fixed(240.0)));
+            col = col.push(plan_panel(plan));
         }
         widget::scrollable(col).into()
     }
@@ -974,8 +1070,21 @@ impl Installer {
                     .unwrap_or(&self.disk_device)
                     .to_string();
                 let dev = self.disk_device.clone();
+                // "25 GiB" says what is being erased — the bare path is
+                // too easy to skim past
+                let dev_shown = match self.disks.get(&dev) {
+                    Some(g) => format!("{dev} · {g} GiB"),
+                    None => dev.clone(),
+                };
                 let mut panel = widget::column::with_capacity(3).spacing(spacing.space_xs);
-                panel = panel.push(widget::text::title4(format!("Install onto {dev}?")));
+                panel = panel.push(
+                    widget::text::title4(format!("Install onto {dev_shown}?")).class(
+                        theme::Text::Custom(|t| cosmic::iced::widget::text::Style {
+                            color: Some(t.cosmic().destructive.base.into()),
+                            ..Default::default()
+                        }),
+                    ),
+                );
                 panel = panel.push(widget::text::body(
                     "All data on the disk will be erased.".to_string(),
                 ));
@@ -1037,16 +1146,17 @@ impl Installer {
             .and_then(|p| p.get("page"))
             .and_then(Value::as_str)
             .unwrap_or("");
-        for e in self
+        let page_errors: Vec<&str> = self
             .errors
             .iter()
             .filter(|e| self.errors_unscoped || e.local || e.page.as_deref() == Some(cur_id))
-        {
-            col = col.push(error_text(&e.message));
+            .map(|e| e.message.as_str())
+            .collect();
+        if !page_errors.is_empty() {
+            col = col.push(error_panel(page_errors.into_iter()));
         }
         if let Some(plan) = &self.plan {
-            col = col
-                .push(widget::scrollable(widget::text(plan).size(11)).height(Length::Fixed(240.0)));
+            col = col.push(plan_panel(plan));
         }
 
         widget::row::with_capacity(3)
@@ -1058,12 +1168,53 @@ impl Installer {
     }
 }
 
-fn error_text(e: &String) -> Element<'_, Message> {
-    widget::text::body(e.clone())
+fn error_text(e: String) -> Element<'static, Message> {
+    widget::text::body(e)
         .class(theme::Text::Custom(|t| cosmic::iced::widget::text::Style {
             color: Some(t.cosmic().destructive.base.into()),
             ..Default::default()
         }))
+        .into()
+}
+
+/// Grouped error list — a card-tinted block with a heading, so a gate
+/// refusal reads as one coherent panel rather than stray red lines.
+fn error_panel<'a>(errs: impl Iterator<Item = &'a str>) -> Element<'a, Message> {
+    let spacing = theme::spacing();
+    let msgs: Vec<String> = errs.map(str::to_string).collect();
+    let mut col = widget::column::with_capacity(msgs.len() + 1).spacing(spacing.space_xxs);
+    col = col.push(
+        widget::text::title4("Problems").class(theme::Text::Custom(|t| {
+            cosmic::iced::widget::text::Style {
+                color: Some(t.cosmic().destructive.base.into()),
+                ..Default::default()
+            }
+        })),
+    );
+    for m in msgs {
+        col = col.push(error_text(format!("· {m}")));
+    }
+    widget::container(col)
+        .padding(spacing.space_m)
+        .width(Length::Fill)
+        .class(theme::Container::Card)
+        .into()
+}
+
+/// Plan commands inside a titled card — the scrollable gets a label so
+/// it's clear these are the commands the install would run.
+fn plan_panel(plan: &str) -> Element<'_, Message> {
+    let spacing = theme::spacing();
+    let n = plan.lines().count();
+    let mut col = widget::column::with_capacity(2).spacing(spacing.space_xs);
+    col = col.push(widget::text::title4(format!("Install plan — {n} commands")));
+    col = col.push(
+        widget::scrollable(widget::text(plan.to_string()).size(11)).height(Length::Fixed(240.0)),
+    );
+    widget::container(col)
+        .padding(spacing.space_m)
+        .width(Length::Fill)
+        .class(theme::Container::Card)
         .into()
 }
 
