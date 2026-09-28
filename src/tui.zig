@@ -670,7 +670,7 @@ fn draw(t: *Tui, win: vaxis.Window) !void {
     const fa = t.frame_arena.allocator();
     const w = win.width;
     const h = win.height;
-    if (w < 30 or h < 8) {
+    if (w < 30 or h < 12) {
         _ = win.print(&.{.{ .text = "terminal too small", .style = err_style }}, .{});
         return;
     }
@@ -751,6 +751,9 @@ fn draw(t: *Tui, win: vaxis.Window) !void {
     }
     // pages without fields can't show errors inline — a whole-config
     // gate joins the scroll stream so >3 problems stay reachable.
+    // Under ~3 scroll rows the stream can't render at all — the gate
+    // list goes flat in the content rows instead of vanishing.
+    const short_stream = (h -| 11) < 3;
     if (t.pv.fields.len == 0) {
         var has_err = false;
         for (t.errors.items) |e| {
@@ -760,18 +763,39 @@ fn draw(t: *Tui, win: vaxis.Window) !void {
             }
         }
         if (has_err) {
-            if (li >= t.scroll and row < h -| 7) {
-                _ = win.print(&.{.{ .text = " problems", .style = err_style }}, .{ .row_offset = row, .col_offset = cx });
-                row += 1;
-            }
-            li += 1;
-            for (t.errors.items) |e| {
-                if (!e.on_page) continue;
+            if (short_stream) {
+                // flat fallback: as many ↳ lines as rows 5..h-6 fit,
+                // then a count of what couldn't be shown
+                var er: u16 = 5;
+                var shown: usize = 0;
+                for (t.errors.items) |e| {
+                    if (!e.on_page) continue;
+                    if (er >= h -| 5) break;
+                    _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " ↳ {s}", .{e.msg}), .style = err_style }}, .{ .row_offset = er, .col_offset = cx });
+                    er += 1;
+                    shown += 1;
+                }
+                var rem: usize = 0;
+                for (t.errors.items) |e| {
+                    if (e.on_page) rem += 1;
+                }
+                if (rem > shown) {
+                    _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " … +{d} problems", .{rem - shown}), .style = err_style }}, .{ .row_offset = h -| 5, .col_offset = cx });
+                }
+            } else {
                 if (li >= t.scroll and row < h -| 7) {
-                    _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, "   ↳ {s}", .{e.msg}), .style = err_style }}, .{ .row_offset = row, .col_offset = cx });
+                    _ = win.print(&.{.{ .text = " problems", .style = err_style }}, .{ .row_offset = row, .col_offset = cx });
                     row += 1;
                 }
                 li += 1;
+                for (t.errors.items) |e| {
+                    if (!e.on_page) continue;
+                    if (li >= t.scroll and row < h -| 7) {
+                        _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, "   ↳ {s}", .{e.msg}), .style = err_style }}, .{ .row_offset = row, .col_offset = cx });
+                        row += 1;
+                    }
+                    li += 1;
+                }
             }
         }
     }
