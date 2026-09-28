@@ -198,13 +198,6 @@ pub fn main(init: std.process.Init) !void {
         try errw.flush();
         std.process.exit(2);
     }
-    if (cmd == .run and !dry_run and cfg.system.init == .s6) {
-        // s6-linux-init needs a generated boot dir (s6-linux-init-maker)
-        // + a compiled s6-rc database — still gated; runit/dinit exec.
-        try errw.print("init=s6 is not executable yet — its s6-linux-init backend lands in a later milestone; use runit|dinit|openrc|systemd or --dry-run to preview\n", .{});
-        try errw.flush();
-        std.process.exit(2);
-    }
     // Secrets are exec gates, not plan gates — an exported answer file
     // previews fine but can't run until the passphrase is provided.
     if (cmd == .run and !dry_run) if (engine.config.execPrechecks(&cfg)) |e| {
@@ -823,10 +816,6 @@ fn doInstall(io: std.Io, alloc: std.mem.Allocator, wiz: *engine.wizard.Wizard, o
         }
         if (cfg.system.kernel == .manual and cfg.system.kernel_config.len == 0) {
             try writeErr(out, req, "kernel=manual needs system.kernel_config=<path to .config>");
-            return;
-        }
-        if (cfg.system.init == .s6) {
-            try writeErr(out, req, "init=s6 is not executable yet — s6-linux-init backend lands in a later milestone");
             return;
         }
         if (engine.config.execPrechecks(cfg)) |e| {

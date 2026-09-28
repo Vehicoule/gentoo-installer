@@ -399,9 +399,17 @@ init-native. `init=` on the kernel cmdline swaps PID1:
 - **dinit** — `init=/sbin/dinit`: a scripted `sysinit` unit runs
   gi-sysinit, tty1-4 are process services (`restart`, `depends-on =
   sysinit`), and units link into `boot.d/` (the implicit boot target).
-- **s6** — exec-gated for now: s6-linux-init needs a generated
-  skeldir + compiled s6-rc db; `plan`/`--dry-run` preview it, `run`
-  refuses.
+- **s6** — `init=/sbin/init`: sysvinit is unmerged first (s6-linux-init
+  has a `!sysvinit` blocker and owns the /sbin/init slot), then
+  `s6-linux-init-maker` generates the basedir, `s6-hiercopy` installs it
+  at the compiled-in default `/etc/s6-linux-init/current`, and its
+  `bin/` sysvinit-compat scripts land in `/sbin` — halt/poweroff/
+  reboot/shutdown/telinit work for free, no custom shim needed.
+  `scripts/rc.init` runs gi-sysinit (openrc stays for sysinit/boot),
+  then `s6-rc-init` opens a db compiled at install time by
+  `s6-rc-compile`: a `sysinit` oneshot every unit depends on, tty1-4
+  supervised agettys, and each enabled service becomes a longrun
+  (`type`/`run`/`dependencies` files) in the `default` bundle.
 
 ## Headless protocol (GUI ↔ engine)
 
@@ -484,7 +492,7 @@ GUI is a separate build artifact; the TUI/engine binary stays dependency-free.
   proprietary NVIDIA driver selection
   paths; BIOS/CSM boot path; arm64 + riscv64 bring-up.
 - **M6** — secure boot signing flow (sbctl path first), dual-boot
-  alongside-mode + menu merge, runit/dinit init backends (s6 follows).
+  alongside-mode + menu merge, runit/dinit/s6 init backends.
 - **M7** — distro preset layer hardening (branding, extra steps,
   post-install hooks), docs, 1.0.
 

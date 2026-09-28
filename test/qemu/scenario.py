@@ -157,6 +157,20 @@ def phase_a(scn, disk):
               "chroot /mnt/gentoo mokutil --revoke-import && "
               "! chroot /mnt/gentoo mokutil --list-new | grep -q .; "
               "echo ZZ-GOT-$?", pat=DONE, timeout=120)
+    # s6 likewise — a serial agetty longrun in the s6-rc db; recompile so
+    # the installed db picks it up (host-side equivalent of enabling a
+    # service post-install).
+    sh(c, "[ -d /mnt/gentoo/etc/s6-rc/source ] && { "
+          "mkdir -p /mnt/gentoo/etc/s6-rc/source/agetty-ttyS0 && "
+          "echo longrun > /mnt/gentoo/etc/s6-rc/source/agetty-ttyS0/type && "
+          "printf '#!/bin/sh\\nexec /sbin/agetty -L 115200 ttyS0 linux\\n' "
+          "> /mnt/gentoo/etc/s6-rc/source/agetty-ttyS0/run && "
+          "chmod 755 /mnt/gentoo/etc/s6-rc/source/agetty-ttyS0/run && "
+          "echo sysinit > /mnt/gentoo/etc/s6-rc/source/agetty-ttyS0/dependencies && "
+          "echo agetty-ttyS0 >> /mnt/gentoo/etc/s6-rc/source/default/contents && "
+          "rm -rf /mnt/gentoo/etc/s6-rc/compiled && "
+          "chroot /mnt/gentoo s6-rc-compile /etc/s6-rc/compiled /etc/s6-rc/source; }; "
+          "echo ZZ-GOT-0", pat=DONE, timeout=60)
     # runit likewise — a supervised agetty on ttyS0 under runsvdir.
     sh(c, "[ -d /mnt/gentoo/etc/sv ] && { "
           "mkdir -p /mnt/gentoo/etc/sv/agetty-ttyS0 && "

@@ -723,6 +723,9 @@ fn kernelArgs(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, see
     switch (cfg.system.init) {
         .runit => r = s(alloc, "{s} init=/sbin/runit-init", .{r}),
         .dinit => r = s(alloc, "{s} init=/sbin/dinit", .{r}),
+        // the maker's bin/init lands at /sbin/init (sysvinit unmerged),
+        // but spell it out so the cmdline documents the PID1 choice.
+        .s6 => r = s(alloc, "{s} init=/sbin/init", .{r}),
         else => {},
     }
     return s(alloc, "{s} rootfstype={s}", .{ r, @tagName(rootFsOf(cfg)) });
@@ -1654,7 +1657,19 @@ fn planServices(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !
             // package so the runit wrappers installed below stand alone.
             try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "--unmerge", "sys-apps/sysvinit" }), .chroot = true, .desc = "unmerge sysvinit (runit takes PID1)" } });
         },
-        .s6 => try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-apps/s6", "sys-apps/s6-rc" }), .chroot = true, .desc = "s6 + s6-rc packages" } }),
+        .s6 => {
+            // s6 stack is ~arch-keyworded in ::gentoo on some arches.
+            try c.append(alloc, .{ .write_file = .{
+                .path = "/mnt/gentoo/etc/portage/package.accept_keywords/s6",
+                .mode = 0o644,
+                .content = "dev-lang/execline ~amd64 ~arm64 ~riscv\nsys-apps/s6 ~amd64 ~arm64 ~riscv\nsys-apps/s6-rc ~amd64 ~arm64 ~riscv\nsys-apps/s6-linux-init ~amd64 ~arm64 ~riscv\nsys-apps/s6-linux-utils ~amd64 ~arm64 ~riscv\nsys-apps/s6-portable-utils ~amd64 ~arm64 ~riscv\nsys-libs/skalibs ~amd64 ~arm64 ~riscv\n",
+            } });
+            // sysvinit goes FIRST: s6-linux-init RDEPENDs !sys-apps/sysvinit
+            // (its bin/init takes the /sbin/init slot) and the initctl tools
+            // hang under a foreign PID1 anyway.
+            try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "--unmerge", "sys-apps/sysvinit" }), .chroot = true, .desc = "unmerge sysvinit (s6 takes PID1)" } });
+            try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-apps/s6", "sys-apps/s6-rc", "sys-apps/s6-linux-init", "sys-apps/s6-linux-utils", "sys-apps/s6-portable-utils" }), .chroot = true, .desc = "s6 + s6-rc + s6-linux-init" } });
+        },
         else => {},
     }
     // Boot scaffolding per init — a shared stage-1 script every
@@ -1762,6 +1777,41 @@ fn planServices(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !
             try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/sbin/reboot", .mode = 0o755,
                 .content = "#!/bin/sh\nexec /sbin/runit-init 6\n" } });
         },
+        .s6 => {
+            // s6-linux-init-maker emits a staging dir: bin/ holds init +
+            // sysvinit-compat tools, run-image/ env/ scripts/ form the
+            // runtime layout the init binary expects at /etc/s6-linux-init.
+            // Generate in chroot, install with s6-hiercopy (mode-preserving).
+            try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "s6-linux-init-maker", "/root/gi-mk" }), .chroot = true, .desc = "s6-linux-init skeldir" } });
+            // The default basedir (-c) is /etc/s6-linux-init/current —
+            // bin/init embeds it, so the copy must land exactly there.
+            try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "s6-hiercopy", "/root/gi-mk", "/etc/s6-linux-init/current" }), .chroot = true, .desc = "install s6 runtime dirs" } });
+            for ([_][]const u8{ "init", "halt", "poweroff", "reboot", "shutdown", "telinit" }) |b|
+                try c.append(alloc, argv(alloc, &.{ "cp", "-a", s(alloc, "/mnt/gentoo/root/gi-mk/bin/{s}", .{b}), s(alloc, "/mnt/gentoo/sbin/{s}", .{b}) }, s(alloc, "install s6 {s}", .{b})));
+            try c.append(alloc, argv(alloc, &.{ "rm", "-rf", "/mnt/gentoo/root/gi-mk" }, "drop maker staging"));
+            // rc.init is stage 2: openrc owns sysinit/boot (gi-sysinit),
+            // then s6-rc-init opens the compiled db on the live scandir
+            // and brings up the default bundle ($1 is the boot runlevel).
+            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/etc/s6-linux-init/current/scripts/rc.init", .mode = 0o755,
+                .content = "#!/bin/sh\n/usr/libexec/gi-sysinit\ns6-rc-init -c /etc/s6-rc/compiled /run/service || exit 1\nexec s6-rc -u change \"${1:-default}\"\n" } });
+            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/etc/s6-linux-init/current/scripts/rc.shutdown", .mode = 0o755,
+                .content = "#!/bin/sh\ns6-rc -da change default || true\n" } });
+            // s6-rc source db: sysinit is a oneshot every unit depends on,
+            // tty1-4 are supervised agettys, `default` bundles them all.
+            // The bundle's contents file is appended per enabled unit in
+            // the services loop below, then s6-rc-compile bakes the db.
+            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/etc/s6-rc/source/sysinit/type", .mode = 0o644, .content = "oneshot\n" } });
+            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/etc/s6-rc/source/sysinit/up", .mode = 0o644, .content = "/usr/libexec/gi-sysinit\n" } });
+            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/etc/s6-rc/source/default/type", .mode = 0o644, .content = "bundle\n" } });
+            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/etc/s6-rc/source/default/contents", .mode = 0o644, .content = "sysinit\ntty1\ntty2\ntty3\ntty4\n" } });
+            for ([_]u8{ '1', '2', '3', '4' }) |n| {
+                const name = s(alloc, "tty{c}", .{n});
+                try c.append(alloc, .{ .write_file = .{ .path = s(alloc, "/mnt/gentoo/etc/s6-rc/source/{s}/type", .{name}), .mode = 0o644, .content = "longrun\n" } });
+                try c.append(alloc, .{ .write_file = .{ .path = s(alloc, "/mnt/gentoo/etc/s6-rc/source/{s}/run", .{name}), .mode = 0o755,
+                    .content = s(alloc, "#!/bin/sh\nexec /sbin/agetty {s} 38400 linux\n", .{name}) } });
+                try c.append(alloc, .{ .write_file = .{ .path = s(alloc, "/mnt/gentoo/etc/s6-rc/source/{s}/dependencies", .{name}), .mode = 0o644, .content = "sysinit\n" } });
+            }
+        },
         else => {},
     }
 
@@ -1794,13 +1844,21 @@ fn planServices(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !
                                 s(alloc, "type = process\ncommand = {s}\nrestart = true\ndepends-on = sysinit\n", .{cmd})));
                             try c.append(alloc, argv(alloc, &.{ "ln", "-sf", s(alloc, "../{s}", .{u}), s(alloc, "/mnt/gentoo/etc/dinit.d/boot.d/{s}", .{u}) }, s(alloc, "dinit enable {s}", .{u})));
                         },
-                        .s6 => try c.append(alloc, .{ .note = s(alloc, "s6-rc: add {s} to the default bundle", .{u}) }),
+                        .s6 => {
+                            try c.append(alloc, .{ .write_file = .{ .path = s(alloc, "/mnt/gentoo/etc/s6-rc/source/{s}/type", .{u}), .mode = 0o644, .content = "longrun\n" } });
+                            try c.append(alloc, .{ .write_file = .{ .path = s(alloc, "/mnt/gentoo/etc/s6-rc/source/{s}/run", .{u}), .mode = 0o755,
+                                .content = s(alloc, "#!/bin/sh\nexec {s}\n", .{cmd}) } });
+                            try c.append(alloc, .{ .write_file = .{ .path = s(alloc, "/mnt/gentoo/etc/s6-rc/source/{s}/dependencies", .{u}), .mode = 0o644, .content = "sysinit\n" } });
+                            try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "echo {s} >> /etc/s6-rc/source/default/contents", .{u}) }), .chroot = true, .desc = s(alloc, "s6-rc bundle {s}", .{u}) } });
+                        },
                         else => unreachable,
                     }
                 }
             },
         }
     }
+    if (init == .s6)
+        try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "s6-rc-compile", "/etc/s6-rc/compiled", "/etc/s6-rc/source" }), .chroot = true, .desc = "compile s6-rc database" } });
     return step(alloc, "services", "Enable services", c);
 }
 
@@ -2739,6 +2797,7 @@ test "alt inits: init= cmdline + supervisor scaffolding" {
     const cases = [_]struct { init: []const u8, arg: []const u8, want: []const u8 }{
         .{ .init = "dinit", .arg = "init=/sbin/dinit", .want = "/mnt/gentoo/etc/dinit.d/sysinit" },
         .{ .init = "runit", .arg = "init=/sbin/runit-init", .want = "/mnt/gentoo/etc/runit/2" },
+        .{ .init = "s6", .arg = "init=/sbin/init", .want = "/mnt/gentoo/etc/s6-rc/source/sysinit/type" },
     };
     for (cases) |tc| {
         var doc = try @import("toml.zig").parse(std.testing.allocator,
@@ -2762,12 +2821,13 @@ test "alt inits: init= cmdline + supervisor scaffolding" {
         const alloc = arena.allocator();
         var cfg = try config.decode(alloc, doc);
         if (std.mem.eql(u8, tc.init, "runit")) cfg.system.init = .runit;
+        if (std.mem.eql(u8, tc.init, "s6")) cfg.system.init = .s6;
         const plan = try build(alloc, &cfg, null, .{}, null, null);
         var saw_arg = false;
         var saw_scaffold = false;
         var saw_sysinit = false;
         var saw_zram = false;
-        var saw_boot = std.mem.eql(u8, tc.init, "runit"); // only dinit needs the boot svc
+        var saw_boot = !std.mem.eql(u8, tc.init, "dinit"); // only dinit needs the boot svc
         for (plan.steps) |st| {
             for (st.cmds) |cmd| {
                 switch (cmd) {
