@@ -2145,11 +2145,15 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env,
             if (cfg.boot_mode == .uefi)
                 try c.append(alloc, .{ .exec = .{
                     // shim owns the NVRAM entry — under --no-nvram
-                    // grub-install only lays modules + boot files.
+                    // grub-install only lays modules + boot files. When the
+                    // live env wasn't EFI-booted (riscv64 OpenSBI direct-kernel
+                    // bring-up) efibootmgr can't register an entry — install
+                    // --removable instead, which also writes the
+                    // EFI/BOOT/BOOT<arch>.EFI fallback U-Boot/EDK2 scan for.
                     .argv = if (cfg.security.secure_boot == .shim)
                         try alloc.dupe([]const u8, &.{ "grub-install", s(alloc, "--target={s}", .{grubEfiTarget(cfg)}), s(alloc, "--efi-directory={s}", .{espInTarget(cfg)}), "--no-nvram" })
                     else
-                        try alloc.dupe([]const u8, &.{ "grub-install", s(alloc, "--target={s}", .{grubEfiTarget(cfg)}), s(alloc, "--efi-directory={s}", .{espInTarget(cfg)}) }),
+                        try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "if [ -d /sys/firmware/efi/efivars ]; then exec grub-install --target={s} --efi-directory={s}; else exec grub-install --target={s} --efi-directory={s} --removable; fi", .{ grubEfiTarget(cfg), espInTarget(cfg), grubEfiTarget(cfg), espInTarget(cfg) }) }),
                     .chroot = true,
                     .desc = "grub-install UEFI",
                 } })
