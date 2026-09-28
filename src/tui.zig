@@ -763,39 +763,39 @@ fn draw(t: *Tui, win: vaxis.Window) !void {
             }
         }
         if (has_err) {
-            if (short_stream) {
-                // flat fallback: as many ↳ lines as rows 5..h-6 fit,
-                // then a count of what couldn't be shown
-                var er: u16 = 5;
-                var shown: usize = 0;
-                for (t.errors.items) |e| {
-                    if (!e.on_page) continue;
-                    if (er >= h -| 5) break;
-                    _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " ↳ {s}", .{e.msg}), .style = err_style }}, .{ .row_offset = er, .col_offset = cx });
-                    er += 1;
-                    shown += 1;
-                }
-                var rem: usize = 0;
-                for (t.errors.items) |e| {
-                    if (e.on_page) rem += 1;
-                }
-                if (rem > shown) {
-                    _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " … +{d} problems", .{rem - shown}), .style = err_style }}, .{ .row_offset = h -| 5, .col_offset = cx });
-                }
-            } else {
-                if (li >= t.scroll and row < h -| 7) {
-                    _ = win.print(&.{.{ .text = " problems", .style = err_style }}, .{ .row_offset = row, .col_offset = cx });
+            // the "problems" header is one virtual item in both modes —
+            // short mode leaves its slot so scrollTotal's numbering
+            // lines up whether or not the stream has room to draw it
+            if (!short_stream and li >= t.scroll and row < h -| 7) {
+                _ = win.print(&.{.{ .text = " problems", .style = err_style }}, .{ .row_offset = row, .col_offset = cx });
+                row += 1;
+            }
+            li += 1;
+            var er: u16 = 5;
+            var shown: usize = 0;
+            var skipped: usize = 0;
+            var on_total: usize = 0;
+            for (t.errors.items) |e| {
+                if (!e.on_page) continue;
+                on_total += 1;
+                if (short_stream) {
+                    // flat rows 5..h-6, still offset by scroll — items
+                    // above the window are skipped, items below counted
+                    if (li < t.scroll) {
+                        skipped += 1;
+                    } else if (er < h -| 5) {
+                        _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " ↳ {s}", .{e.msg}), .style = err_style }}, .{ .row_offset = er, .col_offset = cx });
+                        er += 1;
+                        shown += 1;
+                    }
+                } else if (li >= t.scroll and row < h -| 7) {
+                    _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, "   ↳ {s}", .{e.msg}), .style = err_style }}, .{ .row_offset = row, .col_offset = cx });
                     row += 1;
                 }
                 li += 1;
-                for (t.errors.items) |e| {
-                    if (!e.on_page) continue;
-                    if (li >= t.scroll and row < h -| 7) {
-                        _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, "   ↳ {s}", .{e.msg}), .style = err_style }}, .{ .row_offset = row, .col_offset = cx });
-                        row += 1;
-                    }
-                    li += 1;
-                }
+            }
+            if (short_stream and on_total - shown - skipped > 0) {
+                _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " … +{d} problems", .{on_total - shown - skipped}), .style = err_style }}, .{ .row_offset = h -| 5, .col_offset = cx });
             }
         }
     }
