@@ -166,22 +166,66 @@ pub const Tui = struct {
         t.ensureFocusVisible();
     }
 
+    /// First content row under title/subtitle/rule — must match draw().
+    fn contentStart(t: *Tui) usize {
+        return if (t.pv.subtitle.len > 0) 5 else 4;
+    }
+    /// Rendered height of field `i` at current focus/mode — the focused
+    /// enum expands into an option list, help + error rows hang under
+    /// their field. Scroll math must use the same layout as draw(), or
+    /// focus lands on a field whose rows are already clipped away.
+    fn fieldRows(t: *Tui, i: usize) usize {
+        const f = t.pv.fields[i];
+        var r: usize = 1;
+        if (i == t.focus and std.mem.eql(u8, f.ftype, "enum") and f.options.len > 0 and t.mode == .form) {
+            r += @min(f.options.len, 6);
+            if (f.options.len > 6) r += 1;
+        } else if (i == t.focus and f.help != null) {
+            r += 1;
+        }
+        for (t.errors.items) |e| {
+            if (e.field) |ef| {
+                if (std.mem.eql(u8, ef, f.name)) r += 1;
+            }
+        }
+        return r;
+    }
+
     /// Keep the focused row inside the visible window — short terminals
     /// must scroll as focus moves, or the user edits invisible fields.
     /// On the review page (no fields) the arrows drive summary scroll
     /// instead, so this must not touch t.scroll.
     fn ensureFocusVisible(t: *Tui) void {
-        const max_rows: usize = t.last_h -| 8;
-        if (max_rows == 0) return;
+        const start = t.contentStart();
         if (t.pv.fields.len == 0) {
-            // review page — clamp the summary offset to its content
+            // review page — clamp the summary offset to its content.
+            // summary lines render at rows start..h-8 (draw clips at
+            // row < h-7), so that many rows are visible.
+            const vis: usize = ((t.last_h -| 8) -| start) + 1;
             const total = summaryLines(t.pv.summary);
-            t.scroll = @min(t.scroll, total -| max_rows);
+            t.scroll = @min(t.scroll, total -| vis);
             return;
         }
-        const target = @min(t.focus, t.pv.fields.len); // actions row counts
-        if (target < t.scroll) t.scroll = target;
-        if (target >= t.scroll + max_rows) t.scroll = target - max_rows + 1;
+        // the pinned actions row is always visible — no scroll needed
+        if (t.focus >= t.pv.fields.len) return;
+        if (t.focus < t.scroll) {
+            t.scroll = t.focus;
+            return;
+        }
+        // field rows render at start..h-7 (draw clips at row > h-7)
+        const vis: usize = ((t.last_h -| 7) -| start) + 1;
+        // scroll counts field indices but visibility counts rendered
+        // rows — advance until the focused field's full height fits.
+        while (t.scroll < t.focus) {
+            var used: usize = 0;
+            var fits = false;
+            for (t.scroll..t.focus + 1) |i| {
+                used += t.fieldRows(i);
+                if (i == t.focus) fits = used <= vis;
+            }
+            if (fits) break;
+            t.scroll += 1;
+        }
     }
 
     fn summaryLines(summary: []SumGroup) usize {
@@ -293,11 +337,13 @@ pub const Tui = struct {
         try t.refreshPage();
     }
 
-    /// `g<N>` — jump the nav rail. The engine's `goto` keeps flow
-    /// order, so a forward hop just lands on the page (next/back
-    /// resolve the intermediate pages on the next keypress).
+    /// `g<N>` — jump the nav rail. Backward hops only: the engine's
+    /// `goto` refuses todo pages (a forward jump would land on Review
+    /// with the gate pages unvalidated), so only done/current respond.
     fn gotoPage(t: *Tui, i: usize) !void {
         if (i >= t.pv.nav.len) return;
+        const st = t.pv.nav[i].state;
+        if (!std.mem.eql(u8, st, "done") and !std.mem.eql(u8, st, "current")) return;
         const id = t.pv.nav[i].id;
         var aw: std.Io.Writer.Allocating = .init(t.alloc);
         defer aw.deinit();
@@ -321,12 +367,26 @@ pub const Tui = struct {
             try t.showPlanPreview();
         } else if (std.mem.eql(u8, act, "export_answer")) {
             // cwd-relative — export is confined to the launch dir.
+            if (!try t.requireValidConfig()) return;
             try t.wiz.exportAnswer("gentoo-installer-answer.toml");
             t.status = "answer file → ./gentoo-installer-answer.toml";
         } else if (std.mem.eql(u8, act, "install")) {
+            if (!try t.requireValidConfig()) return;
             t.mode = .confirm_install;
             t.edit_buf.clearRetainingCapacity();
         }
+    }
+
+    /// Whole-config gate for the review actions — Review can be reached
+    /// without `next` having validated every page (answer-file load,
+    /// rail jump), so export/install re-check the full validator first.
+    fn requireValidConfig(t: *Tui) !bool {
+        const errs = try engine.config.validate(t.alloc, &t.wiz.cfg, nvidiaTier(&t.wiz), if (t.wiz.env) |*e| e else null);
+        if (errs.len == 0) return true;
+        t.errors.clearRetainingCapacity();
+        for (errs) |e| try t.errors.append(t.alloc, .{ .field = wizard.errorField(e), .msg = e, .on_page = true });
+        t.status = "fix the listed problems first";
+        return false;
     }
 
     fn showPlanPreview(t: *Tui) !void {
@@ -919,8 +979,8 @@ pub fn runTui(init: std.process.Init, alloc: Allocator, io: std.Io, preset: ?*co
                     } else if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
                         if (review_scroll) {
                             const total = Tui.summaryLines(t.pv.summary);
-                            const max_rows: usize = t.last_h -| 8;
-                            t.scroll = @min(t.scroll + 1, total -| max_rows);
+                            const vis: usize = ((t.last_h -| 8) -| t.contentStart()) + 1;
+                            t.scroll = @min(t.scroll + 1, total -| vis);
                         } else {
                             t.focus = @min(t.focus + 1, t.pv.fields.len);
                             t.ensureFocusVisible();

@@ -335,13 +335,17 @@ const packages_fields = [_]Field{
     .{ .name = "makeconf.video_cards", .ftype = .string, .label = "VIDEO_CARDS", .help = "auto-detected" },
 };
 
-/// Attribute a validation error string to the field that owns it —
-/// config.validate leads with the dotted config path ("disk.device is
-/// required"), and the wizard's pseudo-fields match by name. Frontends
-/// render `field` errors inline; the rest are page banners.
+/// Attribute a validation error string to the schema field that owns
+/// it — config.validate leads with a config-path token that isn't
+/// always a field name verbatim: "disk.scheme=alongside must be …"
+/// carries a value, "disk.partitions[1].size …" an index. Normalize
+/// those to the field ("disk.scheme", "disk.partitions"), then match
+/// against the actual schema so a config path outside the wizard
+/// surface still surfaces as a page banner, never a dead inline slot.
 pub fn errorField(err: []const u8) ?[]const u8 {
-    const tok = std.mem.sliceTo(err, ' ');
-    if (std.mem.indexOfScalar(u8, tok, '.') != null) return tok;
+    var tok = std.mem.sliceTo(err, ' ');
+    tok = std.mem.sliceTo(tok, '=');
+    tok = std.mem.sliceTo(tok, '[');
     for (pages) |pg| {
         for (pg.fields) |f| {
             if (std.mem.eql(u8, f.name, tok)) return f.name;
@@ -415,15 +419,31 @@ pub const Wizard = struct {
     /// Emit the `page` event for the current (or named) page.
     pub fn emitPage(w: *Wizard, out: *std.Io.Writer, req: ?u64, name: ?[]const u8) !void {
         if (name) |nm| {
-            var found = false;
+            var target: ?usize = null;
             for (pages, 0..) |pg, i| {
                 if (std.mem.eql(u8, pg.id, nm)) {
-                    w.page_idx = i;
-                    found = true;
+                    target = i;
                     break;
                 }
             }
-            if (!found) return error.BadValue;
+            const pi = target orelse return error.BadValue;
+            // goto is a backward hop only — it must sit on the current
+            // flow and at-or-before the current page. A forward jump
+            // would land on Review with the gate pages unvalidated
+            // (install/export actions armed on an incomplete config),
+            // and an off-flow page (Advanced-only under Express) has
+            // no route back.
+            var buf: [pages.len]usize = undefined;
+            const order = w.flowOrder(&buf);
+            var ti: ?usize = null;
+            for (order, 0..) |opi, i| {
+                if (opi == pi) {
+                    ti = i;
+                    break;
+                }
+            }
+            if (ti == null or ti.? > w.flowIndex()) return error.BadValue;
+            w.page_idx = pi;
         }
         const pg = w.currentPage();
         try out.writeAll("{\"ev\":\"page\",");
@@ -522,25 +542,28 @@ pub const Wizard = struct {
             const pg = pages[pi];
             if (std.mem.eql(u8, pg.id, "review")) continue;
             seen[pi] = true;
-            try w.emitSummaryGroup(out, pg, &first_g);
+            try w.emitSummaryGroup(out, pg, true, &first_g);
         }
         // Pages hidden by the flow still carry the configured defaults —
-        // the review must show them before the user confirms.
+        // the review must show them before the user confirms. They get
+        // no edit target: off-flow pages are unreachable by `goto`, so
+        // a link would strand the user outside the nav rail.
         for (pages, 0..) |pg, pi| {
             if (seen[pi] or std.mem.eql(u8, pg.id, "review")) continue;
-            try w.emitSummaryGroup(out, pg, &first_g);
+            try w.emitSummaryGroup(out, pg, false, &first_g);
         }
         try out.writeAll("]");
     }
 
-    fn emitSummaryGroup(w: *Wizard, out: *std.Io.Writer, pg: Page, first_g: *bool) !void {
+    fn emitSummaryGroup(w: *Wizard, out: *std.Io.Writer, pg: Page, on_flow: bool, first_g: *bool) !void {
         if (!first_g.*) try out.writeAll(",");
         first_g.* = false;
         try out.writeAll("{\"title\":\"");
         jesc(out, pg.title);
-        // page to `goto` when the user wants to change this section
+        // page to `goto` when the user wants to change this section —
+        // empty for off-flow pages (they stay read-only in Express)
         try out.writeAll("\",\"edit\":\"");
-        jesc(out, pg.id);
+        jesc(out, if (on_flow) pg.id else "");
         try out.writeAll("\",\"lines\":[");
         var first_l = true;
         for (pg.fields) |f| {
@@ -2272,7 +2295,15 @@ fn testWizard() Wizard {
 
 fn pageJsonHas(w: *Wizard, alloc: Allocator, page_id: []const u8, needle: []const u8) !bool {
     var aw: std.Io.Writer.Allocating = .init(alloc);
-    try w.emitPage(&aw.writer, null, page_id);
+    // direct index jump — emitPage's named path is the `goto` op and
+    // now refuses forward/off-flow hops by design
+    for (pages, 0..) |pg, i| {
+        if (std.mem.eql(u8, pg.id, page_id)) {
+            w.page_idx = i;
+            break;
+        }
+    }
+    try w.emitPage(&aw.writer, null, null);
     return std.mem.indexOf(u8, aw.written(), needle) != null;
 }
 
@@ -2310,9 +2341,10 @@ test "every page emits valid JSON in both flows" {
         w.cfg.disk.luks = true; // widen visible field set
         w.cfg.disk.luks_passphrase = "sup3rsecret";
         w.cfg.disk.device = "/dev/vda";
-        for (pages) |pg| {
+        for (pages, 0..) |pg, pi| {
             var aw: std.Io.Writer.Allocating = .init(alloc);
-            try w.emitPage(&aw.writer, null, pg.id);
+            w.page_idx = pi; // direct jump — named emitPage is the restricted `goto` op
+            try w.emitPage(&aw.writer, null, null);
             _ = std.json.parseFromSlice(std.json.Value, alloc, aw.written(), .{}) catch |e| {
                 std.debug.print("invalid page JSON ({s}, page {s}): {s}\n", .{ @tagName(fl), pg.id, aw.written() });
                 return e;

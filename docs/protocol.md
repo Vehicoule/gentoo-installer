@@ -55,7 +55,7 @@ journal. (`repair` in-protocol is the same engine path as the
 | `page` | `page?` (name) | `page` | current page or the named one |
 | `next` | — | `page` or `review` | runs page VALIDATE first; `error` on failure |
 | `back` | — | `page` | — |
-| `goto` | `page` | `page` | review-page jump links; backward jumps only mutate nav |
+| `goto` | `page` | `page` | rail jump — restricted to done/current flow pages; forward or off-flow pages get `error` (a forward hop would reach Review with gate pages unvalidated) |
 | `plan` | — | `plan` | the DiskPlan/`Cmd` preview — dry-run identical |
 | `validate` | — | `validate` | whole-config check (P7's gate backend) |
 | `export_answer` | `path` | `result` | writes TOML mode 0600; passwords → hashes |
@@ -120,7 +120,9 @@ on the nav rail (`Get started`, `Storage`, `Personalize`, `Software`,
 
 The `review` page additionally emits `summary[]` — `{title, edit,
 lines[]}` groups where `edit` is the page id a frontend links its
-"Change" button to — and `steps[]` — `{id, title}` of every plan step,
+"Change" button to (empty string for pages hidden by the current flow —
+they render read-only, off-flow pages are unreachable by `goto`) — and
+`steps[]` — `{id, title}` of every plan step,
 so the install view can draw the timeline before `step` events arrive.
 
 `validate` errors carry `field`: the dotted config path the message
