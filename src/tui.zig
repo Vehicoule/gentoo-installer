@@ -22,15 +22,22 @@ const FieldView = struct {
     options: []OptView = &.{},
     value: std.json.Value = .null,
 };
-const SumGroup = struct { title: []const u8, lines: [][]const u8 };
+const NavItem = struct { id: []const u8, title: []const u8, section: []const u8, state: []const u8 };
+const SumGroup = struct { title: []const u8, edit: []const u8 = "", lines: [][]const u8 };
+const StepView = struct { id: []const u8, title: []const u8, state: []const u8 = "todo" };
+const ErrItem = struct { field: ?[]const u8, msg: []const u8, on_page: bool };
 const PageView = struct {
     page: []const u8,
     index: u32,
     of: u32,
     title: []const u8,
+    section: []const u8 = "",
+    subtitle: []const u8 = "",
+    nav: []NavItem = &.{},
     fields: []FieldView = &.{},
     actions: [][]const u8 = &.{},
     summary: []SumGroup = &.{},
+    steps: []StepView = &.{},
 };
 
 const Mode = enum { form, editing, confirm_install, progress, plan_preview, done, failed };
@@ -49,12 +56,17 @@ pub const Tui = struct {
     edit_field: usize = 0,
     edit_confirm: std.ArrayList(u8) = .empty,
     confirming: bool = false,
-    errors: std.ArrayList([]const u8) = .empty,
+    errors: std.ArrayList(ErrItem) = .empty,
     status: []const u8 = "",
     prog_lines: std.ArrayList([]const u8) = .empty,
     plan_lines: std.ArrayList([]const u8) = .empty,
+    /// timeline for the install view — ids/titles live on `alloc`
+    /// (frame arena resets each keypress), state mutates via on_step.
+    install_steps: std.ArrayList(StepView) = .empty,
     frame_arena: std.heap.ArenaAllocator,
     scroll: usize = 0,
+    /// pending digit for the `g<N>` nav jump — 0 = no jump armed.
+    goto_armed: bool = false,
 
     pub fn init(alloc: Allocator, io: std.Io) Tui {
         return .{
@@ -78,7 +90,22 @@ pub const Tui = struct {
             .index = @intCast(o.get("index").?.integer),
             .of = @intCast(o.get("of").?.integer),
             .title = o.get("title").?.string,
+            .section = if (o.get("section")) |s| s.string else "",
+            .subtitle = if (o.get("subtitle")) |s| s.string else "",
         };
+        if (o.get("nav")) |nv| {
+            var nav: std.ArrayList(NavItem) = .empty;
+            for (nv.array.items) |n| {
+                const no = n.object;
+                try nav.append(fa, .{
+                    .id = no.get("id").?.string,
+                    .title = no.get("title").?.string,
+                    .section = if (no.get("section")) |s| s.string else "",
+                    .state = no.get("state").?.string,
+                });
+            }
+            pv.nav = nav.items;
+        }
         if (o.get("fields")) |fv| {
             var fields: std.ArrayList(FieldView) = .empty;
             for (fv.array.items) |f| {
@@ -114,9 +141,17 @@ pub const Tui = struct {
                 const go = g.object;
                 var lines: std.ArrayList([]const u8) = .empty;
                 for (go.get("lines").?.array.items) |l| try lines.append(fa, l.string);
-                try groups.append(fa, .{ .title = go.get("title").?.string, .lines = lines.items });
+                try groups.append(fa, .{ .title = go.get("title").?.string, .edit = if (go.get("edit")) |e| e.string else "", .lines = lines.items });
             }
             pv.summary = groups.items;
+        }
+        if (o.get("steps")) |sv| {
+            var steps: std.ArrayList(StepView) = .empty;
+            for (sv.array.items) |s| {
+                const so = s.object;
+                try steps.append(fa, .{ .id = so.get("id").?.string, .title = so.get("title").?.string });
+            }
+            pv.steps = steps.items;
         }
         if (o.get("actions")) |av| {
             var acts: std.ArrayList([]const u8) = .empty;
@@ -229,9 +264,21 @@ pub const Tui = struct {
     }
 
     fn refreshErrors(t: *Tui) !void {
-        const errs = try engine.config.validate(t.alloc, &t.wiz.cfg, nvidiaTier(&t.wiz), if (t.wiz.env) |*e| e else null);
+        // error strings live on the frame arena — this runs per
+        // keypress for live validation.
+        const fa = t.frame_arena.allocator();
+        const errs = try engine.config.validate(fa, &t.wiz.cfg, nvidiaTier(&t.wiz), if (t.wiz.env) |*e| e else null);
+        const mine = try t.wiz.pageErrors(fa, nvidiaTier(&t.wiz), t.wiz.currentPage());
         t.errors.clearRetainingCapacity();
-        for (errs) |e| try t.errors.append(t.alloc, e);
+        // only this page's errors surface — global noise on every
+        // screen is the incoherence we're removing.
+        for (errs) |e| {
+            var on_page = false;
+            for (mine) |m| {
+                if (std.mem.eql(u8, e, m)) on_page = true;
+            }
+            try t.errors.append(t.alloc, .{ .field = wizard.errorField(e), .msg = e, .on_page = on_page });
+        }
     }
 
     fn doNext(t: *Tui) !void {
@@ -241,8 +288,22 @@ pub const Tui = struct {
         } else {
             const errs = try t.wiz.pageErrors(t.alloc, nvidiaTier(&t.wiz), t.wiz.currentPage());
             t.errors.clearRetainingCapacity();
-            for (errs) |e| try t.errors.append(t.alloc, e);
+            for (errs) |e| try t.errors.append(t.alloc, .{ .field = wizard.errorField(e), .msg = e, .on_page = true });
         }
+        try t.refreshPage();
+    }
+
+    /// `g<N>` — jump the nav rail. The engine's `goto` keeps flow
+    /// order, so a forward hop just lands on the page (next/back
+    /// resolve the intermediate pages on the next keypress).
+    fn gotoPage(t: *Tui, i: usize) !void {
+        if (i >= t.pv.nav.len) return;
+        const id = t.pv.nav[i].id;
+        var aw: std.Io.Writer.Allocating = .init(t.alloc);
+        defer aw.deinit();
+        t.wiz.emitPage(&aw.writer, null, id) catch return;
+        t.focus = 0;
+        t.scroll = 0;
         try t.refreshPage();
     }
 
@@ -304,16 +365,29 @@ pub const Tui = struct {
             t.mode = .failed;
             return;
         };
+        // snapshot the review page's step list for the timeline — pv
+        // lives in frame_arena and would go stale mid-run.
+        t.install_steps.clearRetainingCapacity();
+        for (t.pv.steps) |s| {
+            try t.install_steps.append(t.alloc, .{
+                .id = try t.alloc.dupe(u8, s.id),
+                .title = try t.alloc.dupe(u8, s.title),
+            });
+        }
         const sctx = struct {
             lines: *std.ArrayList([]const u8),
+            steps: *std.ArrayList(StepView),
             alloc: Allocator,
         };
-        var ctx = sctx{ .lines = &t.prog_lines, .alloc = t.alloc };
+        var ctx = sctx{ .lines = &t.prog_lines, .steps = &t.install_steps, .alloc = t.alloc };
         const cb = struct {
             fn f(c: ?*anyopaque, i: usize, of: usize, id: []const u8, state: []const u8) void {
                 const sc: *sctx = @ptrCast(@alignCast(c orelse return));
                 const ln = std.fmt.allocPrint(sc.alloc, "[{}/{}] {s} — {s}", .{ i, of, state, id }) catch return;
                 sc.lines.append(sc.alloc, ln) catch return;
+                for (sc.steps.items) |*s| {
+                    if (std.mem.eql(u8, s.id, id)) s.state = state;
+                }
             }
         }.f;
         var logw: std.Io.Writer.Allocating = .init(t.alloc);
@@ -412,12 +486,102 @@ const dim: vaxis.Style = .{ .fg = fg_dim };
 const err_style: vaxis.Style = .{ .fg = fg_red };
 const ok_style: vaxis.Style = .{ .fg = fg_green };
 
+fn repStr(a: Allocator, s: []const u8, n: usize) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(a);
+    for (0..n) |_| try aw.writer.writeAll(s);
+    return aw.written();
+}
+
+fn fieldOnPage(pv: PageView, name: []const u8) bool {
+    for (pv.fields) |f| {
+        if (std.mem.eql(u8, f.name, name)) return true;
+    }
+    return false;
+}
+
+/// draw the nav rail: section headers dim-caps, pages numbered for
+/// `g<N>` jumps, done/current/todo glyphs.
+fn drawRail(t: *Tui, win: vaxis.Window, fa: Allocator, h: u16) !void {
+    var row: u16 = 1;
+    var last_section: []const u8 = "";
+    for (t.pv.nav, 0..) |n, i| {
+        if (row >= h -| 2) break;
+        if (!std.mem.eql(u8, n.section, last_section)) {
+            _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " {s}", .{n.section}), .style = .{ .fg = fg_dim, .bold = true } }}, .{ .row_offset = row });
+            last_section = n.section;
+            row += 1;
+            if (row >= h -| 2) break;
+        }
+        const done_ = std.mem.eql(u8, n.state, "done");
+        const cur = std.mem.eql(u8, n.state, "current");
+        const glyph = if (done_) "✓" else if (cur) "▶" else "○";
+        const sty: vaxis.Style = if (cur) accent else if (done_) ok_style else dim;
+        // clip long titles rather than bleeding over the divider
+        const title = if (n.title.len > 17) n.title[0..16] else n.title;
+        const ln = try std.fmt.allocPrint(fa, " {d} {s} {s}", .{ i + 1, glyph, title });
+        _ = win.print(&.{.{ .text = ln, .style = sty }}, .{ .row_offset = row });
+        row += 1;
+    }
+}
+
+fn drawModal(t: *Tui, win: vaxis.Window, fa: Allocator, w: u16, h: u16) !void {
+    const bw: u16 = @min(w -| 4, 52);
+    const bh: u16 = 9;
+    const bx = (w -| bw) / 2;
+    const by = (h -| bh) / 2;
+    const dev = t.wiz.cfg.disk.device;
+    const base = std.fs.path.basename(dev);
+    const bar = try repStr(fa, "─", bw - 2);
+    _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, "╭{s}╮", .{bar}), .style = err_style }}, .{ .row_offset = by, .col_offset = bx });
+    _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, "╰{s}╯", .{bar}), .style = err_style }}, .{ .row_offset = by + bh - 1, .col_offset = bx });
+    for (1..bh - 1) |i| {
+        _ = win.print(&.{.{ .text = "│", .style = err_style }}, .{ .row_offset = by + @as(u16, @intCast(i)), .col_offset = bx });
+        _ = win.print(&.{.{ .text = "│", .style = err_style }}, .{ .row_offset = by + @as(u16, @intCast(i)), .col_offset = bx + bw - 1 });
+        _ = win.print(&.{.{ .text = try repStr(fa, " ", bw - 2), .style = .{} }}, .{ .row_offset = by + @as(u16, @intCast(i)), .col_offset = bx + 1 });
+    }
+    _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " Install onto {s}?", .{dev}), .style = .{ .bold = true, .fg = fg_red } }}, .{ .row_offset = by + 1, .col_offset = bx + 1 });
+    _ = win.print(&.{.{ .text = " All data on the disk will be erased.", .style = .{} }}, .{ .row_offset = by + 2, .col_offset = bx + 1 });
+    _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " type `{s}` to continue — TUI previews only (dry-run)", .{base}), .style = dim }}, .{ .row_offset = by + 4, .col_offset = bx + 1 });
+    _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " > {s}▌", .{t.edit_buf.items}), .style = .{} }}, .{ .row_offset = by + 6, .col_offset = bx + 1 });
+    _ = win.print(&.{.{ .text = " esc cancel · enter confirm", .style = dim }}, .{ .row_offset = by + 7, .col_offset = bx + 1 });
+}
+
+/// install progress: left = step timeline, right = tail of the run log.
+fn drawProgress(t: *Tui, win: vaxis.Window, fa: Allocator, h: u16) !void {
+    var row: u16 = 2;
+    if (t.install_steps.items.len > 0) {
+        _ = win.print(&.{.{ .text = " steps", .style = .{ .fg = fg_dim, .bold = true } }}, .{ .row_offset = 1 });
+        for (t.install_steps.items) |s| {
+            if (row >= h -| 4) break;
+            const done_ = std.mem.eql(u8, s.state, "done");
+            const started = std.mem.eql(u8, s.state, "started");
+            const failed_ = std.mem.eql(u8, s.state, "failed");
+            const skipped_ = std.mem.eql(u8, s.state, "skipped");
+            const glyph = if (done_) "✓" else if (failed_) "✗" else if (started) "▸" else if (skipped_) "·" else "○";
+            const sty: vaxis.Style = if (failed_) err_style else if (started) accent else if (done_) ok_style else dim;
+            _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " {s} {s}", .{ glyph, s.title }), .style = sty }}, .{ .row_offset = row });
+            row += 1;
+        }
+    }
+    // log tail on the right — last N lines that fit
+    const lx: u16 = 30;
+    const cap = h -| 4;
+    const first = if (t.prog_lines.items.len > cap) t.prog_lines.items.len - cap else 0;
+    var lr: u16 = 2;
+    for (t.prog_lines.items[first..]) |ln| {
+        if (lr >= h -| 3) break;
+        _ = win.print(&.{.{ .text = ln, .style = .{} }}, .{ .row_offset = lr, .col_offset = lx });
+        lr += 1;
+    }
+    const sty: vaxis.Style = if (t.mode == .failed) err_style else if (t.mode == .done) ok_style else .{};
+    _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " {s}", .{t.status}), .style = sty }}, .{ .row_offset = h -| 2 });
+}
+
 fn draw(t: *Tui, win: vaxis.Window) !void {
     win.clear();
     // transient draw strings live on the frame arena — the process
     // allocator would grow by one redraw per keypress otherwise.
     const fa = t.frame_arena.allocator();
-    var row: u16 = 0;
     const w = win.width;
     const h = win.height;
     if (w < 30 or h < 8) {
@@ -425,53 +589,70 @@ fn draw(t: *Tui, win: vaxis.Window) !void {
         return;
     }
 
-    // header
-    const title = try std.fmt.allocPrint(fa, " gentoo-installer — {s}  ({d}/{d})  [{s}]", .{ t.pv.title, t.pv.index, t.pv.of, @tagName(t.wiz.flow) });
-    _ = win.print(&.{.{ .text = title, .style = .{ .reverse = true, .bold = true } }}, .{ .row_offset = row, .col_offset = 0 });
-    row += 2;
+    // header — brand + flow badge; page position moved to the rail.
+    const head = try std.fmt.allocPrint(fa, " gentoo-installer  ·  {s} flow", .{@tagName(t.wiz.flow)});
+    _ = win.print(&.{.{ .text = head, .style = .{ .reverse = true, .bold = true } }}, .{ .row_offset = 0, .col_offset = 0 });
+    _ = win.print(&.{.{ .text = try repStr(fa, " ", w -| @as(u16, @intCast(head.len))), .style = .{ .reverse = true } }}, .{ .row_offset = 0, .col_offset = @intCast(head.len) });
+    t.last_h = h;
 
     if (t.mode == .plan_preview) {
-        _ = win.print(&.{.{ .text = " plan preview — esc to return", .style = accent }}, .{ .row_offset = row });
-        row += 1;
-        for (t.plan_lines.items, 0..) |ln, i| {
-            if (row >= h -| 1) break;
-            _ = i;
-            _ = win.print(&.{.{ .text = ln, .style = .{} }}, .{ .row_offset = row });
-            row += 1;
+        _ = win.print(&.{.{ .text = " plan preview — esc to return", .style = accent }}, .{ .row_offset = 2 });
+        var prow: u16 = 3;
+        for (t.plan_lines.items) |ln| {
+            if (prow >= h -| 1) break;
+            _ = win.print(&.{.{ .text = ln, .style = .{} }}, .{ .row_offset = prow });
+            prow += 1;
         }
         return;
     }
 
     if (t.mode == .progress or t.mode == .done or t.mode == .failed) {
-        for (t.prog_lines.items) |ln| {
-            if (row >= h -| 4) break;
-            _ = win.print(&.{.{ .text = ln, .style = .{} }}, .{ .row_offset = row });
-            row += 1;
-        }
-        _ = win.print(&.{.{ .text = t.status, .style = if (t.mode == .failed) err_style else ok_style }}, .{ .row_offset = row + 1 });
+        try drawProgress(t, win, fa, h);
+        _ = win.print(&.{.{ .text = " q quit", .style = .{ .reverse = true } }}, .{ .row_offset = h -| 1 });
         return;
     }
 
     if (t.mode == .confirm_install) {
-        _ = win.print(&.{.{ .text = "Type the disk name to confirm the dry-run preview (exec rides on headless):", .style = accent }}, .{ .row_offset = row });
-        row += 1;
-        _ = win.print(&.{.{ .text = t.edit_buf.items, .style = sel }}, .{ .row_offset = row });
+        try drawRail(t, win, fa, h);
+        try drawModal(t, win, fa, w, h);
         return;
     }
 
-    // review page: grouped config summary — scrollable slice, arrows
-    // adjust t.scroll on this page (fields.len == 0).
+    const rail_w: u16 = 24;
+    const cx: u16 = rail_w + 2;
+    try drawRail(t, win, fa, h);
+    // rail/content divider
+    for (1..h -| 2) |i| {
+        _ = win.print(&.{.{ .text = "│", .style = dim }}, .{ .row_offset = @intCast(i), .col_offset = rail_w });
+    }
+
+    var row: u16 = 1;
+    _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " {s}", .{t.pv.title}), .style = .{ .bold = true, .fg = fg_cyan } }}, .{ .row_offset = row, .col_offset = cx });
+    row += 1;
+    if (t.pv.subtitle.len > 0) {
+        _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " {s}", .{t.pv.subtitle}), .style = dim }}, .{ .row_offset = row, .col_offset = cx });
+        row += 1;
+    }
+    _ = win.print(&.{.{ .text = try repStr(fa, "─", w -| cx -| 1), .style = dim }}, .{ .row_offset = row, .col_offset = cx });
+    row += 2;
+
+    // review page: grouped config cards — scrollable; 'g<N>' jumps to
+    // the owning page, arrows scroll the summary (fields.len == 0).
     if (t.pv.summary.len > 0) {
         var li: usize = 0;
         for (t.pv.summary) |g| {
-            if (li >= t.scroll and row < h -| 6) {
-                _ = win.print(&.{.{ .text = g.title, .style = accent }}, .{ .row_offset = row, .col_offset = 1 });
+            if (li >= t.scroll and row < h -| 7) {
+                var gi: []const u8 = "";
+                for (t.pv.nav, 0..) |n, i| {
+                    if (std.mem.eql(u8, n.id, g.edit)) gi = try std.fmt.allocPrint(fa, "  (g{d} to edit)", .{i + 1});
+                }
+                _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " {s}{s}", .{ g.title, gi }), .style = accent }}, .{ .row_offset = row, .col_offset = cx });
                 row += 1;
             }
             li += 1;
             for (g.lines) |ln| {
-                if (li >= t.scroll and row < h -| 6) {
-                    _ = win.print(&.{.{ .text = ln, .style = .{} }}, .{ .row_offset = row, .col_offset = 3 });
+                if (li >= t.scroll and row < h -| 7) {
+                    _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, "   {s}", .{ln}), .style = .{} }}, .{ .row_offset = row, .col_offset = cx });
                     row += 1;
                 }
                 li += 1;
@@ -479,10 +660,10 @@ fn draw(t: *Tui, win: vaxis.Window) !void {
         }
     }
 
-    t.last_h = h;
-    // fields
-    var vi: usize = 0; // visible row index (fields + action row)
-    const max_rows = h -| 8;
+    // fields — label col, value col, focused enum expands into an
+    // option list, help + errors inline under the field.
+    var vi: usize = 0;
+    const max_rows = h -| 9;
     for (t.pv.fields, 0..) |f, i| {
         if (vi < t.scroll) {
             vi += 1;
@@ -492,56 +673,86 @@ fn draw(t: *Tui, win: vaxis.Window) !void {
         vi += 1;
         const is_focus = i == t.focus;
         const sty: vaxis.Style = if (is_focus) sel else .{};
-        const label = try std.fmt.allocPrint(fa, " {s}", .{f.label});
-        _ = win.print(&.{.{ .text = label, .style = sty }}, .{ .row_offset = row, .col_offset = 0 });
-        // value
+        _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " {s}", .{f.label}), .style = sty }}, .{ .row_offset = row, .col_offset = cx });
         var vbuf: std.Io.Writer.Allocating = .init(fa);
         try renderValue(&vbuf.writer, f, t, i);
-        _ = win.print(&.{.{ .text = vbuf.written(), .style = sty }}, .{ .row_offset = row, .col_offset = @min(28, w / 3) });
-        // help on focused field
-        if (is_focus and f.help != null)
-            _ = win.print(&.{.{ .text = f.help.?, .style = dim }}, .{ .row_offset = row, .col_offset = @min(60, w / 2) });
+        _ = win.print(&.{.{ .text = vbuf.written(), .style = sty }}, .{ .row_offset = row, .col_offset = cx + @min(26, w / 4) });
         row += 1;
+        // focused enum expands inline: option list w/ current marked
+        if (is_focus and std.mem.eql(u8, f.ftype, "enum") and f.options.len > 0 and t.mode == .form) {
+            const cur = switch (f.value) {
+                .string => |s| s,
+                else => "",
+            };
+            const show = @min(f.options.len, 6);
+            for (f.options[0..show]) |o| {
+                if (row > 2 + max_rows) break;
+                const on = std.mem.eql(u8, o.v, cur);
+                var obuf: std.Io.Writer.Allocating = .init(fa);
+                try obuf.writer.print("   {s} {s}", .{ if (on) "●" else "○", o.label });
+                if (o.help) |oh| try obuf.writer.print("  ·  {s}", .{oh});
+                _ = win.print(&.{.{ .text = obuf.written(), .style = if (on) accent else dim }}, .{ .row_offset = row, .col_offset = cx });
+                row += 1;
+            }
+            if (f.options.len > show and row <= 2 + max_rows) {
+                _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, "   … {} more", .{f.options.len - show}), .style = dim }}, .{ .row_offset = row, .col_offset = cx });
+                row += 1;
+            }
+        }
+        // focused field help line
+        if (is_focus and f.help != null and row <= 2 + max_rows and !std.mem.eql(u8, f.ftype, "enum")) {
+            _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, "   {s}", .{f.help.?}), .style = dim }}, .{ .row_offset = row, .col_offset = cx });
+            row += 1;
+        }
+        // inline errors for this field
+        for (t.errors.items) |e| {
+            if (e.field) |ef| {
+                if (std.mem.eql(u8, ef, f.name)) {
+                    if (row > 2 + max_rows) break;
+                    _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, "   ↳ {s}", .{e.msg}), .style = err_style }}, .{ .row_offset = row, .col_offset = cx });
+                    row += 1;
+                }
+            }
+        }
     }
 
-    // actions row — a long summary can't be allowed to push actions
-    // offscreen; pin a fallback slot above the error block if the
-    // natural position ran out of room.
+    // actions row — pinned above the footer so a long page can't push
+    // buttons offscreen.
     if (t.pv.actions.len > 0) {
-        const pinned = h -| @as(u16, @intCast(@min(t.errors.items.len + 4, h -| 4)));
-        const act_row: u16 = if (row <= 2 + max_rows) row + 1 else pinned;
-        var col: u16 = 2;
+        const act_row = h -| 3;
+        var col: u16 = cx;
         for (t.pv.actions, 0..) |a, i| {
             const is_focus = (t.focus == t.pv.fields.len) and t.action_sel == i;
             // the TUI's install is a dry-run preview — label it so.
-            const shown = if (std.mem.eql(u8, a, "install")) "preview install (dry-run)" else a;
+            const shown = if (std.mem.eql(u8, a, "install")) "install (dry-run)" else a;
             const label = try std.fmt.allocPrint(fa, "[ {s} ]", .{shown});
             _ = win.print(&.{.{ .text = label, .style = if (is_focus) sel else accent }}, .{ .row_offset = act_row, .col_offset = col });
             col += @intCast(label.len + 1);
         }
-        row = act_row + 1;
     }
 
-    // errors
-    if (t.errors.items.len > 0) {
-        row = h -| @as(u16, @intCast(@min(t.errors.items.len + 3, h -| 3)));
-        _ = win.print(&.{.{ .text = " errors:", .style = err_style }}, .{ .row_offset = row });
-        row += 1;
-        for (t.errors.items) |e| {
-            if (row >= h -| 2) break;
-            _ = win.print(&.{.{ .text = e, .style = err_style }}, .{ .row_offset = row, .col_offset = 2 });
-            row += 1;
-        }
+    // page-level errors (unattributed or off-page) as a banner — only
+    // when the error actually belongs to the page being shown.
+    var n_banner: u16 = 0;
+    for (t.errors.items) |e| {
+        if (!e.on_page) continue;
+        const unattributed = e.field == null or !fieldOnPage(t.pv, e.field.?);
+        if (!unattributed) continue;
+        if (n_banner > 2) break;
+        _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " {s}", .{e.msg}), .style = err_style }}, .{ .row_offset = h -| 6 + n_banner, .col_offset = cx });
+        n_banner += 1;
     }
 
     // footer
     const foot = if (t.mode == .editing)
         if (t.confirming) " confirm: type again · enter commit · esc cancel" else " editing — enter commit · esc cancel"
+    else if (t.goto_armed)
+        " g<N>: pick a page number from the rail"
     else
-        " ↑↓ navigate · enter edit/cycle · ←→ options · space toggle · PgUp/PgDn page · q quit";
+        " ↑↓ navigate · enter edit · ←→/space pick · PgUp/Dn page · g<N> jump · q quit";
     _ = win.print(&.{.{ .text = foot, .style = .{ .reverse = true } }}, .{ .row_offset = h -| 1 });
     if (t.status.len > 0)
-        _ = win.print(&.{.{ .text = t.status, .style = ok_style }}, .{ .row_offset = h -| 2 });
+        _ = win.print(&.{.{ .text = t.status, .style = ok_style }}, .{ .row_offset = h -| 2, .col_offset = cx });
 }
 
 fn renderValue(w: *std.Io.Writer, f: FieldView, t: *Tui, i: usize) !void {
@@ -682,7 +893,17 @@ pub fn runTui(init: std.process.Init, alloc: Allocator, io: std.Io, preset: ?*co
                         try t.edit_buf.appendSlice(t.alloc, txt);
                     }
                 } else if (t.mode == .form) {
-                    if (key.matches('q', .{})) break;
+                    if (t.goto_armed) {
+                        t.goto_armed = false;
+                        if (key.text) |txt| {
+                            if (txt.len == 1 and txt[0] >= '1' and txt[0] <= '9')
+                                try t.gotoPage(txt[0] - '1')
+                            else if (txt.len == 1 and txt[0] == '0')
+                                try t.gotoPage(9);
+                        }
+                    } else if (key.matches('g', .{})) {
+                        t.goto_armed = true;
+                    } else if (key.matches('q', .{})) break;
                     // review page (no fields): ↑/↓ scroll the summary
                     const review_scroll = t.pv.fields.len == 0 and t.pv.summary.len > 0;
                     if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
@@ -742,6 +963,7 @@ pub fn runTui(init: std.process.Init, alloc: Allocator, io: std.Io, preset: ?*co
         _ = t.frame_arena.reset(.retain_capacity);
         // re-emit page inside frame arena so pv fields stay valid this frame
         try t.refreshPage();
+        try t.refreshErrors();
         const win = vx.window();
         try draw(&t, win);
         try vx.render(tty.writer());

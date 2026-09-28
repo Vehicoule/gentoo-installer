@@ -114,10 +114,22 @@ enum Message {
     Plan,
     /// Enter pressed in a text field — used to commit answer_file loads.
     Submit(String),
+    /// Sidebar rail entry clicked — engine `goto` (backward jumps keep
+    /// flow order; forward hops land on the page and `next` resolves the
+    /// skipped pages from there).
+    Goto(String),
 }
 
 struct Step {
     name: String,
+    state: String,
+}
+
+/// One rail entry from the page event's `nav` array.
+struct NavItem {
+    id: String,
+    title: String,
+    section: String,
     state: String,
 }
 
@@ -142,6 +154,7 @@ struct Installer {
     disk_device: String,                     // last disk.device seen — survives leaving its page
     install_confirm: String,                 // typed basename ack gating the Install button
     steps: Vec<Step>,
+    nav: Vec<NavItem>, // page rail mirrored from the engine's nav state
     plan: Option<String>,
     errors: Vec<String>,
     log: Vec<String>,
@@ -291,6 +304,7 @@ impl cosmic::app::Application for Installer {
             disk_device: String::new(),
             install_confirm: String::new(),
             steps: Vec::new(),
+            nav: Vec::new(),
             plan: None,
             errors: Vec::new(),
             log: vec![format!("spawn {}", engine_binary())],
@@ -399,6 +413,36 @@ impl cosmic::app::Application for Installer {
                             self.selected.remove(n);
                         }
                     }
+                    self.nav = v
+                        .get("nav")
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .map(|n| NavItem {
+                                    id: n
+                                        .get("id")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    title: n
+                                        .get("title")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    section: n
+                                        .get("section")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    state: n
+                                        .get("state")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("todo")
+                                        .to_string(),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     self.page = Some(v);
                 }
                 Some("validate") => {
@@ -568,6 +612,9 @@ impl cosmic::app::Application for Installer {
                 // conditional fields (e.g. luks reveals its passphrase)
                 send_op(json!({"op": "page"}));
             }
+            Message::Goto(page) => {
+                send_op(json!({"op": "goto", "page": page}));
+            }
             Message::Select(name, val) => {
                 self.selected.insert(name.clone(), val.clone());
                 if name == "disk.device" {
@@ -636,11 +683,61 @@ impl cosmic::app::Application for Installer {
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
+        match self.phase {
+            Phase::Wizard => self.view_wizard(),
+            _ => self.view_run(),
+        }
+    }
+}
+
+impl Installer {
+    /// Left rail: section headers + one row per page (done/current are
+    /// clickable — the engine's `goto` keeps flow order).
+    fn rail(&self) -> Element<'_, Message> {
         let spacing = theme::spacing();
-        let mut col = widget::column::with_capacity(4)
+        let mut col = widget::column::with_capacity(self.nav.len() * 2)
+            .spacing(spacing.space_xxs)
+            .padding(spacing.space_m);
+        let mut last_section = String::new();
+        for n in &self.nav {
+            if n.section != last_section {
+                col = col.push(widget::text::caption(n.section.clone()).class(theme::Text::Accent));
+                last_section = n.section.clone();
+            }
+            let glyph = match n.state.as_str() {
+                "done" => "✓",
+                "current" => "●",
+                _ => "○",
+            };
+            let btn = widget::button::text(format!("{glyph}  {}", n.title))
+                .width(Length::Fill)
+                .class(if n.state == "current" {
+                    theme::Button::Suggested
+                } else {
+                    theme::Button::Text
+                });
+            // only visited pages jump — a 'todo' hop would skip the
+            // gate pages the linear flow is built around
+            let btn = if n.state == "done" {
+                btn.on_press(Message::Goto(n.id.clone()))
+            } else {
+                btn
+            };
+            col = col.push(btn);
+        }
+        widget::container(col)
+            .width(Length::Fixed(240.0))
+            .height(Length::Fill)
+            .class(theme::Container::Background)
+            .into()
+    }
+
+    /// Install progress — step timeline + engine log tail + result.
+    fn view_run(&self) -> Element<'_, Message> {
+        let spacing = theme::spacing();
+        let mut col = widget::column::with_capacity(8)
             .spacing(spacing.space_m)
             .padding(spacing.space_l);
-
         match self.phase {
             Phase::Boot => {
                 col = col.push(widget::text::title2("Starting installer engine…"));
@@ -648,133 +745,48 @@ impl cosmic::app::Application for Installer {
             Phase::Dead => {
                 col = col.push(widget::text::title2("Engine exited"));
             }
-            Phase::Pending | Phase::Running | Phase::Done(_) | Phase::Failed => {
-                col = col.push(widget::text::title2(match self.phase {
+            _ => {
+                let title = match self.phase {
                     Phase::Pending => "Starting install…",
                     Phase::Running => "Installing…",
                     Phase::Done(true) => "Install complete — safe to reboot",
                     Phase::Done(false) => "Dry run complete",
                     Phase::Failed => "Installation failed",
                     _ => unreachable!(),
-                }));
+                };
+                col = col.push(widget::text::title2(title));
+                // step timeline — a card per install stage, marked by state
+                let mut steps_col =
+                    widget::column::with_capacity(self.steps.len()).spacing(spacing.space_xxs);
                 for s in &self.steps {
-                    let mark = match s.state.as_str() {
-                        "done" => "✓",
-                        "skipped" => "-",
-                        "failed" => "✗",
-                        _ => "…",
+                    let (mark, done) = match s.state.as_str() {
+                        "done" => ("✓", true),
+                        "skipped" => ("—", false),
+                        "failed" => ("✗", false),
+                        _ => ("…", false),
                     };
-                    col = col.push(widget::text(format!("{mark} {}", s.name)));
+                    let mut row = widget::row::with_capacity(2).spacing(spacing.space_s);
+                    row = row.push(widget::text(mark).width(Length::Fixed(20.0)));
+                    let name = widget::text(s.name.clone());
+                    let name = if s.state == "started" {
+                        name.class(theme::Text::Accent)
+                    } else {
+                        name
+                    };
+                    let _ = done;
+                    row = row.push(name);
+                    steps_col = steps_col.push(row);
                 }
-            }
-            Phase::Wizard => {
-                if let Some(p) = &self.page {
-                    let title = p.get("title").and_then(Value::as_str).unwrap_or("");
-                    let idx = p.get("index").and_then(Value::as_u64).unwrap_or(0);
-                    let of = p.get("of").and_then(Value::as_u64).unwrap_or(0);
-                    col = col.push(widget::text(format!("Step {idx} of {of}")));
-                    col = col.push(widget::text::title2(title));
-                    if let Some(fields) = p.get("fields").and_then(Value::as_array) {
-                        for f in fields {
-                            col = col.push(field_widget(
-                                f,
-                                &self.inputs,
-                                &self.confirm_inputs,
-                                &self.selected,
-                            ));
-                        }
-                    }
-                    if let Some(groups) = p.get("summary").and_then(Value::as_array) {
-                        for g in groups {
-                            let gt = g.get("title").and_then(Value::as_str).unwrap_or("");
-                            col = col.push(widget::text::title4(gt));
-                            for it in g
-                                .get("lines")
-                                .and_then(Value::as_array)
-                                .cloned()
-                                .unwrap_or_default()
-                            {
-                                col = col.push(widget::text(it.as_str().unwrap_or("").to_string()));
-                            }
-                        }
-                    }
-                    let has_install = p
-                        .get("actions")
-                        .and_then(Value::as_array)
-                        .map(|a| a.iter().any(|x| x.as_str() == Some("install")))
-                        .unwrap_or(false);
-                    if has_install {
-                        // destructive gate: the engine wants the target disk's
-                        // basename; make the user type it instead of
-                        // auto-filling the confirm token.
-                        let base = self
-                            .disk_device
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or(&self.disk_device)
-                            .to_string();
-                        col = col.push(
-                            widget::text_input(
-                                format!("type '{base}' to confirm install"),
-                                &self.install_confirm,
-                            )
-                            .on_input(Message::InstallConfirm),
-                        );
-                    }
-                    // actions
-                    let mut row = widget::row::with_capacity(4).spacing(spacing.space_s);
-                    for a in p
-                        .get("actions")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default()
-                    {
-                        let a = a.as_str().unwrap_or("");
-                        let btn = match a {
-                            "next" => {
-                                widget::button::suggested("Next").on_press(Message::Op("next"))
-                            }
-                            "back" => {
-                                widget::button::standard("Back").on_press(Message::Op("back"))
-                            }
-                            "quit" => {
-                                widget::button::destructive("Quit").on_press(Message::Op("quit"))
-                            }
-                            "plan" => widget::button::standard("Plan").on_press(Message::Plan),
-                            "export_answer" => widget::button::standard("Export")
-                                .on_press(Message::Op("export_answer")),
-                            "install" => {
-                                let dry =
-                                    widget::button::standard("Dry run").on_press(Message::DryRun);
-                                row = row.push(dry);
-                                let b = widget::button::destructive("Install");
-                                let base = self
-                                    .disk_device
-                                    .rsplit('/')
-                                    .next()
-                                    .unwrap_or(&self.disk_device);
-                                if !base.is_empty() && self.install_confirm == base {
-                                    b.on_press(Message::Install)
-                                } else {
-                                    b
-                                }
-                            }
-                            _ => continue,
-                        };
-                        row = row.push(btn);
-                    }
-                    col = col.push(row);
-                }
+                col = col.push(
+                    widget::container(steps_col)
+                        .padding(spacing.space_m)
+                        .width(Length::Fill)
+                        .class(theme::Container::Card),
+                );
             }
         }
-
         for e in &self.errors {
-            col = col.push(widget::text::body(e).class(theme::Text::Custom(|t| {
-                cosmic::iced::widget::text::Style {
-                    color: Some(t.cosmic().destructive.base.into()),
-                    ..Default::default()
-                }
-            })));
+            col = col.push(error_text(e));
         }
         if let Some(plan) = &self.plan {
             col = col
@@ -782,6 +794,162 @@ impl cosmic::app::Application for Installer {
         }
         widget::scrollable(col).into()
     }
+
+    /// Wizard: rail + one-concept page (title, subtitle, fields/cards,
+    /// actions) — the engine owns page order and validation.
+    fn view_wizard(&self) -> Element<'_, Message> {
+        let spacing = theme::spacing();
+        let mut col = widget::column::with_capacity(8)
+            .spacing(spacing.space_m)
+            .padding(spacing.space_l);
+
+        if let Some(p) = &self.page {
+            let title = p.get("title").and_then(Value::as_str).unwrap_or("");
+            let subtitle = p.get("subtitle").and_then(Value::as_str).unwrap_or("");
+            col = col.push(widget::text::title2(title));
+            if !subtitle.is_empty() {
+                col = col.push(widget::text::caption(subtitle.to_string()));
+            }
+            col = col.push(widget::divider::horizontal::light());
+
+            if let Some(fields) = p.get("fields").and_then(Value::as_array) {
+                for f in fields {
+                    col = col.push(field_widget(
+                        f,
+                        &self.inputs,
+                        &self.confirm_inputs,
+                        &self.selected,
+                    ));
+                }
+            }
+            if let Some(groups) = p.get("summary").and_then(Value::as_array) {
+                for g in groups {
+                    let gt = g
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let edit = g.get("edit").and_then(Value::as_str).unwrap_or("");
+                    let mut head = widget::row::with_capacity(2).spacing(spacing.space_m);
+                    head = head.push(widget::text::title4(gt));
+                    if !edit.is_empty() {
+                        head = head.push(
+                            widget::button::text("Edit").on_press(Message::Goto(edit.to_string())),
+                        );
+                    }
+                    let mut card = widget::column::with_capacity(4).spacing(spacing.space_xxs);
+                    card = card.push(head);
+                    for it in g
+                        .get("lines")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                    {
+                        card = card.push(widget::text(it.as_str().unwrap_or("").to_string()));
+                    }
+                    col = col.push(
+                        widget::container(card)
+                            .padding(spacing.space_m)
+                            .width(Length::Fill)
+                            .class(theme::Container::Card),
+                    );
+                }
+            }
+            let has_install = p
+                .get("actions")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().any(|x| x.as_str() == Some("install")))
+                .unwrap_or(false);
+            if has_install {
+                // destructive gate: the engine wants the target disk's
+                // basename typed — an emphasized warning panel, not a
+                // bare input row.
+                let base = self
+                    .disk_device
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&self.disk_device)
+                    .to_string();
+                let dev = self.disk_device.clone();
+                let mut panel = widget::column::with_capacity(3).spacing(spacing.space_xs);
+                panel = panel.push(widget::text::title4(format!("Install onto {dev}?")));
+                panel = panel.push(widget::text::body(
+                    "All data on the disk will be erased.".to_string(),
+                ));
+                panel = panel.push(
+                    widget::text_input(format!("type '{base}' to confirm"), &self.install_confirm)
+                        .on_input(Message::InstallConfirm),
+                );
+                col = col.push(
+                    widget::container(panel)
+                        .padding(spacing.space_m)
+                        .width(Length::Fill)
+                        .class(theme::Container::Card),
+                );
+            }
+            // actions
+            let mut row = widget::row::with_capacity(4).spacing(spacing.space_s);
+            for a in p
+                .get("actions")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+            {
+                let a = a.as_str().unwrap_or("");
+                let btn = match a {
+                    "next" => widget::button::suggested("Next").on_press(Message::Op("next")),
+                    "back" => widget::button::standard("Back").on_press(Message::Op("back")),
+                    "quit" => widget::button::destructive("Quit").on_press(Message::Op("quit")),
+                    "plan" => widget::button::standard("Plan").on_press(Message::Plan),
+                    "export_answer" => {
+                        widget::button::standard("Export").on_press(Message::Op("export_answer"))
+                    }
+                    "install" => {
+                        let dry = widget::button::standard("Dry run").on_press(Message::DryRun);
+                        row = row.push(dry);
+                        let b = widget::button::destructive("Install");
+                        let base = self
+                            .disk_device
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(&self.disk_device);
+                        if !base.is_empty() && self.install_confirm == base {
+                            b.on_press(Message::Install)
+                        } else {
+                            b
+                        }
+                    }
+                    _ => continue,
+                };
+                row = row.push(btn);
+            }
+            col = col.push(row);
+        }
+
+        for e in &self.errors {
+            col = col.push(error_text(e));
+        }
+        if let Some(plan) = &self.plan {
+            col = col
+                .push(widget::scrollable(widget::text(plan).size(11)).height(Length::Fixed(240.0)));
+        }
+
+        widget::row::with_capacity(3)
+            .push(self.rail())
+            .push(widget::divider::vertical::default())
+            .push(widget::scrollable(col).height(Length::Fill))
+            .height(Length::Fill)
+            .into()
+    }
+}
+
+fn error_text(e: &String) -> Element<'_, Message> {
+    widget::text::body(e.clone())
+        .class(theme::Text::Custom(|t| cosmic::iced::widget::text::Style {
+            color: Some(t.cosmic().destructive.base.into()),
+            ..Default::default()
+        }))
+        .into()
 }
 
 fn field_widget<'a>(

@@ -74,8 +74,8 @@ journal. (`repair` in-protocol is the same engine path as the
 | `result` | `req?`, `ok:true`, `data?` | ack for mutation ops (`set`, `answer`, `retry`…); `req` omitted when the op didn't send one |
 | `env` | `boot`, `arch`, `ram_mib`, `net`, `disks[]`, `oses[]`, `esps[]`, `gpus[]`, `live_media` | after `detect`; also pushed when hotplug changes disks |
 | `config` | `config` (secrets masked) | `get_config` reply |
-| `page` | `page` (name), `index`, `of`, `title`, `fields[]`, `actions[]` | navigation replies |
-| `validate` | `errors[]{path,code,message,hint}`, `warnings[]` | after `set`, `next`, `validate` |
+| `page` | `page` (name), `index`, `of`, `title`, `section`, `subtitle`, `nav[]`, `fields[]`, `actions[]`; review adds `summary[]`, `steps[]` | navigation replies |
+| `validate` | `errors[]{field?,message}`, `warnings[]` | after `set`, `next`, `validate` |
 | `plan` | `ops[]` (the partitioning doc's op list), `cmds[]` preview | `plan` reply |
 | `step` | `i`, `of`, `name`, `state`(started/done/failed/skipped), `secs?` | pipeline progress |
 | `progress` | `step`, `bytes?`, `pct?`, `label` | sub-step detail (downloads, rsync, emerge ETA) |
@@ -93,25 +93,39 @@ journal. (`repair` in-protocol is the same engine path as the
 owns labels, defaults, options, visibility:
 
 ```json
-{"ev":"page","page":"disk","index":1,"of":9,"fields":[
-  {"name":"disk.scheme","type":"enum","label":"Install mode",
-   "options":[{"v":"normal","label":"Erase disk"},
-              {"v":"alongside","label":"Install alongside Windows",
-               "help":"Keeps your existing OS"}],
-   "value":"normal","default":"normal"},
-  {"name":"disk.luks_passphrase","type":"secret","label":"Encryption passphrase",
-   "min":8,"confirm":true}],
- "actions":["next","back"]}
+{"ev":"page","page":"disk","index":2,"of":7,"title":"Disk",
+ "section":"Storage","subtitle":"pick the disk Gentoo installs onto",
+ "nav":[{"id":"welcome","title":"Welcome","section":"Get started","state":"done"},
+        {"id":"disk","title":"Disk","section":"Storage","state":"current"}],
+ "fields":[
+  {"name":"disk.device","type":"enum","label":"Target disk",
+   "options":[{"v":"/dev/vdb","label":"vdb · 64 GiB"}],
+   "value":"/dev/vdb","default":null}],
+ "actions":["back","next"]}
 ```
 
 Field types: `enum`, `bool`, `int`, `string`, `secret`, `list`, `record`,
 `table`, `path`. Visibility predicates live **engine-side only**: the
 emitted schema already omits fields and enum options whose conditions
-are false (the example above is emitted for a machine with a detected
-OS and `disk.luks=true` — otherwise `alongside` and the passphrase
-field are simply absent). Frontends get a fresh `page` event whenever
-a `set` changes visibility; they never evaluate predicates. `expert`
-fields are absent in Express flow.
+are false (a machine with no detected other OS never sees `alongside`;
+`disk.luks=false` hides the passphrase). Frontends get a fresh `page`
+event whenever a `set` changes visibility; they never evaluate
+predicates. `expert` fields are absent in Express flow.
+
+`section` + `subtitle` drive the guided layout: `section` groups pages
+on the nav rail (`Get started`, `Storage`, `Personalize`, `Software`,
+`Install`), `subtitle` is the one-line "why am I here" under the title.
+`nav[]` lists every page in the flow with `state` ∈ `done` / `current` /
+`todo` — frontends draw the rail from it and jump with `goto`.
+
+The `review` page additionally emits `summary[]` — `{title, edit,
+lines[]}` groups where `edit` is the page id a frontend links its
+"Change" button to — and `steps[]` — `{id, title}` of every plan step,
+so the install view can draw the timeline before `step` events arrive.
+
+`validate` errors carry `field`: the dotted config path the message
+belongs to (frontend renders it under that field), or `null` for
+page-level errors rendered as a banner.
 
 ## Secrets
 

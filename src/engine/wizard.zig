@@ -53,6 +53,11 @@ const Field = struct {
 const Page = struct {
     id: []const u8,
     title: []const u8,
+    /// nav-rail grouping ("Storage", "Personalize", …) — frontends
+    /// render the section label, not the word "page".
+    section: []const u8,
+    /// one-line hint under the page title — the "why am I here".
+    subtitle: []const u8,
     essential: bool, // visited in Express flow
     fields: []const Field = &.{},
     /// validation error field-prefixes owned by this page
@@ -165,12 +170,33 @@ const disk_fields = [_]Field{
         .{ .v = "bios", .label = "BIOS (legacy)" },
         .{ .v = "uefi", .label = "UEFI" },
     } },
+};
+
+// One concept per screen: scheme gets its own page — "what happens to
+// the disk you just picked" — with the alongside/manual expansions.
+const install_type_fields = [_]Field{
     .{ .name = "disk.scheme", .ftype = .@"enum", .label = "Partitioning", .options = &.{
         .{ .v = "efi-swap-root", .label = "Normal — erase disk (UEFI layout)", .visible = isUefi },
         .{ .v = "bios-boot-swap-root", .label = "Normal — erase disk (BIOS layout)", .visible = isBios },
         .{ .v = "alongside", .label = "Install alongside existing OS", .visible = hasOtherOs },
         .{ .v = "manual", .label = "Manual partition table", .help = "expert", .visible = null },
     } },
+    .{ .name = "disk.space_src", .ftype = .@"enum", .label = "Space source", .options = &.{
+        .{ .v = "free-space", .label = "Use free space" },
+        .{ .v = "shrink", .label = "Shrink a partition" },
+    }, .visible = isAlongside },
+    .{ .name = "disk.shrink_part", .ftype = .@"enum", .label = "Partition to shrink", .visible = shrinkSrc },
+    .{ .name = "disk.shrink_mib", .ftype = .int, .label = "Shrink by (MiB)", .visible = shrinkSrc },
+    // Free-form table for scheme=manual: one row per entry, fields
+    // `size:type:name:fs:mount` (';' or newline separated). size is
+    // <n>MiB|<n>GiB|rest; fs=swap takes no mount; fs=none leaves the
+    // partition unformatted.
+    .{ .name = "disk.partitions", .ftype = .string, .label = "Partition table", .help = "512MiB:EF00:ESP:vfat:/efi; rest:8304:root:btrfs:/", .visible = isManual, .expert = true },
+};
+
+// Third Storage screen: how the claimed space is laid out — filesystem,
+// swap, encryption, LVM.
+const layout_fields = [_]Field{
     .{ .name = "disk.root_fs", .ftype = .@"enum", .label = "Root filesystem", .options = &.{
         .{ .v = "btrfs", .label = "btrfs", .help = "recommended — CoW snapshots/rollback" },
         .{ .v = "xfs", .label = "xfs" },
@@ -190,17 +216,6 @@ const disk_fields = [_]Field{
     .{ .name = "disk.luks_passphrase", .ftype = .secret, .label = "Encryption passphrase", .min_len = 8, .confirm = true, .visible = luksOn },
     .{ .name = "disk.lvm", .ftype = .bool, .label = "LVM volume group", .help = "thin pool when snapshots are on" },
     .{ .name = "disk.home_part", .ftype = .bool, .label = "Separate /home (LVM LV)", .expert = true },
-    .{ .name = "disk.space_src", .ftype = .@"enum", .label = "Space source", .options = &.{
-        .{ .v = "free-space", .label = "Use free space" },
-        .{ .v = "shrink", .label = "Shrink a partition" },
-    }, .visible = isAlongside },
-    .{ .name = "disk.shrink_part", .ftype = .@"enum", .label = "Partition to shrink", .visible = shrinkSrc },
-    .{ .name = "disk.shrink_mib", .ftype = .int, .label = "Shrink by (MiB)", .visible = shrinkSrc },
-    // Free-form table for scheme=manual: one row per entry, fields
-    // `size:type:name:fs:mount` (';' or newline separated). size is
-    // <n>MiB|<n>GiB|rest; fs=swap takes no mount; fs=none leaves the
-    // partition unformatted.
-    .{ .name = "disk.partitions", .ftype = .string, .label = "Partition table", .help = "512MiB:EF00:ESP:vfat:/efi; rest:8304:root:btrfs:/", .visible = isManual, .expert = true },
 };
 
 const variant_fields = [_]Field{
@@ -233,7 +248,6 @@ const region_fields = [_]Field{
     .{ .name = "system.timezone", .ftype = .string, .label = "Timezone", .help = "zoneinfo name, e.g. Europe/Lisbon" },
     .{ .name = "system.locales", .ftype = .list, .label = "Locales to generate", .help = "locale.gen entries" },
     .{ .name = "system.locale", .ftype = .string, .label = "Default locale" },
-    .{ .name = "system.keymap", .ftype = .@"enum", .label = "Console keymap", .options = &keymap_opts },
     .{ .name = "services.ntp", .ftype = .bool, .label = "Network time sync", .help = "chrony / systemd-timesyncd" },
 };
 
@@ -321,15 +335,32 @@ const packages_fields = [_]Field{
     .{ .name = "makeconf.video_cards", .ftype = .string, .label = "VIDEO_CARDS", .help = "auto-detected" },
 };
 
+/// Attribute a validation error string to the field that owns it —
+/// config.validate leads with the dotted config path ("disk.device is
+/// required"), and the wizard's pseudo-fields match by name. Frontends
+/// render `field` errors inline; the rest are page banners.
+pub fn errorField(err: []const u8) ?[]const u8 {
+    const tok = std.mem.sliceTo(err, ' ');
+    if (std.mem.indexOfScalar(u8, tok, '.') != null) return tok;
+    for (pages) |pg| {
+        for (pg.fields) |f| {
+            if (std.mem.eql(u8, f.name, tok)) return f.name;
+        }
+    }
+    return null;
+}
+
 pub const pages = [_]Page{
-    .{ .id = "welcome", .title = "Welcome", .essential = true, .fields = &welcome_fields, .prefixes = &.{"system.keymap"} },
-    .{ .id = "disk", .title = "Disk & partitioning", .essential = true, .fields = &disk_fields, .prefixes = &.{ "disk.", "boot_mode" } },
-    .{ .id = "variant", .title = "Variant", .essential = false, .fields = &variant_fields, .prefixes = &.{ "stage3.", "system.init", "system.binhost", "security.hardening" } },
-    .{ .id = "region", .title = "Region & input", .essential = false, .fields = &region_fields, .prefixes = &.{ "system.timezone", "system.locale", "system.locales", "services.ntp" } },
-    .{ .id = "accounts", .title = "Accounts", .essential = true, .fields = &accounts_fields, .prefixes = &.{ "root.", "users", "system.privilege", "login", "privilege" } },
-    .{ .id = "system", .title = "System", .essential = false, .fields = &system_fields, .prefixes = &.{ "system.", "network.", "gpu.", "services.", "security.", "bootloader", "uki" } },
-    .{ .id = "packages", .title = "Packages & USE", .essential = false, .fields = &packages_fields, .prefixes = &.{ "packages.", "use.", "makeconf." } },
-    .{ .id = "review", .title = "Review & install", .essential = true, .prefixes = &.{} },
+    .{ .id = "welcome", .title = "Welcome", .section = "Get started", .subtitle = "keyboard + install mode", .essential = true, .fields = &welcome_fields, .prefixes = &.{"system.keymap"} },
+    .{ .id = "disk", .title = "Disk", .section = "Storage", .subtitle = "pick the disk Gentoo installs onto", .essential = true, .fields = &disk_fields, .prefixes = &.{ "disk.device", "boot_mode" } },
+    .{ .id = "install_type", .title = "Installation type", .section = "Storage", .subtitle = "erase, install alongside, or lay out partitions yourself", .essential = true, .fields = &install_type_fields, .prefixes = &.{ "disk.scheme", "disk.space_src", "disk.shrink", "disk.partitions" } },
+    .{ .id = "layout", .title = "Storage layout", .section = "Storage", .subtitle = "filesystem, encryption, swap", .essential = true, .fields = &layout_fields, .prefixes = &.{ "disk.root_fs", "disk.swap", "disk.esp", "disk.boot_part", "disk.luks", "disk.lvm", "disk.home" } },
+    .{ .id = "region", .title = "Region & timezone", .section = "Personalize", .subtitle = "time, language, clock sync", .essential = true, .fields = &region_fields, .prefixes = &.{ "system.timezone", "system.locale", "system.locales", "services.ntp" } },
+    .{ .id = "accounts", .title = "Accounts", .section = "Personalize", .subtitle = "your login + the root account", .essential = true, .fields = &accounts_fields, .prefixes = &.{ "root.", "users", "system.privilege", "login", "privilege" } },
+    .{ .id = "variant", .title = "System variant", .section = "Software", .subtitle = "init, C library, toolchain hardening", .essential = false, .fields = &variant_fields, .prefixes = &.{ "stage3.", "system.init", "system.binhost", "security.hardening" } },
+    .{ .id = "system", .title = "System", .section = "Software", .subtitle = "hostname, kernel, boot, network, services", .essential = false, .fields = &system_fields, .prefixes = &.{ "system.", "network.", "gpu.", "services.", "security.", "bootloader", "uki" } },
+    .{ .id = "packages", .title = "Packages & USE", .section = "Software", .subtitle = "package sets and build flags", .essential = false, .fields = &packages_fields, .prefixes = &.{ "packages.", "use.", "makeconf." } },
+    .{ .id = "review", .title = "Review & install", .section = "Install", .subtitle = "confirm — then it runs", .essential = true, .prefixes = &.{} },
 };
 
 // ---------- the wizard ----------
@@ -399,7 +430,13 @@ pub const Wizard = struct {
         if (req) |r| try out.print("\"req\":{},", .{r});
         try out.print("\"page\":\"{s}\",\"index\":{},\"of\":{},\"title\":\"", .{ pg.id, w.flowIndex() + 1, w.flowLen() });
         jesc(out, pg.title);
-        try out.writeAll("\",\"fields\":[");
+        try out.writeAll("\",\"section\":\"");
+        jesc(out, pg.section);
+        try out.writeAll("\",\"subtitle\":\"");
+        jesc(out, pg.subtitle);
+        try out.writeAll("\",\"nav\":[");
+        try w.emitNav(out);
+        try out.writeAll("],\"fields\":[");
         var first = true;
         for (pg.fields) |f| {
             if (f.expert and w.flow == .express) continue;
@@ -411,12 +448,67 @@ pub const Wizard = struct {
         if (std.mem.eql(u8, pg.id, "review")) {
             try out.writeAll("],\"summary\":[");
             try w.emitSummary(out);
+            // Step timeline for the install progress view — frontends
+            // render the list up front and light steps up as `step`
+            // events stream in.
+            try out.writeAll(",\"steps\":[");
+            try w.emitSteps(out);
         } else {
             try out.writeAll("]");
         }
         try out.writeAll(",\"actions\":[");
         try w.emitActions(out);
         try out.writeAll("]}\n");
+    }
+
+    /// nav-rail entries for every page in the current flow — done /
+    /// current / todo so frontends can draw progress without tracking
+    /// history themselves.
+    fn emitNav(w: *Wizard, out: *std.Io.Writer) !void {
+        var buf: [pages.len]usize = undefined;
+        const order = w.flowOrder(&buf);
+        const cur = w.flowIndex();
+        for (order, 0..) |pi, i| {
+            if (i > 0) try out.writeAll(",");
+            const pg = pages[pi];
+            try out.writeAll("{\"id\":\"");
+            jesc(out, pg.id);
+            try out.writeAll("\",\"title\":\"");
+            jesc(out, pg.title);
+            try out.writeAll("\",\"section\":\"");
+            jesc(out, pg.section);
+            try out.writeAll("\",\"state\":\"");
+            try out.writeAll(if (i < cur) "done" else if (i == cur) "current" else "todo");
+            try out.writeAll("\"}");
+        }
+    }
+
+    /// The step ids+titles the review page previews — the resolved plan
+    /// without its commands. Emit nothing when the config can't plan
+    /// (the validate event names why).
+    fn emitSteps(w: *Wizard, out: *std.Io.Writer) !void {
+        // Resolved only to list step ids+titles — plan allocations die
+        // with this arena, the emitted JSON outlives nothing.
+        var arena = std.heap.ArenaAllocator.init(w.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const ps = w.pkgSets(a) catch {
+            try out.writeAll("]");
+            return;
+        };
+        const p = plan.build(a, &w.cfg, if (w.env) |*e| e else null, ps.sets, w.preset, null) catch {
+            try out.writeAll("]");
+            return;
+        };
+        for (p.steps, 0..) |s, i| {
+            if (i > 0) try out.writeAll(",");
+            try out.writeAll("{\"id\":\"");
+            jesc(out, s.id);
+            try out.writeAll("\",\"title\":\"");
+            jesc(out, s.title);
+            try out.writeAll("\"}");
+        }
+        try out.writeAll("]");
     }
 
     /// Grouped "label: value" summary of the whole config for the
@@ -446,6 +538,9 @@ pub const Wizard = struct {
         first_g.* = false;
         try out.writeAll("{\"title\":\"");
         jesc(out, pg.title);
+        // page to `goto` when the user wants to change this section
+        try out.writeAll("\",\"edit\":\"");
+        jesc(out, pg.id);
         try out.writeAll("\",\"lines\":[");
         var first_l = true;
         for (pg.fields) |f| {
@@ -2188,8 +2283,8 @@ test "express flow visits only essential pages" {
     var w = testWizard();
     var aw: std.Io.Writer.Allocating = .init(alloc);
     try w.emitPage(&aw.writer, null, null);
-    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"of\":4") != null);
-    // welcome → disk → accounts → review
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"of\":7") != null);
+    // welcome → disk → install_type → layout → region → accounts → review
     try testing.expect(try w.next(alloc, null));
     try testing.expectEqualStrings("disk", w.currentPage().id);
 }
@@ -2202,7 +2297,7 @@ test "advanced flow visits all pages" {
     try w.setField("flow.mode", .{ .string = "advanced" });
     var aw: std.Io.Writer.Allocating = .init(alloc);
     try w.emitPage(&aw.writer, null, null);
-    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"of\":8") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"of\":10") != null);
 }
 
 test "every page emits valid JSON in both flows" {
@@ -2239,8 +2334,8 @@ test "secrets are masked in page emission and config" {
     var w = testWizard();
     w.cfg.disk.luks = true;
     w.cfg.disk.luks_passphrase = "sup3rsecret";
-    try testing.expect(try pageJsonHas(&w, alloc, "disk", "\"is_set\":true"));
-    try testing.expect(!(try pageJsonHas(&w, alloc, "disk", "sup3rsecret")));
+    try testing.expect(try pageJsonHas(&w, alloc, "layout", "\"is_set\":true"));
+    try testing.expect(!(try pageJsonHas(&w, alloc, "layout", "sup3rsecret")));
     var aw: std.Io.Writer.Allocating = .init(alloc);
     try w.emitConfigJson(&aw.writer, null);
     try testing.expect(std.mem.indexOf(u8, aw.written(), "sup3rsecret") == null);
@@ -2252,9 +2347,9 @@ test "luks passphrase field only visible when luks on" {
     const alloc = arena.allocator();
     var w = testWizard();
     w.flow = .advanced;
-    try testing.expect(!(try pageJsonHas(&w, alloc, "disk", "disk.luks_passphrase")));
+    try testing.expect(!(try pageJsonHas(&w, alloc, "layout", "disk.luks_passphrase")));
     try w.setField("disk.luks", .{ .bool = true });
-    try testing.expect(try pageJsonHas(&w, alloc, "disk", "disk.luks_passphrase"));
+    try testing.expect(try pageJsonHas(&w, alloc, "layout", "disk.luks_passphrase"));
 }
 
 test "root.password set hashes via openssl" {
