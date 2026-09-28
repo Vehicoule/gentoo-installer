@@ -1789,13 +1789,23 @@ fn planServices(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !
             for ([_][]const u8{ "init", "halt", "poweroff", "reboot", "shutdown", "telinit" }) |b|
                 try c.append(alloc, argv(alloc, &.{ "cp", "-a", s(alloc, "/mnt/gentoo/root/gi-mk/bin/{s}", .{b}), s(alloc, "/mnt/gentoo/sbin/{s}", .{b}) }, s(alloc, "install s6 {s}", .{b})));
             try c.append(alloc, argv(alloc, &.{ "rm", "-rf", "/mnt/gentoo/root/gi-mk" }, "drop maker staging"));
+            // Upstream requirement (s6-linux-init skel rc.shutdown): under
+            // s6 PID1, openrc's shutdown runlevel must not run killprocs
+            // or mount-ro — they kill the s6 supervision tree mid-teardown
+            // and stage 3 never finishes.
+            try c.append(alloc, argv(alloc, &.{ "rm", "-f",
+                "/mnt/gentoo/etc/runlevels/shutdown/killprocs",
+                "/mnt/gentoo/etc/runlevels/shutdown/mount-ro" }, "strip killprocs/mount-ro from shutdown runlevel"));
             // rc.init is stage 2: openrc owns sysinit/boot (gi-sysinit),
             // then s6-rc-init opens the compiled db on the live scandir
             // and brings up the default bundle ($1 is the boot runlevel).
             try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/etc/s6-linux-init/current/scripts/rc.init", .mode = 0o755,
                 .content = "#!/bin/sh\n/usr/libexec/gi-sysinit\ns6-rc-init -c /etc/s6-rc/compiled /run/service || exit 1\nexec s6-rc -u change \"${1:-default}\"\n" } });
+            // Bundle down first, then openrc's shutdown runlevel — the
+            // sysinit oneshot has no down action, so zram/mounts/sysctl
+            // state needs openrc's own teardown (same as runit's /3).
             try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/etc/s6-linux-init/current/scripts/rc.shutdown", .mode = 0o755,
-                .content = "#!/bin/sh\ns6-rc -da change default || true\n" } });
+                .content = "#!/bin/sh\ns6-rc -da change default || true\nopenrc shutdown || true\nexit 0\n" } });
             // s6-rc source db: sysinit is a oneshot every unit depends on,
             // tty1-4 are supervised agettys, `default` bundles them all.
             // The bundle's contents file is appended per enabled unit in
