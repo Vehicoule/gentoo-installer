@@ -1217,7 +1217,9 @@ fn error_panel<'a>(errs: impl Iterator<Item = &'a str>) -> Element<'a, Message> 
 /// it's clear these are the commands the install would run.
 fn plan_panel(plan: &str) -> Element<'_, Message> {
     let spacing = theme::spacing();
-    let n = plan.lines().count();
+    // "commands" = `     $` exec lines only — the stream also carries
+    // step headings, notes and write_file lines
+    let n = plan.lines().filter(|l| l.starts_with("     $")).count();
     let mut col = widget::column::with_capacity(2).spacing(spacing.space_xs);
     col = col.push(widget::text::title4(format!("Install plan — {n} commands")));
     col = col.push(

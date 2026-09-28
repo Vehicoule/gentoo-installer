@@ -724,8 +724,10 @@ fn drawProgress(t: *Tui, win: vaxis.Window, fa: Allocator, w: u16, h: u16) !void
     const sty: vaxis.Style = if (t.mode == .failed) err_style else if (t.mode == .done) ok_style else .{};
     _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " {s}", .{t.status}), .style = sty }}, .{ .row_offset = h -| 2 });
 
-    // result panel — a boxed verdict on the finished state
-    if (t.mode == .done or t.mode == .failed) {
+    // result panel — a boxed verdict on the finished state. Only
+    // when an install actually ran: quitting the wizard also lands
+    // on .done, and "✓ finished" would falsely report completion.
+    if ((t.mode == .done or t.mode == .failed) and t.install_steps.items.len > 0) {
         const psty: vaxis.Style = if (t.mode == .done) ok_style else err_style;
         const title = if (t.mode == .done) " ✓ finished " else " ✗ failed ";
         const bw: u16 = @min(w -| 4, @max(title.len + 6, t.status.len + 8));
@@ -770,9 +772,15 @@ fn draw(t: *Tui, win: vaxis.Window) !void {
 
     if (t.mode == .plan_preview) {
         const total = t.plan_lines.items.len;
+        // "commands" = `     $` exec lines only — step headings, notes
+        // and write_file lines ride in the same stream
+        var ncmd: usize = 0;
+        for (t.plan_lines.items) |ln| {
+            if (std.mem.startsWith(u8, ln, "     $")) ncmd += 1;
+        }
         const vis = h -| 4;
         t.plan_scroll = @min(t.plan_scroll, total -| vis);
-        _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " plan preview — {d} commands  ·  ↑↓ scroll · esc return", .{total}), .style = accent }}, .{ .row_offset = 2 });
+        _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " plan preview — {d} commands  ·  ↑↓ scroll · esc return", .{ncmd}), .style = accent }}, .{ .row_offset = 2 });
         var prow: u16 = 3;
         for (t.plan_lines.items[@min(t.plan_scroll, total)..]) |ln| {
             if (prow >= h -| 1) break;
@@ -783,18 +791,21 @@ fn draw(t: *Tui, win: vaxis.Window) !void {
             _ = win.print(&.{.{ .text = " ↑", .style = dim }}, .{ .row_offset = 2, .col_offset = w -| 3 });
         if (t.plan_scroll + vis < total)
             _ = win.print(&.{.{ .text = " ↓", .style = dim }}, .{ .row_offset = h -| 2, .col_offset = w -| 3 });
+        if (t.show_help) try drawHelp(win, fa, w, h);
         return;
     }
 
     if (t.mode == .progress or t.mode == .done or t.mode == .failed) {
         try drawProgress(t, win, fa, w, h);
         _ = win.print(&.{.{ .text = " q quit", .style = .{ .reverse = true } }}, .{ .row_offset = h -| 1 });
+        if (t.show_help) try drawHelp(win, fa, w, h);
         return;
     }
 
     if (t.mode == .confirm_install) {
         if (w >= 60) try drawRail(t, win, fa, h);
         try drawModal(t, win, fa, w, h);
+        if (t.show_help) try drawHelp(win, fa, w, h);
         return;
     }
 
@@ -1025,7 +1036,11 @@ fn drawHelp(win: vaxis.Window, fa: Allocator, w: u16, h: u16) !void {
     var lines: std.ArrayList([]const u8) = .empty;
     var it = std.mem.splitScalar(u8, HELP_TEXT, '\n');
     while (it.next()) |l| try lines.append(fa, l);
-    const bw: u16 = 52;
+    // bound by the terminal — the overlay must stay drawable at the
+    // supported 30-col minimum, so shrink the box and clip lines to
+    // the interior rather than spilling off the right edge
+    const bw: u16 = @min(52, w -| 4);
+    const iw: usize = bw -| 4;
     const bh: u16 = @intCast(@min(lines.items.len + 2, h -| 4));
     const bx = (w -| bw) / 2;
     const by = (h -| bh) / 2;
@@ -1037,7 +1052,7 @@ fn drawHelp(win: vaxis.Window, fa: Allocator, w: u16, h: u16) !void {
         _ = win.print(&.{.{ .text = try repStr(fa, " ", bw - 2), .style = .{} }}, .{ .row_offset = by + @as(u16, @intCast(i)), .col_offset = bx + 1 });
     }
     for (lines.items[0..@min(lines.items.len, bh -| 2)], 0..) |l, i| {
-        _ = win.print(&.{.{ .text = l, .style = .{} }}, .{ .row_offset = by + 1 + @as(u16, @intCast(i)), .col_offset = bx + 1 });
+        _ = win.print(&.{.{ .text = l[0..@min(l.len, iw)], .style = .{} }}, .{ .row_offset = by + 1 + @as(u16, @intCast(i)), .col_offset = bx + 1 });
     }
 }
 
@@ -1142,7 +1157,11 @@ pub fn runTui(init: std.process.Init, alloc: Allocator, io: std.Io, preset: ?*co
                 if (t.show_help) {
                     if (key.matches('?', .{}) or key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{}))
                         t.show_help = false;
-                } else if (key.text != null and key.text.?.len == 1 and key.text.?[0] == '?' and t.mode == .form) {
+                } else if (key.text != null and key.text.?.len == 1 and key.text.?[0] == '?' and
+                    // '?' is literal input in the text-entry modes —
+                    // help can't take it there
+                    (t.mode == .form or t.mode == .plan_preview or t.mode == .done or t.mode == .failed))
+                {
                     t.show_help = true;
                 } else if (t.mode == .done or t.mode == .failed) {
                     if (key.matches('q', .{})) break;
