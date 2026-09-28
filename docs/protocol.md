@@ -52,7 +52,7 @@ journal. (`repair` in-protocol is the same engine path as the
 | `get_config` | — | `config` | secrets masked (`{"secret":true,"is_set":bool}`) |
 | `set` | `field`, `value` | `result` + `validate` delta | dotted path (`disk.root_fs`); secrets accepted, never re-emitted |
 | `set_config` | `config` | `result` + `validate` | bulk load (answer file import) |
-| `page` | `page?` (name) | `page` | current page or the named one |
+| `page` | `page?` (name) | `page` | current page, or a *peek* at the named one — schema emitted but wizard position unchanged (`index` is its flow position, `0` when off-flow) |
 | `next` | — | `page` or `review` | runs page VALIDATE first; `error` on failure |
 | `back` | — | `page` | — |
 | `goto` | `page` | `page` | rail jump — restricted to done/current flow pages; forward or off-flow pages get `error` (a forward hop would reach Review with gate pages unvalidated) |
