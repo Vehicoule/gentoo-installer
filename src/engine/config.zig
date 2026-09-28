@@ -544,7 +544,7 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier, env: 
     if (resolveBootloader(cfg) == .grub and cfg.disk.luks) {
         if (cfg.disk.scheme == .manual) {
             if (manualMountPart(cfg, "/boot") == null)
-                try errs.append(alloc, "GRUB + LUKS under scheme=manual needs a mount=\"/boot\" row — grub cannot read kernels inside the encrypted root");
+                try errs.append(alloc, "disk.partitions: GRUB + LUKS under scheme=manual needs a mount=\"/boot\" row — grub cannot read kernels inside the encrypted root");
         } else if (!cfg.disk.boot_part)
             try errs.append(alloc, "GRUB + LUKS requires disk.boot_part=true — grub cannot read kernels inside the encrypted root");
     }
@@ -562,7 +562,7 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier, env: 
         try errs.append(alloc, "disk.partitions only applies to scheme=manual");
     if (cfg.disk.scheme == .manual) {
         if (cfg.disk.partitions.len == 0)
-            try errs.append(alloc, "scheme=manual needs at least one [[disk.partitions]] entry");
+            try errs.append(alloc, "disk.partitions: scheme=manual needs at least one entry");
         if (cfg.disk.partitions.len > 128)
             try errs.append(alloc, "disk.partitions exceeds GPT's 128-entry limit");
         if (cfg.disk.lvm)
@@ -638,22 +638,22 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier, env: 
             // picks the first EF00 row, so multiples would bootload the
             // wrong partition.
             if (esp_count != 1)
-                try errs.append(alloc, "scheme=manual on UEFI needs exactly one type=\"EF00\" partition (the ESP)");
+                try errs.append(alloc, "disk.partitions: scheme=manual on UEFI needs exactly one type=\"EF00\" partition (the ESP)");
             var esp_ok = false;
             for (cfg.disk.partitions) |p| {
                 if (std.ascii.eqlIgnoreCase(p.ptype, "EF00") and std.mem.eql(u8, p.fs, "vfat")) esp_ok = true;
             }
             if (esp_count == 1 and !esp_ok)
-                try errs.append(alloc, "the EF00 ESP row needs fs=\"vfat\"");
+                try errs.append(alloc, "disk.partitions: the EF00 ESP row needs fs=\"vfat\"");
         } else {
             if (esp_count > 0)
                 try errs.append(alloc, "disk.partitions lists an EF00 ESP under BIOS boot — ESPs are UEFI-only");
             if (biosboot_count == 0)
-                try errs.append(alloc, "BIOS boot needs a type=\"EF02\" biosboot partition (grub and limine both embed stage2 there — GPT has no post-MBR gap)");
+                try errs.append(alloc, "disk.partitions: BIOS boot needs a type=\"EF02\" biosboot partition (grub and limine both embed stage2 there — GPT has no post-MBR gap)");
             if (resolveBootloader(cfg) == .limine) {
                 const bf = manualBootFs(cfg);
                 if (bf == null or !std.mem.eql(u8, bf.?, "vfat"))
-                    try errs.append(alloc, "BIOS limine reads only FAT — add a mount=\"/boot\" fs=\"vfat\" partition for kernels + limine-bios.sys");
+                    try errs.append(alloc, "disk.partitions: BIOS limine reads only FAT — add a mount=\"/boot\" fs=\"vfat\" partition for kernels + limine-bios.sys");
             }
         }
     }
@@ -845,26 +845,28 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier, env: 
         const musl = cfg.stage3.libc == .musl;
         const llvm = cfg.stage3.toolchain == .llvm;
         const h = cfg.security.hardening;
+        // leads carry the field they point at — errorField/errorPage
+        // attribute them onto the variant page for inline display.
         if (llvm and h != .standard)
-            try errs.append(alloc, "no hardened-llvm stage3 — hardened toolchains ship gcc only");
+            try errs.append(alloc, "stage3.toolchain: no hardened-llvm stage3 — hardened toolchains ship gcc only");
         if (musl and h == .@"hardened-selinux")
-            try errs.append(alloc, "no musl-selinux stage3 — musl-hardened is the ceiling");
+            try errs.append(alloc, "stage3.libc: no musl-selinux stage3 — musl-hardened is the ceiling");
         if (musl and llvm and h == .hardened)
-            try errs.append(alloc, "no musl-hardened-llvm stage3 — musl variants are hardened or llvm, not both");
+            try errs.append(alloc, "stage3.libc: no musl-hardened-llvm stage3 — musl variants are hardened or llvm, not both");
         switch (cfg.arch) {
             .amd64 => {
                 if (cfg.stage3.nomultilib and (llvm or h != .standard))
-                    try errs.append(alloc, "nomultilib stage3s exist only for the plain glibc+gcc toolchain — hardened+nomultilib is reachable via profile + world rebuild, not stage3");
+                    try errs.append(alloc, "stage3.nomultilib: stage3s exist only for the plain glibc+gcc toolchain — hardened+nomultilib is reachable via profile + world rebuild, not stage3");
             },
             .arm64 => {
                 if (!musl and h != .standard)
-                    try errs.append(alloc, "no arm64 glibc hardened stage3 — hardened on arm64 is musl-only");
+                    try errs.append(alloc, "security.hardening: no arm64 glibc hardened stage3 — hardened on arm64 is musl-only");
             },
             .riscv64 => {
                 if (h != .standard)
-                    try errs.append(alloc, "no riscv64 hardened/selinux stage3");
+                    try errs.append(alloc, "security.hardening: no riscv64 hardened/selinux stage3");
                 if (llvm)
-                    try errs.append(alloc, "no riscv64 llvm stage3");
+                    try errs.append(alloc, "stage3.toolchain: no riscv64 llvm stage3");
             },
             .detect => {}, // resolved post-detection; matrix re-checked then
         }

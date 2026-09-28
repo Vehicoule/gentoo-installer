@@ -444,6 +444,7 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
     const r = &fr.interface;
 
     var wiz = engine.wizard.Wizard.init(alloc, io, .{});
+    defer wiz.deinit();
     wiz.preset = preset;
     wiz.applyPresetDefaults() catch {};
     // `--config` prefills the session per protocol.md — same
@@ -549,9 +550,10 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
                 if (at_eof) break;
                 continue;
             };
-            wiz.emitPage(out, req, pgname) catch |e| {
+            wiz.gotoPage(out, req, pgname) catch |e| {
                 try writeErr(out, req, switch (e) {
                     error.BadValue => "unknown page",
+                    error.PageUnreachable => "page not reachable — rail jumps go to done/current pages only",
                     else => "page failed",
                 });
             };
@@ -758,7 +760,23 @@ fn writeValidate(out: *std.Io.Writer, req: ?u64, errs: []const []const u8) !void
     try out.writeAll("\"errors\":[");
     for (errs, 0..) |e, i| {
         if (i > 0) try out.writeAll(",");
-        try out.writeAll("{\"message\":\"");
+        try out.writeAll("{\"field\":");
+        if (engine.wizard.errorField(e)) |f| {
+            try out.writeAll("\"");
+            jsonEsc(out, f);
+            try out.writeAll("\"");
+        } else {
+            try out.writeAll("null");
+        }
+        try out.writeAll(",\"page\":");
+        if (engine.wizard.errorPage(e)) |pgid| {
+            try out.writeAll("\"");
+            jsonEsc(out, pgid);
+            try out.writeAll("\"");
+        } else {
+            try out.writeAll("null");
+        }
+        try out.writeAll(",\"message\":\"");
         jsonEsc(out, e);
         try out.writeAll("\"}");
     }

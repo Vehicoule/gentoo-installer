@@ -53,6 +53,11 @@ const Field = struct {
 const Page = struct {
     id: []const u8,
     title: []const u8,
+    /// nav-rail grouping ("Storage", "Personalize", …) — frontends
+    /// render the section label, not the word "page".
+    section: []const u8,
+    /// one-line hint under the page title — the "why am I here".
+    subtitle: []const u8,
     essential: bool, // visited in Express flow
     fields: []const Field = &.{},
     /// validation error field-prefixes owned by this page
@@ -165,12 +170,33 @@ const disk_fields = [_]Field{
         .{ .v = "bios", .label = "BIOS (legacy)" },
         .{ .v = "uefi", .label = "UEFI" },
     } },
+};
+
+// One concept per screen: scheme gets its own page — "what happens to
+// the disk you just picked" — with the alongside/manual expansions.
+const install_type_fields = [_]Field{
     .{ .name = "disk.scheme", .ftype = .@"enum", .label = "Partitioning", .options = &.{
         .{ .v = "efi-swap-root", .label = "Normal — erase disk (UEFI layout)", .visible = isUefi },
         .{ .v = "bios-boot-swap-root", .label = "Normal — erase disk (BIOS layout)", .visible = isBios },
         .{ .v = "alongside", .label = "Install alongside existing OS", .visible = hasOtherOs },
         .{ .v = "manual", .label = "Manual partition table", .help = "expert", .visible = null },
     } },
+    .{ .name = "disk.space_src", .ftype = .@"enum", .label = "Space source", .options = &.{
+        .{ .v = "free-space", .label = "Use free space" },
+        .{ .v = "shrink", .label = "Shrink a partition" },
+    }, .visible = isAlongside },
+    .{ .name = "disk.shrink_part", .ftype = .@"enum", .label = "Partition to shrink", .visible = shrinkSrc },
+    .{ .name = "disk.shrink_mib", .ftype = .int, .label = "Shrink by (MiB)", .visible = shrinkSrc },
+    // Free-form table for scheme=manual: one row per entry, fields
+    // `size:type:name:fs:mount` (';' or newline separated). size is
+    // <n>MiB|<n>GiB|rest; fs=swap takes no mount; fs=none leaves the
+    // partition unformatted.
+    .{ .name = "disk.partitions", .ftype = .string, .label = "Partition table", .help = "512MiB:EF00:ESP:vfat:/efi; rest:8304:root:btrfs:/", .visible = isManual, .expert = true },
+};
+
+// Third Storage screen: how the claimed space is laid out — filesystem,
+// swap, encryption, LVM.
+const layout_fields = [_]Field{
     .{ .name = "disk.root_fs", .ftype = .@"enum", .label = "Root filesystem", .options = &.{
         .{ .v = "btrfs", .label = "btrfs", .help = "recommended — CoW snapshots/rollback" },
         .{ .v = "xfs", .label = "xfs" },
@@ -190,17 +216,6 @@ const disk_fields = [_]Field{
     .{ .name = "disk.luks_passphrase", .ftype = .secret, .label = "Encryption passphrase", .min_len = 8, .confirm = true, .visible = luksOn },
     .{ .name = "disk.lvm", .ftype = .bool, .label = "LVM volume group", .help = "thin pool when snapshots are on" },
     .{ .name = "disk.home_part", .ftype = .bool, .label = "Separate /home (LVM LV)", .expert = true },
-    .{ .name = "disk.space_src", .ftype = .@"enum", .label = "Space source", .options = &.{
-        .{ .v = "free-space", .label = "Use free space" },
-        .{ .v = "shrink", .label = "Shrink a partition" },
-    }, .visible = isAlongside },
-    .{ .name = "disk.shrink_part", .ftype = .@"enum", .label = "Partition to shrink", .visible = shrinkSrc },
-    .{ .name = "disk.shrink_mib", .ftype = .int, .label = "Shrink by (MiB)", .visible = shrinkSrc },
-    // Free-form table for scheme=manual: one row per entry, fields
-    // `size:type:name:fs:mount` (';' or newline separated). size is
-    // <n>MiB|<n>GiB|rest; fs=swap takes no mount; fs=none leaves the
-    // partition unformatted.
-    .{ .name = "disk.partitions", .ftype = .string, .label = "Partition table", .help = "512MiB:EF00:ESP:vfat:/efi; rest:8304:root:btrfs:/", .visible = isManual, .expert = true },
 };
 
 const variant_fields = [_]Field{
@@ -233,7 +248,6 @@ const region_fields = [_]Field{
     .{ .name = "system.timezone", .ftype = .string, .label = "Timezone", .help = "zoneinfo name, e.g. Europe/Lisbon" },
     .{ .name = "system.locales", .ftype = .list, .label = "Locales to generate", .help = "locale.gen entries" },
     .{ .name = "system.locale", .ftype = .string, .label = "Default locale" },
-    .{ .name = "system.keymap", .ftype = .@"enum", .label = "Console keymap", .options = &keymap_opts },
     .{ .name = "services.ntp", .ftype = .bool, .label = "Network time sync", .help = "chrony / systemd-timesyncd" },
 };
 
@@ -321,15 +335,59 @@ const packages_fields = [_]Field{
     .{ .name = "makeconf.video_cards", .ftype = .string, .label = "VIDEO_CARDS", .help = "auto-detected" },
 };
 
+/// Attribute a validation error string to the schema field that owns
+/// it — config.validate leads with a config-path token that isn't
+/// always a field name verbatim: "disk.scheme=alongside must be …"
+/// carries a value, "disk.partitions[1].size …" an index. Normalize
+/// those to the field ("disk.scheme", "disk.partitions"), then match
+/// against the actual schema so a config path outside the wizard
+/// surface still surfaces as a page banner, never a dead inline slot.
+pub fn errorField(err: []const u8) ?[]const u8 {
+    var tok = std.mem.sliceTo(err, ' ');
+    tok = std.mem.sliceTo(tok, '=');
+    tok = std.mem.sliceTo(tok, '[');
+    tok = std.mem.sliceTo(tok, ':'); // "field.path: message" leads
+    for (pages) |pg| {
+        for (pg.fields) |f| {
+            if (std.mem.eql(u8, f.name, tok)) return f.name;
+        }
+    }
+    return null;
+}
+
+/// Owning page id for a whole-config validate error — the same
+/// attribution pageErrors applies in-process, exposed on the wire so
+/// headless frontends can scope errors to the page that can fix them.
+/// Prefix match mirrors pageErrors; a schema-field token falls back
+/// to the field's owning page. null = unscoped (frontends surface it
+/// only at the whole-config gate).
+pub fn errorPage(err: []const u8) ?[]const u8 {
+    for (pages) |pg| {
+        for (pg.prefixes) |p| {
+            if (std.mem.indexOf(u8, err, p) != null) return pg.id;
+        }
+    }
+    if (errorField(err)) |f| {
+        for (pages) |pg| {
+            for (pg.fields) |fld| {
+                if (std.mem.eql(u8, fld.name, f)) return pg.id;
+            }
+        }
+    }
+    return null;
+}
+
 pub const pages = [_]Page{
-    .{ .id = "welcome", .title = "Welcome", .essential = true, .fields = &welcome_fields, .prefixes = &.{"system.keymap"} },
-    .{ .id = "disk", .title = "Disk & partitioning", .essential = true, .fields = &disk_fields, .prefixes = &.{ "disk.", "boot_mode" } },
-    .{ .id = "variant", .title = "Variant", .essential = false, .fields = &variant_fields, .prefixes = &.{ "stage3.", "system.init", "system.binhost", "security.hardening" } },
-    .{ .id = "region", .title = "Region & input", .essential = false, .fields = &region_fields, .prefixes = &.{ "system.timezone", "system.locale", "system.locales", "services.ntp" } },
-    .{ .id = "accounts", .title = "Accounts", .essential = true, .fields = &accounts_fields, .prefixes = &.{ "root.", "users", "system.privilege", "login", "privilege" } },
-    .{ .id = "system", .title = "System", .essential = false, .fields = &system_fields, .prefixes = &.{ "system.", "network.", "gpu.", "services.", "security.", "bootloader", "uki" } },
-    .{ .id = "packages", .title = "Packages & USE", .essential = false, .fields = &packages_fields, .prefixes = &.{ "packages.", "use.", "makeconf." } },
-    .{ .id = "review", .title = "Review & install", .essential = true, .prefixes = &.{} },
+    .{ .id = "welcome", .title = "Welcome", .section = "Get started", .subtitle = "keyboard + install mode", .essential = true, .fields = &welcome_fields, .prefixes = &.{"system.keymap"} },
+    .{ .id = "disk", .title = "Disk", .section = "Storage", .subtitle = "pick the disk Gentoo installs onto", .essential = true, .fields = &disk_fields, .prefixes = &.{ "disk.device", "boot_mode" } },
+    .{ .id = "install_type", .title = "Installation type", .section = "Storage", .subtitle = "erase, install alongside, or lay out partitions yourself", .essential = true, .fields = &install_type_fields, .prefixes = &.{ "disk.scheme", "disk.space_src", "disk.shrink", "disk.partitions" } },
+    .{ .id = "layout", .title = "Storage layout", .section = "Storage", .subtitle = "filesystem, encryption, swap", .essential = true, .fields = &layout_fields, .prefixes = &.{ "disk.root_fs", "disk.swap", "disk.esp", "disk.boot_part", "disk.luks", "disk.lvm", "disk.home" } },
+    .{ .id = "region", .title = "Region & timezone", .section = "Personalize", .subtitle = "time, language, clock sync", .essential = true, .fields = &region_fields, .prefixes = &.{ "system.timezone", "system.locale", "system.locales", "services.ntp" } },
+    .{ .id = "accounts", .title = "Accounts", .section = "Personalize", .subtitle = "your login + the root account", .essential = true, .fields = &accounts_fields, .prefixes = &.{ "root.", "users", "system.privilege", "login", "privilege" } },
+    .{ .id = "variant", .title = "System variant", .section = "Software", .subtitle = "init, C library, toolchain hardening", .essential = false, .fields = &variant_fields, .prefixes = &.{ "stage3.", "system.init", "system.binhost", "security.hardening" } },
+    .{ .id = "system", .title = "System", .section = "Software", .subtitle = "hostname, kernel, boot, network, services", .essential = false, .fields = &system_fields, .prefixes = &.{ "system.", "network.", "gpu.", "services.", "security.", "bootloader", "uki" } },
+    .{ .id = "packages", .title = "Packages & USE", .section = "Software", .subtitle = "package sets and build flags", .essential = false, .fields = &packages_fields, .prefixes = &.{ "packages.", "use.", "makeconf." } },
+    .{ .id = "review", .title = "Review & install", .section = "Install", .subtitle = "confirm — then it runs", .essential = true, .prefixes = &.{} },
 };
 
 // ---------- the wizard ----------
@@ -347,11 +405,24 @@ pub const Wizard = struct {
     /// computed by nextInFlow())
     page_idx: usize = 0,
     detected_boot: ?config.BootMode = null,
+    /// Cached `steps[]` payload for the review page — plan.build is not
+    /// cheap enough to run per emitPage (the TUI re-emits per keypress).
+    /// Invalidated on every config/env/preset mutation.
+    steps_json: ?[]u8 = null,
+
+    fn invalidateSteps(w: *Wizard) void {
+        if (w.steps_json) |s| w.alloc.free(s);
+        w.steps_json = null;
+    }
 
     pub fn init(alloc: Allocator, io: std.Io, cfg: Config) Wizard {
         var w = Wizard{ .alloc = alloc, .io = io, .cfg = cfg };
         w.applyExpressDefaults();
         return w;
+    }
+
+    pub fn deinit(w: *Wizard) void {
+        w.invalidateSteps();
     }
 
     /// Express flow picks the opinionated set the distro preset locks:
@@ -381,25 +452,48 @@ pub const Wizard = struct {
         return &pages[w.page_idx];
     }
 
-    /// Emit the `page` event for the current (or named) page.
+    /// Position of a `pages` index within the current flow — null for
+    /// pages the flow hides (Advanced-only under Express).
+    fn flowPos(w: *const Wizard, pi: usize) ?usize {
+        var buf: [pages.len]usize = undefined;
+        const order = w.flowOrder(&buf);
+        for (order, 0..) |opi, i| {
+            if (opi == pi) return i;
+        }
+        return null;
+    }
+
+    /// Emit the `page` event for the current (or named) page. A named
+    /// page is a *peek*: its schema is emitted but the wizard's
+    /// position is unchanged — navigation goes through `gotoPage` /
+    /// `next` / `back`, so a schema lookup can't park the wizard on an
+    /// unvalidated page. Off-flow pages emit `"index":0`.
     pub fn emitPage(w: *Wizard, out: *std.Io.Writer, req: ?u64, name: ?[]const u8) !void {
+        var pi: usize = w.page_idx;
         if (name) |nm| {
-            var found = false;
-            for (pages, 0..) |pg, i| {
-                if (std.mem.eql(u8, pg.id, nm)) {
-                    w.page_idx = i;
-                    found = true;
+            var found: ?usize = null;
+            for (pages, 0..) |p2, i| {
+                if (std.mem.eql(u8, p2.id, nm)) {
+                    found = i;
                     break;
                 }
             }
-            if (!found) return error.BadValue;
+            pi = found orelse return error.BadValue;
         }
-        const pg = w.currentPage();
+        const pg = &pages[pi];
+        const fpos = w.flowPos(pi); // null = outside the current flow
+        const idx: usize = if (fpos) |v| v + 1 else 0;
         try out.writeAll("{\"ev\":\"page\",");
         if (req) |r| try out.print("\"req\":{},", .{r});
-        try out.print("\"page\":\"{s}\",\"index\":{},\"of\":{},\"title\":\"", .{ pg.id, w.flowIndex() + 1, w.flowLen() });
+        try out.print("\"page\":\"{s}\",\"index\":{},\"of\":{},\"title\":\"", .{ pg.id, idx, w.flowLen() });
         jesc(out, pg.title);
-        try out.writeAll("\",\"fields\":[");
+        try out.writeAll("\",\"section\":\"");
+        jesc(out, pg.section);
+        try out.writeAll("\",\"subtitle\":\"");
+        jesc(out, pg.subtitle);
+        try out.writeAll("\",\"nav\":[");
+        try w.emitNav(out);
+        try out.writeAll("],\"fields\":[");
         var first = true;
         for (pg.fields) |f| {
             if (f.expert and w.flow == .express) continue;
@@ -411,12 +505,98 @@ pub const Wizard = struct {
         if (std.mem.eql(u8, pg.id, "review")) {
             try out.writeAll("],\"summary\":[");
             try w.emitSummary(out);
+            // Step timeline for the install progress view — frontends
+            // render the list up front and light steps up as `step`
+            // events stream in.
+            try out.writeAll(",\"steps\":[");
+            try w.emitSteps(out);
         } else {
             try out.writeAll("]");
         }
         try out.writeAll(",\"actions\":[");
-        try w.emitActions(out);
+        try w.emitActions(out, fpos, pi);
         try out.writeAll("]}\n");
+    }
+
+    /// `goto` — restricted rail jump: the target must sit on the
+    /// current flow at-or-before the current page. A forward hop would
+    /// land on Review with the gate pages unvalidated (install/export
+    /// actions armed on an incomplete config), and an off-flow page
+    /// (Advanced-only under Express) has no route back.
+    pub fn gotoPage(w: *Wizard, out: *std.Io.Writer, req: ?u64, name: []const u8) !void {
+        var pi: ?usize = null;
+        for (pages, 0..) |pg, i| {
+            if (std.mem.eql(u8, pg.id, name)) {
+                pi = i;
+                break;
+            }
+        }
+        const p2 = pi orelse return error.BadValue;
+        const ti = w.flowPos(p2) orelse return error.PageUnreachable;
+        if (ti > w.flowIndex()) return error.PageUnreachable;
+        w.page_idx = p2;
+        try w.emitPage(out, req, null);
+    }
+
+    /// nav-rail entries for every page in the current flow — done /
+    /// current / todo so frontends can draw progress without tracking
+    /// history themselves.
+    fn emitNav(w: *Wizard, out: *std.Io.Writer) !void {
+        var buf: [pages.len]usize = undefined;
+        const order = w.flowOrder(&buf);
+        const cur = w.flowIndex();
+        for (order, 0..) |pi, i| {
+            if (i > 0) try out.writeAll(",");
+            const pg = pages[pi];
+            try out.writeAll("{\"id\":\"");
+            jesc(out, pg.id);
+            try out.writeAll("\",\"title\":\"");
+            jesc(out, pg.title);
+            try out.writeAll("\",\"section\":\"");
+            jesc(out, pg.section);
+            try out.writeAll("\",\"state\":\"");
+            try out.writeAll(if (i < cur) "done" else if (i == cur) "current" else "todo");
+            try out.writeAll("\"}");
+        }
+    }
+
+    /// The step ids+titles the review page previews — the resolved plan
+    /// without its commands. Emit nothing when the config can't plan
+    /// (the validate event names why). The fragment is cached — a TUI
+    /// redraw must not re-run the whole planner per keypress.
+    fn emitSteps(w: *Wizard, out: *std.Io.Writer) !void {
+        if (w.steps_json) |c| {
+            try out.writeAll(c);
+            return;
+        }
+        // Resolved only to list step ids+titles — plan allocations die
+        // with this arena, the emitted JSON outlives nothing.
+        var arena = std.heap.ArenaAllocator.init(w.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var aw: std.Io.Writer.Allocating = .init(a);
+        const ps = w.pkgSets(a) catch {
+            try out.writeAll("]");
+            return;
+        };
+        const p = plan.build(a, &w.cfg, if (w.env) |*e| e else null, ps.sets, w.preset, null) catch {
+            try out.writeAll("]");
+            return;
+        };
+        for (p.steps, 0..) |s, i| {
+            if (i > 0) try aw.writer.writeAll(",");
+            try aw.writer.writeAll("{\"id\":\"");
+            jesc(&aw.writer, s.id);
+            try aw.writer.writeAll("\",\"title\":\"");
+            jesc(&aw.writer, s.title);
+            try aw.writer.writeAll("\"}");
+        }
+        try aw.writer.writeAll("]");
+        const json = aw.written();
+        if (w.alloc.dupe(u8, json)) |d| {
+            w.steps_json = d;
+        } else |_| {}
+        try out.writeAll(json);
     }
 
     /// Grouped "label: value" summary of the whole config for the
@@ -430,22 +610,28 @@ pub const Wizard = struct {
             const pg = pages[pi];
             if (std.mem.eql(u8, pg.id, "review")) continue;
             seen[pi] = true;
-            try w.emitSummaryGroup(out, pg, &first_g);
+            try w.emitSummaryGroup(out, pg, true, &first_g);
         }
         // Pages hidden by the flow still carry the configured defaults —
-        // the review must show them before the user confirms.
+        // the review must show them before the user confirms. They get
+        // no edit target: off-flow pages are unreachable by `goto`, so
+        // a link would strand the user outside the nav rail.
         for (pages, 0..) |pg, pi| {
             if (seen[pi] or std.mem.eql(u8, pg.id, "review")) continue;
-            try w.emitSummaryGroup(out, pg, &first_g);
+            try w.emitSummaryGroup(out, pg, false, &first_g);
         }
         try out.writeAll("]");
     }
 
-    fn emitSummaryGroup(w: *Wizard, out: *std.Io.Writer, pg: Page, first_g: *bool) !void {
+    fn emitSummaryGroup(w: *Wizard, out: *std.Io.Writer, pg: Page, on_flow: bool, first_g: *bool) !void {
         if (!first_g.*) try out.writeAll(",");
         first_g.* = false;
         try out.writeAll("{\"title\":\"");
         jesc(out, pg.title);
+        // page to `goto` when the user wants to change this section —
+        // empty for off-flow pages (they stay read-only in Express)
+        try out.writeAll("\",\"edit\":\"");
+        jesc(out, if (on_flow) pg.id else "");
         try out.writeAll("\",\"lines\":[");
         var first_l = true;
         for (pg.fields) |f| {
@@ -497,11 +683,18 @@ pub const Wizard = struct {
         return 0;
     }
 
-    fn emitActions(w: *const Wizard, out: *std.Io.Writer) !void {
-        const last = w.flowIndex() == w.flowLen() - 1;
+    /// Actions for the *emitted* page — `fpos` is its flow position
+    /// (null on an off-flow peek) and `pi` its `pages` index, so a peek
+    /// never reports the current page's buttons.
+    fn emitActions(w: *const Wizard, out: *std.Io.Writer, fpos: ?usize, pi: usize) !void {
+        const pos = fpos orelse {
+            // off-flow peek — no flow position to navigate from/to
+            try out.writeAll("\"back\",\"quit\"");
+            return;
+        };
         try out.writeAll("\"back\"");
-        if (w.page_idx == 0) try out.writeAll(",\"quit\"");
-        if (!last) {
+        if (pi == 0) try out.writeAll(",\"quit\"");
+        if (pos < w.flowLen() - 1) {
             try out.writeAll(",\"next\"");
         } else {
             // review page
@@ -540,7 +733,11 @@ pub const Wizard = struct {
                     jesc(out, d.path);
                     try out.writeAll("\",\"label\":\"");
                     jesc(out, d.name);
-                    try out.print(" · {} GiB\"}}", .{d.size_bytes / (1 << 30)});
+                    if (d.size_bytes / (1 << 30) > 0) {
+                        try out.print(" · {} GiB\"}}", .{d.size_bytes / (1 << 30)});
+                    } else {
+                        try out.print(" · {} MiB\"}}", .{d.size_bytes / (1 << 20)});
+                    }
                 }
             }
             if (shrink_opts and w.env != null) {
@@ -557,7 +754,11 @@ pub const Wizard = struct {
                         try out.writeAll("\",\"label\":\"");
                         const base = std.fs.path.basename(p.path);
                         jesc(out, base);
-                        try out.print(" · {s} · {} GiB free\"}}", .{ p.fs, p.fs_free_bytes >> 30 });
+                        if (p.fs_free_bytes >> 30 > 0) {
+                            try out.print(" · {s} · {} GiB free\"}}", .{ p.fs, p.fs_free_bytes >> 30 });
+                        } else {
+                            try out.print(" · {s} · {} MiB free\"}}", .{ p.fs, p.fs_free_bytes >> 20 });
+                        }
                     }
                 }
             }
@@ -647,6 +848,7 @@ pub const Wizard = struct {
         // it itself or the disk page can never validate on BIOS.
         if (w.flow == .express and w.cfg.boot_mode == .bios)
             w.cfg.disk.boot_part = true;
+        w.invalidateSteps();
     }
 
     /// Merge the attached preset's `[defaults]` under cfg and pin any
@@ -665,6 +867,7 @@ pub const Wizard = struct {
                 if (tomlToJson(w.alloc, tv)) |jv| setPath(w, path, jv) catch {};
             }
         }
+        w.invalidateSteps();
     }
 
     /// Does the preset lock this field? A locked field only accepts the
@@ -714,6 +917,7 @@ pub const Wizard = struct {
             w.page_idx = prev_page;
             return e;
         };
+        w.invalidateSteps();
     }
 
     /// Every locked path on the CURRENT cfg must equal the preset
@@ -1073,6 +1277,7 @@ pub const Wizard = struct {
         // Re-apply the probed env: implicit boot_mode/scheme follow the
         // live firmware exactly like they did before the file loaded.
         if (w.env) |e| w.applyEnv(e);
+        w.invalidateSteps();
         // jump to review
         for (pages, 0..) |pg, i| {
             if (std.mem.eql(u8, pg.id, "review")) {
@@ -2177,7 +2382,15 @@ fn testWizard() Wizard {
 
 fn pageJsonHas(w: *Wizard, alloc: Allocator, page_id: []const u8, needle: []const u8) !bool {
     var aw: std.Io.Writer.Allocating = .init(alloc);
-    try w.emitPage(&aw.writer, null, page_id);
+    // direct index jump — emitPage's named path is the `goto` op and
+    // now refuses forward/off-flow hops by design
+    for (pages, 0..) |pg, i| {
+        if (std.mem.eql(u8, pg.id, page_id)) {
+            w.page_idx = i;
+            break;
+        }
+    }
+    try w.emitPage(&aw.writer, null, null);
     return std.mem.indexOf(u8, aw.written(), needle) != null;
 }
 
@@ -2188,8 +2401,8 @@ test "express flow visits only essential pages" {
     var w = testWizard();
     var aw: std.Io.Writer.Allocating = .init(alloc);
     try w.emitPage(&aw.writer, null, null);
-    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"of\":4") != null);
-    // welcome → disk → accounts → review
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"of\":7") != null);
+    // welcome → disk → install_type → layout → region → accounts → review
     try testing.expect(try w.next(alloc, null));
     try testing.expectEqualStrings("disk", w.currentPage().id);
 }
@@ -2202,7 +2415,7 @@ test "advanced flow visits all pages" {
     try w.setField("flow.mode", .{ .string = "advanced" });
     var aw: std.Io.Writer.Allocating = .init(alloc);
     try w.emitPage(&aw.writer, null, null);
-    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"of\":8") != null);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "\"of\":10") != null);
 }
 
 test "every page emits valid JSON in both flows" {
@@ -2211,13 +2424,15 @@ test "every page emits valid JSON in both flows" {
     const alloc = arena.allocator();
     inline for (.{ Flow.express, Flow.advanced }) |fl| {
         var w = testWizard();
+        defer w.deinit();
         w.flow = fl;
         w.cfg.disk.luks = true; // widen visible field set
         w.cfg.disk.luks_passphrase = "sup3rsecret";
         w.cfg.disk.device = "/dev/vda";
-        for (pages) |pg| {
+        for (pages, 0..) |pg, pi| {
             var aw: std.Io.Writer.Allocating = .init(alloc);
-            try w.emitPage(&aw.writer, null, pg.id);
+            w.page_idx = pi; // direct jump — named emitPage is the restricted `goto` op
+            try w.emitPage(&aw.writer, null, null);
             _ = std.json.parseFromSlice(std.json.Value, alloc, aw.written(), .{}) catch |e| {
                 std.debug.print("invalid page JSON ({s}, page {s}): {s}\n", .{ @tagName(fl), pg.id, aw.written() });
                 return e;
@@ -2239,8 +2454,8 @@ test "secrets are masked in page emission and config" {
     var w = testWizard();
     w.cfg.disk.luks = true;
     w.cfg.disk.luks_passphrase = "sup3rsecret";
-    try testing.expect(try pageJsonHas(&w, alloc, "disk", "\"is_set\":true"));
-    try testing.expect(!(try pageJsonHas(&w, alloc, "disk", "sup3rsecret")));
+    try testing.expect(try pageJsonHas(&w, alloc, "layout", "\"is_set\":true"));
+    try testing.expect(!(try pageJsonHas(&w, alloc, "layout", "sup3rsecret")));
     var aw: std.Io.Writer.Allocating = .init(alloc);
     try w.emitConfigJson(&aw.writer, null);
     try testing.expect(std.mem.indexOf(u8, aw.written(), "sup3rsecret") == null);
@@ -2252,9 +2467,9 @@ test "luks passphrase field only visible when luks on" {
     const alloc = arena.allocator();
     var w = testWizard();
     w.flow = .advanced;
-    try testing.expect(!(try pageJsonHas(&w, alloc, "disk", "disk.luks_passphrase")));
+    try testing.expect(!(try pageJsonHas(&w, alloc, "layout", "disk.luks_passphrase")));
     try w.setField("disk.luks", .{ .bool = true });
-    try testing.expect(try pageJsonHas(&w, alloc, "disk", "disk.luks_passphrase"));
+    try testing.expect(try pageJsonHas(&w, alloc, "layout", "disk.luks_passphrase"));
 }
 
 test "root.password set hashes via openssl" {
@@ -2463,4 +2678,23 @@ test "export refuses an existing symlink that escapes cwd" {
     std.Io.Dir.cwd().symLink(testing.io, "/etc/passwd", link, .{}) catch return;
     defer std.Io.Dir.cwd().deleteFile(testing.io, link) catch {};
     try testing.expectError(error.PathEscape, w.exportAnswer(link));
+}
+
+test "errorPage attributes errors to their owning page" {
+    // manual-table errors carry the disk.partitions: lead — they belong
+    // to installation type, not the page the substring happens to name
+    try testing.expectEqualStrings("install_type", errorPage("disk.partitions: scheme=manual needs at least one entry").?);
+    try testing.expectEqualStrings("install_type", errorPage("disk.partitions: the EF00 ESP row needs fs=\"vfat\"").?);
+    try testing.expectEqualStrings("install_type", errorPage("disk.partitions: BIOS boot needs a type=\"EF02\" biosboot partition (grub and limine both embed stage2 there — GPT has no post-MBR gap)").?);
+    try testing.expectEqualStrings("install_type", errorPage("disk.partitions: GRUB + LUKS under scheme=manual needs a mount=\"/boot\" row — grub cannot read kernels inside the encrypted root").?);
+    // field tokens land on their owning page too
+    try testing.expectEqualStrings("disk", errorPage("disk.device is required (e.g. /dev/vda)").?);
+    try testing.expectEqualStrings("accounts", errorPage("no surviving login path: set a password_hash, or sshd=true plus ssh_authorized_keys").?);
+    // stage3-matrix errors carry a field lead so they surface inline on
+    // the variant page instead of hiding until the whole-config gate
+    try testing.expectEqualStrings("variant", errorPage("stage3.toolchain: no hardened-llvm stage3 — hardened toolchains ship gcc only").?);
+    try testing.expectEqualStrings("variant", errorPage("stage3.nomultilib: stage3s exist only for the plain glibc+gcc toolchain — hardened+nomultilib is reachable via profile + world rebuild, not stage3").?);
+    try testing.expectEqualStrings("variant", errorPage("security.hardening: no arm64 glibc hardened stage3 — hardened on arm64 is musl-only").?);
+    // unscoped: no prefix and no field name → null, frontends gate-show
+    try testing.expect(errorPage("stage3 tarball is too small to be a system") == null);
 }

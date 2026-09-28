@@ -1,11 +1,23 @@
-# Wizard pages — field-level spec (v1)
+# Wizard pages — field-level spec
 
 Pages are **data owned by the engine**: each page is a schema (fields,
 defaults, validation rules, visibility conditions) served over the wizard
 protocol. TUI and GUI render the same schema; neither frontend implements
 validation itself.
 
-Two flows, picked on P0:
+The flow is **one concept per page**, grouped into sections the page
+event reports (`section`, `subtitle`, `nav[]` — frontends draw a rail
+from them; see protocol.md):
+
+| Section | Pages | Express |
+|---|---|---|
+| Get started | `welcome` | ✓ |
+| Storage | `disk` → `install_type` → `layout` | ✓ |
+| Personalize | `region` → `accounts` | ✓ |
+| Software | `variant` → `system` → `packages` | Advanced only |
+| Install | `review` (then Progress, Finish) | ✓ |
+
+Two flows, picked on `welcome`:
 
 - **Express** — opinionated defaults are pre-selected for every choice;
   the wizard only asks for the disk, confirmation, and credentials.
@@ -13,13 +25,14 @@ Two flows, picked on P0:
   (glibc/gcc — one resolved stem; desktop-profile bits are applied
   post-stage3), dist-bin kernel, **limine** bootloader (uniform across
   BIOS/UEFI — one predictable path), NM, doas, minimal package set.
-- **Advanced** — every field on every page is editable; fields marked
-  `expert` below appear only here.
+- **Advanced** — adds the three Software pages (variant/system/packages)
+  between `accounts` and `review`; every field on every page is editable,
+  and fields marked `expert` below appear only here.
 
 Field notation: `name: type = default` — `expert` fields appear only in
 Advanced flow; `secret` fields are never echoed or persisted.
 
-## P0 — Welcome / mode
+## `welcome` — Get started
 
 Purpose: orient the user, verify the environment is installable, pick the
 interaction mode.
@@ -27,9 +40,9 @@ interaction mode.
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | locale | enum (preset list) | `en_US.UTF-8` | display language for the wizard itself |
-| keymap | enum (console keymaps) | `us` | applies to the *live env* immediately (`loadkeys`/`localectl`); prefills P3's installed-system keymap — needed before P1's LUKS passphrase, not after |
+| keymap | enum (console keymaps) | `us` | applies to the *live env* immediately (`loadkeys`/`localectl`); prefills `region`'s installed-system keymap — needed before `layout`'s LUKS passphrase, not after |
 | mode | enum `express\|advanced` | `express` | sets the flow: express skips all non-essential pages; advanced exposes every field |
-| answer_file | path (optional) | — | loads a saved config and jumps to P7 Review |
+| answer_file | path (optional) | — | loads a saved config and jumps to `review` |
 
 Env card (read-only, from `detect`): arch, boot mode (UEFI/BIOS), RAM,
 network status, live-media type (minimal ISO vs LiveGUI vs foreign live
@@ -39,21 +52,44 @@ Edge cases: no network → warning banner + `net-setup`/nmtui handoff
 button; non-Gentoo live env → info banner (supported path on arm64/riscv64);
 RAM < 512 MB → warning (emerge will be painful).
 
-## P1 — Disk
+## `disk` — Storage (1/3)
 
-Purpose: choose target disk(s) and partition plan. The most consequential
-page — everything downstream depends on it.
-
-User-facing layout options are presented Calamares-style:
-**Normal** (erase disk, everything below auto-defaulted), **Install
-alongside Windows** (only shown when Windows/another OS is detected),
-**Advanced** (full control).
+Purpose: pick the target disk. The most consequential single choice —
+everything downstream depends on it.
 
 | Field | Type | Default | Validation |
 |---|---|---|---|
 | device | enum (detected disks) | — | nonempty; excluded: the disk hosting the live env |
-| scheme | enum `normal (efi-swap-root)\|bios-boot-swap-root\|alongside\|advanced (manual)` | `normal` (UEFI) | `bios-*` shown only when booted via BIOS; `alongside` shown only when an existing OS is detected and requires free space or shrinkable partition |
+
+Edge cases: zero eligible disks → hard error page; active swap/LVM/md on
+target → refuse until deactivated.
+
+## `install_type` — Storage (2/3)
+
+Purpose: what to do with the disk — presented Calamares-style:
+**Normal** (erase disk, layout auto-defaulted), **Install alongside
+Windows** (only shown when Windows/another OS is detected), **Manual**
+(full partition-table control).
+
+| Field | Type | Default | Validation |
+|---|---|---|---|
+| scheme | enum `normal (efi-swap-root)\|bios-boot-swap-root\|alongside\|manual` | `normal` (UEFI) | `bios-*` shown only when booted via BIOS; `alongside` shown only when an existing OS is detected and requires free space or shrinkable partition |
 | wipe | bool | `true` | must be `false` when `scheme=alongside` (VALIDATE) |
+| space_src | enum `shrink\|free-space` | auto-detected | alongside only: `free-space` uses existing unallocated space — no partition is touched; `shrink` reveals the two fields below |
+| shrink_part | enum (existing partitions) | — | shrink only; fs must be ntfs/ext4/btrfs (xfs/f2fs unshrinkable → need unallocated space) |
+| shrink_mib | int | — | shrink only; ≥ min install size (8 GiB) and ≤ fs free space |
+| disk.partitions | partition table editor (expert) | — | free-form `size:type:name:fs:mount` rows; validated like any scheme (see partitioning.md) |
+
+`alongside` reuses the existing ESP — never reformats it. Live preview:
+engine emits the post-install partition table (the same `Cmd` plan the
+pipeline will run); TUI renders a table, GUI renders a disk-bar graphic.
+
+## `layout` — Storage (3/3)
+
+Purpose: filesystem, encryption, swap.
+
+| Field | Type | Default | Validation |
+|---|---|---|---|
 | root_fs | enum `xfs\|ext4\|btrfs\|f2fs` (+expert `bcachefs`) | `btrfs` | modern default — CoW enables system snapshots/rollbacks (xfs/ext4/f2fs get kernel rollback only — surfaced here); bcachefs needs a recent kernel — expert flag |
 | swap | enum `zram\|partition\|none` | `zram` | `partition` reveals swap_mib; zram default fits memory-efficiency ethos (no disk swap) |
 | swap_mib | int | 4096 | only when `swap=partition` |
@@ -64,21 +100,33 @@ alongside Windows** (only shown when Windows/another OS is detected),
 | lvm | bool | false | LVM2 vg on root part (or inside LUKS if set); with snapshots on, provisions a thin pool + thin root LV |
 | home_part | bool (expert) | false | separate /home partition |
 | btrfs_subvols | list (expert) | `@,@home,@snapshots` | only when `root_fs=btrfs` |
-| space_src | enum `shrink\|free-space` | auto-detected | alongside only: `free-space` uses existing unallocated space — no partition is touched; `shrink` reveals the two fields below |
-| shrink_part | enum (existing partitions) | — | shrink only; fs must be ntfs/ext4/btrfs (xfs/f2fs unshrinkable → need unallocated space) |
-| shrink_mib | int | — | shrink only; ≥ min install size (8 GiB) and ≤ fs free space |
-| disk.partitions | partition table editor (expert) | — | free-form `size:type:name:fs:mount` rows; validated like any scheme (see partitioning.md) |
 
-Normal/alongside modes auto-default every field above — the user only
-picks disk, fs, LUKS toggle. Live preview: engine emits the post-install
-partition table (the same `Cmd` plan the pipeline will run); TUI renders
-a table, GUI renders a disk-bar graphic.
+## `region` — Personalize (1/2)
 
-Edge cases: zero eligible disks → hard error page; active swap/LVM/md on
-target → refuse until deactivated; `alongside` reuses the existing ESP —
-never reformats it.
+| Field | Type | Default |
+|---|---|---|
+| timezone | searchable enum (zoneinfo) | **autodetected** via geoip when net is up; user confirms/overrides; `UTC` fallback |
+| locales | multi-select (locale.gen) | `en_US.UTF-8` |
+| default_locale | enum (⊂ locales) | first selected |
+| keymap | enum (console keymaps) | `us` — drives xkb_layout default |
+| ntp | bool | `true` (chrony / systemd-timesyncd) |
 
-## P2 — Variant
+## `accounts` — Personalize (2/2)
+
+| Field | Type | Default | Validation |
+|---|---|---|---|
+| root_mode | enum `password\|locked` | `password` | `locked` → `lock_root=true` |
+| root_password | secret | — | required iff root_mode=password; min 8, confirm |
+| users[] | list of records | `[larry]` | username regex, uid auto |
+| user.name / .groups / .shell | str / list / enum | — / `wheel,audio,video` / `/bin/bash` | shell from /etc/shells of stage3 |
+| user.password | secret | — | optional if ssh key present |
+| user.ssh_authorized_keys | textarea | — | ssh pubkey syntax check |
+| privilege | enum `doas\|sudo\|none` | `doas` | minimal-footprint default per distro ethos; `none` only if root unlocked |
+
+VALIDATE (hard): after all options applied, ≥1 usable login path —
+password on a surviving account, or `sshd=true` + authorized key.
+
+## `variant` — Software (Advanced only)
 
 Purpose: the Gentoo-specific choice — init system, stage3 flavor, profile.
 
@@ -115,32 +163,7 @@ Profile preview: show the fully resolved profile name (e.g.
 `default/linux/amd64/23.0/desktop/systemd`) so users see exactly what
 they're getting.
 
-## P3 — Region & input
-
-| Field | Type | Default |
-|---|---|---|
-| timezone | searchable enum (zoneinfo) | **autodetected** via geoip when net is up; user confirms/overrides; `UTC` fallback |
-| locales | multi-select (locale.gen) | `en_US.UTF-8` |
-| default_locale | enum (⊂ locales) | first selected |
-| keymap | enum (console keymaps) | `us` — drives xkb_layout default |
-| ntp | bool | `true` (chrony / systemd-timesyncd) |
-
-## P4 — Accounts
-
-| Field | Type | Default | Validation |
-|---|---|---|---|
-| root_mode | enum `password\|locked` | `password` | `locked` → `lock_root=true` |
-| root_password | secret | — | required iff root_mode=password; min 8, confirm |
-| users[] | list of records | `[larry]` | username regex, uid auto |
-| user.name / .groups / .shell | str / list / enum | — / `wheel,audio,video` / `/bin/bash` | shell from /etc/shells of stage3 |
-| user.password | secret | — | optional if ssh key present |
-| user.ssh_authorized_keys | textarea | — | ssh pubkey syntax check |
-| privilege | enum `doas\|sudo\|none` | `doas` | minimal-footprint default per distro ethos; `none` only if root unlocked |
-
-VALIDATE (hard): after all options applied, ≥1 usable login path —
-password on a surviving account, or `sshd=true` + authorized key.
-
-## P5 — System
+## `system` — Software (Advanced only)
 
 | Field | Type | Default | Validation |
 |---|---|---|---|
@@ -185,7 +208,7 @@ the limine plugin emits `efi_chainload` entries (e.g. Windows Boot
 Manager at `EFI/Microsoft/Boot/bootmgfw.efi`); efistub relies on the
 firmware menu, which already lists them.
 
-## P6 — Packages & USE (the Gentoo page)
+## `packages` — Software (Advanced only)
 
 | Field | Type | Default |
 |---|---|---|
@@ -202,7 +225,7 @@ firmware menu, which already lists them.
 Engine compiles this into `make.conf` + `package.use/*` at the
 `portage-config` step; preview shows the generated make.conf diff.
 
-## P7 — Review
+## `review` — Install
 
 Read-only grouped summary of the whole config (jump-back links per
 section), **print plan** (the exact `Cmd` list — same output as
@@ -220,7 +243,7 @@ private" notice. SSH authorized keys are copied verbatim.
 | confirm_wipe | type-the-device-name | required when `wipe=true` |
 | confirm_text | acknowledge checkbox | alongside mode: plan-derived — `shrink` ⇒ "existing OS partition will be shrunk"; `free-space` ⇒ "new partitions in unallocated space; existing OS/data partitions untouched, the shared ESP gains bootloader files" |
 
-## P8 — Progress
+## Progress — Install
 
 Renders the pipeline's event stream: 16-step checklist with per-step
 status + elapsed, live log tail, journal state line ("resumable through
@@ -230,7 +253,7 @@ Failure handling: `step_failed` → dialog with `{code, message, hint}` +
 `retry` / `skip` (where safe) / `abort`. `cancel` finishes the current
 step then halts, leaving the journal resumable.
 
-## P9 — Finish
+## Finish — Install
 
 Success: summary card (hostname, users, boot entries), **save answer
 file** (again — last chance), **"enter target chroot"** button (drops a
