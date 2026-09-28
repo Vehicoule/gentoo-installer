@@ -259,6 +259,10 @@ fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, 
                 const pp = partPath(alloc, dev, n);
                 const is_root = std.mem.eql(u8, p.mount, "/");
                 var dev_node = pp;
+                // mkfs/luksFormat refuse leftover signatures — a rerun after
+                // a failed install still has them. Wipe before any format.
+                if ((is_root and d.luks) or (p.fs.len > 0 and !std.mem.eql(u8, p.fs, "none")))
+                    try c.append(alloc, argv(alloc, &.{ "wipefs", "-a", pp }, s(alloc, "wipe signatures on {s}", .{pp})));
                 if (is_root and d.luks) {
                     try c.append(alloc, .{ .exec = .{
                         .argv = try alloc.dupe([]const u8, &.{ "cryptsetup", "luksFormat", "--type", "luks2", "--pbkdf", "argon2id", "--batch-mode", "--key-file", "-", pp }),
@@ -415,9 +419,14 @@ fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, 
     try c.append(alloc, argv(alloc, &.{ "sgdisk", s(alloc, "-n{}:0:0", .{n}), s(alloc, "-t{}:8304", .{n}), s(alloc, "-c{}:root", .{n}), s(alloc, "-u{}:{s}", .{ n, partGuid(alloc, seed, n) }), dev }, s(alloc, "root partition {} (rest of disk)", .{n})));
 
     // ESP filesystem (never reformatted in alongside mode — not reached here).
-    if (esp_part) |esp|
+    // wipefs before every format: a rerun after a failed install still
+    // carries signatures mkfs tools refuse to overwrite.
+    if (esp_part) |esp| {
+        try c.append(alloc, argv(alloc, &.{ "wipefs", "-a", esp }, s(alloc, "wipe signatures on {s}", .{esp})));
         try c.append(alloc, argv(alloc, &.{ "mkfs.vfat", "-F32", "-n", "ESP", esp }, "format ESP as FAT32"));
+    }
     if (boot_part) |bp| {
+        try c.append(alloc, argv(alloc, &.{ "wipefs", "-a", bp }, s(alloc, "wipe signatures on {s}", .{bp})));
         // Limine ≥12 reads only FAT/ISO9660 — ext4 /boot is unreadable
         // to its BIOS stage. grub keeps ext4.
         if (std.mem.eql(u8, bootPartFs(cfg), "vfat")) {
@@ -439,8 +448,10 @@ fn appendFsChain(alloc: Allocator, c: *std.ArrayList(Cmd), cfg: *const Config, r
     // standalone partition — validation enforces that pairing.
     _ = d.home_part;
 
-    // LUKS on root (container lives on the raw partition).
+    // LUKS on root (container lives on the raw partition). Wipe stale
+    // signatures first — luksFormat/pvcreate/mkfs all refuse leftovers.
     var root_dev = root_part;
+    try c.append(alloc, argv(alloc, &.{ "wipefs", "-a", root_part }, s(alloc, "wipe signatures on {s}", .{root_part})));
     if (d.luks) {
         try c.append(alloc, .{ .exec = .{
             .argv = try alloc.dupe([]const u8, &.{ "cryptsetup", "luksFormat", "--type", "luks2", "--pbkdf", "argon2id", "--batch-mode", "--key-file", "-", root_part }),
@@ -460,6 +471,7 @@ fn appendFsChain(alloc: Allocator, c: *std.ArrayList(Cmd), cfg: *const Config, r
     // LVM inside the (possibly encrypted) root container.
     var fs_dev = root_dev;
     if (d.lvm) {
+        try c.append(alloc, argv(alloc, &.{ "wipefs", "-a", root_dev }, s(alloc, "wipe signatures on {s}", .{root_dev})));
         try c.append(alloc, argv(alloc, &.{ "pvcreate", "--norestorefile", root_dev }, s(alloc, "PV on {s}", .{root_dev})));
         try c.append(alloc, argv(alloc, &.{ "vgcreate", "vg0", root_dev }, "volume group vg0"));
         if (cfg.system.snapshots == .auto) {
@@ -482,26 +494,31 @@ fn appendFsChain(alloc: Allocator, c: *std.ArrayList(Cmd), cfg: *const Config, r
                     .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "{s}lvcreate -T vg0/tank -n home -V \"${{pm}}M\"", .{measure}) }),
                     .desc = "thin home LV (virtual size = pool, overcommit)",
                 } });
+                try c.append(alloc, argv(alloc, &.{ "wipefs", "-a", "/dev/vg0/home" }, "wipe signatures on home LV"));
                 try c.append(alloc, argv(alloc, &.{ s(alloc, "mkfs.{s}", .{@tagName(d.root_fs)}), "/dev/vg0/home" }, "format home LV"));
             }
         } else {
             try c.append(alloc, argv(alloc, &.{ "lvcreate", "-l", "70%VG", "-n", "root", "vg0" }, "linear root LV (70% VG)"));
             if (d.home_part and d.root_fs != .btrfs) {
                 try c.append(alloc, argv(alloc, &.{ "lvcreate", "-l", "100%FREE", "-n", "home", "vg0" }, "linear home LV (rest of VG)"));
+                try c.append(alloc, argv(alloc, &.{ "wipefs", "-a", "/dev/vg0/home" }, "wipe signatures on home LV"));
                 try c.append(alloc, argv(alloc, &.{ s(alloc, "mkfs.{s}", .{@tagName(d.root_fs)}), "/dev/vg0/home" }, "format home LV"));
             }
         }
         fs_dev = "/dev/vg0/root";
     }
 
+    try c.append(alloc, argv(alloc, &.{ "wipefs", "-a", fs_dev }, s(alloc, "wipe signatures on {s}", .{fs_dev})));
     const mk = mkfsTool(d.root_fs);
     var mkfs_argv: std.ArrayList([]const u8) = .empty;
     try mkfs_argv.append(alloc, mk.mkfs);
     try mkfs_argv.append(alloc, fs_dev);
     try c.append(alloc, fmtArgv(alloc, s(alloc, "format root as {s}", .{@tagName(d.root_fs)}), mkfs_argv.items));
 
-    if (swap_part) |sp|
+    if (swap_part) |sp| {
+        try c.append(alloc, argv(alloc, &.{ "wipefs", "-a", sp }, s(alloc, "wipe signatures on {s}", .{sp})));
         try c.append(alloc, argv(alloc, &.{ "mkswap", "-L", "swap", sp }, "format swap"));
+    }
 
     if (d.root_fs == .btrfs) {
         // Mount then create the subvol layout + @snapshots dir.
@@ -1108,6 +1125,10 @@ fn planChroot(alloc: Allocator) !Step {
 fn planRepoSync(alloc: Allocator, cfg: *const Config) !Step {
     _ = cfg;
     var c: std.ArrayList(Cmd) = .empty;
+    // Portage drops a repo whose `location` isn't a directory (seen on
+    // bare live envs: "Invalid Repository Location" → "Repository
+    // 'gentoo' not found"). Create it rather than relying on webrsync.
+    try c.append(alloc, argv(alloc, &.{ "mkdir", "-p", "/mnt/gentoo/var/db/repos/gentoo" }, "repo location dir"));
     try c.append(alloc, .{ .exec = .{
         .argv = try alloc.dupe([]const u8, &.{"emerge-webrsync"}),
         .chroot = true,
@@ -1179,7 +1200,10 @@ fn planKernel(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !St
     // firmware + microcode
     var fw_atoms: std.ArrayList([]const u8) = .empty;
     try fw_atoms.append(alloc, "sys-kernel/linux-firmware");
-    try fw_atoms.append(alloc, "sys-firmware/sof-firmware");
+    // SOF is Intel audio-DSP firmware — the package is amd64/x86-only in
+    // ::gentoo, so emerging it elsewhere fails dep resolution outright.
+    if (cfg.arch == .amd64)
+        try fw_atoms.append(alloc, "sys-firmware/sof-firmware");
     if (ucodeAtom(cfg, env)) |atom| try fw_atoms.append(alloc, atom);
     try c.append(alloc, .{ .exec = .{
         .argv = try prepend(alloc, "emerge", fw_atoms.items),

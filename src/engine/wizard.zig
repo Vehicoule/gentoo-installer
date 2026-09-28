@@ -426,15 +426,19 @@ pub const Wizard = struct {
     }
 
     /// Express flow picks the opinionated set the distro preset locks:
-    /// btrfs, zram, limine, dist-bin, doas, hardened+selinux.
+    /// btrfs, zram, limine, dist-bin, doas, hardened+selinux — on amd64.
+    /// Off-amd64 the equivalents: bootloader auto (grub), kernel dist on
+    /// riscv64 (no gentoo-kernel-bin keyword), standard hardening (no
+    /// arm64/riscv64 selinux stage3).
     fn applyExpressDefaults(w: *Wizard) void {
         if (w.flow != .express) return;
+        const amd64ish = w.cfg.arch == .amd64 or w.cfg.arch == .detect;
         w.cfg.disk.root_fs = .btrfs;
         w.cfg.disk.swap = .zram;
-        w.cfg.system.bootloader = .limine;
-        w.cfg.system.kernel = .@"dist-bin";
+        w.cfg.system.bootloader = .auto;
+        w.cfg.system.kernel = if (w.cfg.arch == .riscv64) .dist else .@"dist-bin";
         w.cfg.system.privilege = .doas;
-        w.cfg.security.hardening = .@"hardened-selinux";
+        w.cfg.security.hardening = if (amd64ish) .@"hardened-selinux" else .standard;
     }
 
     /// Pages visible under the current flow, in order.
@@ -832,7 +836,18 @@ pub const Wizard = struct {
     pub fn applyEnv(w: *Wizard, env: Env) void {
         w.env = env;
         w.detected_boot = env.boot_mode;
-        if (w.cfg.arch == .detect) w.cfg.arch = env.arch;
+        if (w.cfg.arch == .detect) {
+            w.cfg.arch = env.arch;
+            // Express defaults were applied under .detect → amd64
+            // assumptions; retire the ones still untouched that the
+            // real arch can't do.
+            if (w.flow == .express) {
+                if (w.cfg.system.kernel == .@"dist-bin" and env.arch == .riscv64)
+                    w.cfg.system.kernel = .dist;
+                if (w.cfg.security.hardening == .@"hardened-selinux" and env.arch != .amd64)
+                    w.cfg.security.hardening = .standard;
+            }
+        }
         if (!w.cfg.boot_mode_explicit)
             w.cfg.boot_mode = env.boot_mode;
         // an unpinned scheme tracks the EFFECTIVE firmware either way —

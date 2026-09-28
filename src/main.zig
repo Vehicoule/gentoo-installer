@@ -151,10 +151,14 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(2);
             }
             // boot_mode: detection fills the default; an explicit config
-            // value wins, and a mismatch is a hard stop.
+            // value wins, and a mismatch is a hard stop — except uefi on
+            // non-amd64, where "bios" can only mean "no EFI runtime in
+            // the live env" (no PC BIOS exists off-x86) and an EFI disk
+            // is still the right artifact.
             if (!cfg.boot_mode_explicit) {
                 cfg.boot_mode = e.boot_mode;
-            } else if (cfg.boot_mode != e.boot_mode) {
+            } else if (cfg.boot_mode != e.boot_mode and
+                !(cfg.boot_mode == .uefi and e.boot_mode == .bios and cfg.arch != .amd64)) {
                 try errw.print("config requests {s} but the live env booted {s} — refusing (fix the config or boot firmware settings)\n", .{ @tagName(cfg.boot_mode), @tagName(e.boot_mode) });
                 try errw.flush();
                 std.process.exit(2);
@@ -817,8 +821,13 @@ fn doInstall(io: std.Io, alloc: std.mem.Allocator, wiz: *engine.wizard.Wizard, o
         // Live-boot honesty: an explicit boot_mode (answer file) that
         // disagrees with the firmware we probed must refuse, not produce
         // a plan aimed at the wrong firmware. Non-explicit values were
-        // already synced by applyEnv.
-        if (cfg.boot_mode != env_opt.?.boot_mode) {
+        // already synced by applyEnv. Off-amd64 a "bios" env report can
+        // never mean PC BIOS — it only says the live env lacks an EFI
+        // runtime (OpenSBI/U-Boot chainload) — and an EFI disk is still
+        // the correct artifact for those machines, so don't refuse.
+        const firmware_irrelevant = cfg.boot_mode == .uefi and
+            env_opt.?.boot_mode == .bios and cfg.arch != .amd64;
+        if (cfg.boot_mode != env_opt.?.boot_mode and !firmware_irrelevant) {
             var aw: std.Io.Writer.Allocating = .init(alloc);
             aw.writer.print("config requests {s} but the live env booted {s} — refusing", .{ @tagName(cfg.boot_mode), @tagName(env_opt.?.boot_mode) }) catch {};
             try writeErr(out, req, aw.written());

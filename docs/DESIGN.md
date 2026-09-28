@@ -136,7 +136,8 @@ sensible):
    profile/USE changes).
 10. **base-config** — timezone, locales (`locale.gen` + `locale-gen` +
     `eselect locale`), keymap (`/etc/conf.d/keymaps` or `localectl`).
-11. **firmware-kernel** — `linux-firmware`, `sof-firmware`, CPU microcode
+11. **firmware-kernel** — `linux-firmware`, `sof-firmware` (amd64
+    only — the package has no other-arch keyword), CPU microcode
     (`intel-microcode`/`linux-firmware` amd), kernel per choice below.
 12. **fstab** — generated from blkid PARTUUIDs; skipped entirely for
     systemd+DPS+UEFI layouts (auto-discovery).
@@ -238,8 +239,9 @@ locale      = "en_US.UTF-8"      # default LANG (⊂ locales)
 keymap      = "us"
 kernel      = "dist-bin"         # dist-bin | dist | manual
 bootloader  = "auto"             # auto | grub | systemd-boot | efistub | limine | refind
-                               # auto always resolves to limine (uniform
-                               # BIOS+UEFI); the rest are explicit Advanced picks.
+                               # auto resolves to limine on amd64 (uniform
+                               # BIOS+UEFI) and grub on arm64/riscv64 —
+                               # sys-boot/limine is ~amd64/~x86-only.
                                # NOTE: limine's ebuild BDEPENDs on llvm+clang+lld
                                # unconditionally — cheap where binhost serves
                                # them, a multi-hour source build on musl; an
