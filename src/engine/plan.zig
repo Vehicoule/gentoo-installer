@@ -929,7 +929,10 @@ fn makeConf(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) ![]co
 
     const cflags = switch (cfg.makeconf.cflags) {
         .safe => "-O2 -pipe",
-        .native => "-O2 -pipe -march=native",
+        // -march=native is broken on riscv64: gcc's ISA-string detection
+        // frequently produces an arch string it then rejects (even on real
+        // hardware); rv64gc is the lp64d baseline Gentoo recommends.
+        .native => if (cfg.arch == .riscv64) "-O2 -pipe -march=rv64gc" else "-O2 -pipe -march=native",
         .custom => |f| f,
     };
     try w.print("COMMON_FLAGS=\"{s}\"\nCFLAGS=\"${{COMMON_FLAGS}}\"\nCXXFLAGS=\"${{COMMON_FLAGS}}\"\n", .{cflags});
