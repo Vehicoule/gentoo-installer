@@ -11,8 +11,8 @@ Gentoo-based distribution can ship it with its own branding, defaults, and
 extra steps.
 
 Status: **1.0** — QEMU-verified installs on amd64 (UEFI + BIOS, LUKS,
-LVM, btrfs, musl/hardened stage3s, runit/dinit inits, alongside
-dual-boot, shim secure-boot chain). `s6` stays exec-gated. See
+LVM, btrfs, musl/hardened stage3s, runit/dinit/s6 inits, alongside
+dual-boot, shim secure-boot chain). See
 [docs/DESIGN.md](docs/DESIGN.md) for the architecture, config model,
 headless protocol, and roadmap.
 
