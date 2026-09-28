@@ -724,10 +724,11 @@ fn drawProgress(t: *Tui, win: vaxis.Window, fa: Allocator, w: u16, h: u16) !void
     const sty: vaxis.Style = if (t.mode == .failed) err_style else if (t.mode == .done) ok_style else .{};
     _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " {s}", .{t.status}), .style = sty }}, .{ .row_offset = h -| 2 });
 
-    // result panel — a boxed verdict on the finished state. Only
-    // when an install actually ran: quitting the wizard also lands
-    // on .done, and "✓ finished" would falsely report completion.
-    if ((t.mode == .done or t.mode == .failed) and t.install_steps.items.len > 0) {
+    // result panel — a boxed verdict on the finished state. .failed
+    // always deserves it (even a pre-step failure), but .done also
+    // covers quitting the wizard — no steps ran, and "✓ finished"
+    // would falsely report completion.
+    if (t.mode == .failed or (t.mode == .done and t.install_steps.items.len > 0)) {
         const psty: vaxis.Style = if (t.mode == .done) ok_style else err_style;
         const title = if (t.mode == .done) " ✓ finished " else " ✗ failed ";
         const bw: u16 = @min(w -| 4, @max(title.len + 6, t.status.len + 8));
