@@ -444,6 +444,7 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
     const r = &fr.interface;
 
     var wiz = engine.wizard.Wizard.init(alloc, io, .{});
+    defer wiz.deinit();
     wiz.preset = preset;
     wiz.applyPresetDefaults() catch {};
     // `--config` prefills the session per protocol.md — same

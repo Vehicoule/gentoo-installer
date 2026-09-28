@@ -201,11 +201,12 @@ pub const Tui = struct {
     fn ensureFocusVisible(t: *Tui) void {
         const start = t.contentStart();
         if (t.pv.fields.len == 0) {
-            // review page — clamp the summary offset to its content.
+            // review page — clamp the offset to its content (summary +
+            // any gate-error block appended to the scroll stream).
             // summary lines render at rows start..h-8 (draw clips at
             // row < h-7), so that many rows are visible.
             const vis: usize = ((t.last_h -| 8) -| start) + 1;
-            const total = summaryLines(t.pv.summary);
+            const total = scrollTotal(t);
             t.scroll = @min(t.scroll, total -| vis);
             return;
         }
@@ -234,6 +235,18 @@ pub const Tui = struct {
     fn summaryLines(summary: []SumGroup) usize {
         var n: usize = 0;
         for (summary) |g| n += 1 + g.lines.len;
+        return n;
+    }
+
+    /// Virtual lines the review scroll covers — summary groups plus the
+    /// gate-error block (one " problems" header + a line per error).
+    fn scrollTotal(t: *Tui) usize {
+        var n = summaryLines(t.pv.summary);
+        var errs: usize = 0;
+        for (t.errors.items) |e| {
+            if (e.on_page) errs += 1;
+        }
+        if (errs > 0) n += 1 + errs;
         return n;
     }
 
@@ -686,17 +699,21 @@ fn draw(t: *Tui, win: vaxis.Window) !void {
     }
 
     if (t.mode == .confirm_install) {
-        try drawRail(t, win, fa, h);
+        if (w >= 60) try drawRail(t, win, fa, h);
         try drawModal(t, win, fa, w, h);
         return;
     }
 
-    const rail_w: u16 = 24;
-    const cx: u16 = rail_w + 2;
-    try drawRail(t, win, fa, h);
-    // rail/content divider
-    for (1..h -| 2) |i| {
-        _ = win.print(&.{.{ .text = "│", .style = dim }}, .{ .row_offset = @intCast(i), .col_offset = rail_w });
+    // the rail collapses on narrow terminals — 24 cols of rail leaves
+    // almost no room for fields under ~60 cols of terminal
+    const rail_w: u16 = if (w < 60) 0 else 24;
+    const cx: u16 = if (rail_w == 0) 1 else rail_w + 2;
+    if (rail_w > 0) {
+        try drawRail(t, win, fa, h);
+        // rail/content divider
+        for (1..h -| 2) |i| {
+            _ = win.print(&.{.{ .text = "│", .style = dim }}, .{ .row_offset = @intCast(i), .col_offset = rail_w });
+        }
     }
 
     var row: u16 = 1;
@@ -711,8 +728,8 @@ fn draw(t: *Tui, win: vaxis.Window) !void {
 
     // review page: grouped config cards — scrollable; 'g<N>' jumps to
     // the owning page, arrows scroll the summary (fields.len == 0).
+    var li: usize = 0;
     if (t.pv.summary.len > 0) {
-        var li: usize = 0;
         for (t.pv.summary) |g| {
             if (li >= t.scroll and row < h -| 7) {
                 var gi: []const u8 = "";
@@ -726,6 +743,32 @@ fn draw(t: *Tui, win: vaxis.Window) !void {
             for (g.lines) |ln| {
                 if (li >= t.scroll and row < h -| 7) {
                     _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, "   {s}", .{ln}), .style = .{} }}, .{ .row_offset = row, .col_offset = cx });
+                    row += 1;
+                }
+                li += 1;
+            }
+        }
+    }
+    // pages without fields can't show errors inline — a whole-config
+    // gate joins the scroll stream so >3 problems stay reachable.
+    if (t.pv.fields.len == 0) {
+        var has_err = false;
+        for (t.errors.items) |e| {
+            if (e.on_page) {
+                has_err = true;
+                break;
+            }
+        }
+        if (has_err) {
+            if (li >= t.scroll and row < h -| 7) {
+                _ = win.print(&.{.{ .text = " problems", .style = err_style }}, .{ .row_offset = row, .col_offset = cx });
+                row += 1;
+            }
+            li += 1;
+            for (t.errors.items) |e| {
+                if (!e.on_page) continue;
+                if (li >= t.scroll and row < h -| 7) {
+                    _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, "   ↳ {s}", .{e.msg}), .style = err_style }}, .{ .row_offset = row, .col_offset = cx });
                     row += 1;
                 }
                 li += 1;
@@ -815,9 +858,11 @@ fn draw(t: *Tui, win: vaxis.Window) !void {
     }
 
     // page-level errors (unattributed or off-page) as a banner — only
-    // when the error actually belongs to the page being shown.
+    // when the error actually belongs to the page being shown. Field-less
+    // pages render them in the scroll stream instead (see above).
     var n_banner: u16 = 0;
     for (t.errors.items) |e| {
+        if (t.pv.fields.len == 0) break;
         if (!e.on_page) continue;
         const unattributed = e.field == null or !fieldOnPage(t.pv, e.field.?);
         if (!unattributed) continue;
@@ -916,6 +961,7 @@ pub fn runTui(init: std.process.Init, alloc: Allocator, io: std.Io, preset: ?*co
     t.wiz.preset = preset;
     t.wiz.applyPresetDefaults() catch {};
     defer t.frame_arena.deinit();
+    defer t.wiz.deinit();
 
     // detect → wizard env
     const env = try engine.detect.detect(alloc, io);
@@ -1008,7 +1054,7 @@ pub fn runTui(init: std.process.Init, alloc: Allocator, io: std.Io, preset: ?*co
                         }
                     } else if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
                         if (review_scroll) {
-                            const total = Tui.summaryLines(t.pv.summary);
+                            const total = t.scrollTotal();
                             const vis: usize = ((t.last_h -| 8) -| t.contentStart()) + 1;
                             t.scroll = @min(t.scroll + 1, total -| vis);
                         } else {

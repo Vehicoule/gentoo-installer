@@ -845,26 +845,28 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier, env: 
         const musl = cfg.stage3.libc == .musl;
         const llvm = cfg.stage3.toolchain == .llvm;
         const h = cfg.security.hardening;
+        // leads carry the field they point at — errorField/errorPage
+        // attribute them onto the variant page for inline display.
         if (llvm and h != .standard)
-            try errs.append(alloc, "no hardened-llvm stage3 — hardened toolchains ship gcc only");
+            try errs.append(alloc, "stage3.toolchain: no hardened-llvm stage3 — hardened toolchains ship gcc only");
         if (musl and h == .@"hardened-selinux")
-            try errs.append(alloc, "no musl-selinux stage3 — musl-hardened is the ceiling");
+            try errs.append(alloc, "stage3.libc: no musl-selinux stage3 — musl-hardened is the ceiling");
         if (musl and llvm and h == .hardened)
-            try errs.append(alloc, "no musl-hardened-llvm stage3 — musl variants are hardened or llvm, not both");
+            try errs.append(alloc, "stage3.libc: no musl-hardened-llvm stage3 — musl variants are hardened or llvm, not both");
         switch (cfg.arch) {
             .amd64 => {
                 if (cfg.stage3.nomultilib and (llvm or h != .standard))
-                    try errs.append(alloc, "nomultilib stage3s exist only for the plain glibc+gcc toolchain — hardened+nomultilib is reachable via profile + world rebuild, not stage3");
+                    try errs.append(alloc, "stage3.nomultilib: stage3s exist only for the plain glibc+gcc toolchain — hardened+nomultilib is reachable via profile + world rebuild, not stage3");
             },
             .arm64 => {
                 if (!musl and h != .standard)
-                    try errs.append(alloc, "no arm64 glibc hardened stage3 — hardened on arm64 is musl-only");
+                    try errs.append(alloc, "security.hardening: no arm64 glibc hardened stage3 — hardened on arm64 is musl-only");
             },
             .riscv64 => {
                 if (h != .standard)
-                    try errs.append(alloc, "no riscv64 hardened/selinux stage3");
+                    try errs.append(alloc, "security.hardening: no riscv64 hardened/selinux stage3");
                 if (llvm)
-                    try errs.append(alloc, "no riscv64 llvm stage3");
+                    try errs.append(alloc, "stage3.toolchain: no riscv64 llvm stage3");
             },
             .detect => {}, // resolved post-detection; matrix re-checked then
         }

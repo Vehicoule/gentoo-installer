@@ -346,6 +346,7 @@ pub fn errorField(err: []const u8) ?[]const u8 {
     var tok = std.mem.sliceTo(err, ' ');
     tok = std.mem.sliceTo(tok, '=');
     tok = std.mem.sliceTo(tok, '[');
+    tok = std.mem.sliceTo(tok, ':'); // "field.path: message" leads
     for (pages) |pg| {
         for (pg.fields) |f| {
             if (std.mem.eql(u8, f.name, tok)) return f.name;
@@ -2689,6 +2690,11 @@ test "errorPage attributes errors to their owning page" {
     // field tokens land on their owning page too
     try testing.expectEqualStrings("disk", errorPage("disk.device is required (e.g. /dev/vda)").?);
     try testing.expectEqualStrings("accounts", errorPage("no surviving login path: set a password_hash, or sshd=true plus ssh_authorized_keys").?);
+    // stage3-matrix errors carry a field lead so they surface inline on
+    // the variant page instead of hiding until the whole-config gate
+    try testing.expectEqualStrings("variant", errorPage("stage3.toolchain: no hardened-llvm stage3 — hardened toolchains ship gcc only").?);
+    try testing.expectEqualStrings("variant", errorPage("stage3.nomultilib: stage3s exist only for the plain glibc+gcc toolchain — hardened+nomultilib is reachable via profile + world rebuild, not stage3").?);
+    try testing.expectEqualStrings("variant", errorPage("security.hardening: no arm64 glibc hardened stage3 — hardened on arm64 is musl-only").?);
     // unscoped: no prefix and no field name → null, frontends gate-show
     try testing.expect(errorPage("stage3 tarball is too small to be a system") == null);
 }
