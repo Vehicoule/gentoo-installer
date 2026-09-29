@@ -2155,12 +2155,13 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env,
                     else
                         // --removable overwrites EFI/BOOT/BOOT<arch>.EFI
                         // — on a shared (alongside) ESP preserve whatever
-                        // loader sits there. The live fallback is ours iff
-                        // it byte-matches our core image under EFI/grub/;
-                        // anything else (first-run foreign loader, or one an
-                        // OS update swapped in later) goes to the next free
-                        // .bak/.bakN before grub-install writes ours.
-                        try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "if [ -d /sys/firmware/efi/efivars ]; then exec grub-install --target={s} --efi-directory={s}; else f={s}/EFI/BOOT/{s}; g={s}/EFI/grub/{s}; {{ [ ! -f $f ] || cmp -s $f $g 2>/dev/null || {{ b=$f.bak; n=1; while [ -f $b ]; do b=$f.bak$n; n=$((n+1)); done; cp -f $f $b; }}; }} && exec grub-install --target={s} --efi-directory={s} --removable; fi", .{ grubEfiTarget(cfg), espInTarget(cfg), espInTarget(cfg), efiBootFile(cfg), espInTarget(cfg), grubCoreFile(cfg), grubEfiTarget(cfg), espInTarget(cfg) }) }),
+                        // loader sits there. $f.gentoo is a reference copy of
+                        // the fallback WE last wrote (refreshed after each
+                        // successful install): a live fallback matching it is
+                        // ours; anything else (first-run foreign loader, or
+                        // one an OS update swapped in later) goes to the next
+                        // free .bak/.bakN before grub-install writes ours.
+                        try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "if [ -d /sys/firmware/efi/efivars ]; then exec grub-install --target={s} --efi-directory={s}; else f={s}/EFI/BOOT/{s}; r=$f.gentoo; if [ -f $f ] && ! cmp -s $f $r 2>/dev/null; then b=$f.bak; n=1; while [ -f $b ]; do b=$f.bak$n; n=$((n+1)); done; cp -f $f $b || exit 1; fi; grub-install --target={s} --efi-directory={s} --removable && cp -f $f $r; fi", .{ grubEfiTarget(cfg), espInTarget(cfg), espInTarget(cfg), efiBootFile(cfg), grubEfiTarget(cfg), espInTarget(cfg) }) }),
                     .chroot = true,
                     .desc = "grub-install UEFI",
                 } })
@@ -2472,18 +2473,6 @@ fn grubEfiTarget(cfg: *const Config) []const u8 {
     };
 }
 
-/// grub-install's core image under EFI/grub/ — --removable byte-copies
-/// it to the EFI/BOOT fallback, so a `cmp` against this path tells a
-/// shared-ESP pass whether the live fallback is ours or a foreign
-/// loader worth backing up.
-fn grubCoreFile(cfg: *const Config) []const u8 {
-    return switch (cfg.arch) {
-        .amd64 => "grubx64.efi",
-        .arm64 => "grubaa64.efi",
-        .riscv64 => "grubriscv64.efi",
-        else => "grubx64.efi",
-    };
-}
 
 fn limineConf(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, seed: u128) []const u8 {
     var aw: std.Io.Writer.Allocating = .init(alloc);
