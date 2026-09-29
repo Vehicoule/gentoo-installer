@@ -2142,6 +2142,15 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env,
                     .desc = "os-prober (dual-boot detection for grub.cfg)",
                 } });
             const target = if (cfg.boot_mode == .uefi) grubEfiTarget(cfg) else "i386-pc";
+            // grub's ebuild does not RDEPEND on efibootmgr, and without it
+            // grub-install fails outright on an EFI-booted live env —
+            // merge it whenever the NVRAM-registering path can be taken.
+            if (cfg.boot_mode == .uefi)
+                try c.append(alloc, .{ .exec = .{
+                    .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-boot/efibootmgr" }),
+                    .chroot = true,
+                    .desc = "efibootmgr (grub-install NVRAM registration)",
+                } });
             if (cfg.boot_mode == .uefi)
                 try c.append(alloc, .{ .exec = .{
                     // shim owns the NVRAM entry — under --no-nvram
