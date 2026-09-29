@@ -678,10 +678,6 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier, env: 
     // No official Gentoo binhost exists for riscv64.
     if (cfg.system.binhost and cfg.arch == .riscv64)
         try errs.append(alloc, "system.binhost has no upstream binpackages for riscv64");
-    // Legacy BIOS is an x86 firmware interface — arm64/riscv64 boards
-    // (real and virt) boot UEFI or not at all.
-    if (cfg.boot_mode == .bios and cfg.arch != .amd64 and cfg.arch != .detect)
-        try errs.append(alloc, "boot_mode=bios has no firmware on arm64/riscv64 — UEFI only");
     // An explicit limine pick is amd64-only even though `auto` quietly
     // degrades to grub off-x86 — make the reason explicit.
     if (cfg.system.bootloader == .limine and cfg.arch != .amd64 and cfg.arch != .detect)

@@ -429,7 +429,7 @@ pub const Wizard = struct {
     /// btrfs, zram, limine, dist-bin, doas, hardened+selinux — on amd64.
     /// Off-amd64 the equivalents: bootloader auto (grub), kernel dist on
     /// riscv64 (no gentoo-kernel-bin keyword), standard hardening (no
-    /// arm64/riscv64 selinux stage3).
+    /// arm64/riscv64 selinux stage3), no binhost on riscv64 (none exists).
     fn applyExpressDefaults(w: *Wizard) void {
         if (w.flow != .express) return;
         const amd64ish = w.cfg.arch == .amd64 or w.cfg.arch == .detect;
@@ -438,7 +438,16 @@ pub const Wizard = struct {
         w.cfg.system.bootloader = .auto;
         w.cfg.system.kernel = if (w.cfg.arch == .riscv64) .dist else .@"dist-bin";
         w.cfg.system.privilege = .doas;
+        w.cfg.system.binhost = w.cfg.arch != .riscv64;
         w.cfg.security.hardening = if (amd64ish) .@"hardened-selinux" else .standard;
+        w.cfg.security.selinux = amd64ish;
+    }
+
+    /// A "bios" env report off-amd64 can't mean a real PC BIOS (none
+    /// exists) — it only says the live env lacks an EFI runtime
+    /// (OpenSBI/U-Boot chainload). The target disk is still UEFI.
+    fn effectiveBootMode(reported: config.BootMode, arch: config.Arch) config.BootMode {
+        return if (reported == .bios and arch != .amd64) .uefi else reported;
     }
 
     /// Pages visible under the current flow, in order.
@@ -844,12 +853,16 @@ pub const Wizard = struct {
             if (w.flow == .express) {
                 if (w.cfg.system.kernel == .@"dist-bin" and env.arch == .riscv64)
                     w.cfg.system.kernel = .dist;
-                if (w.cfg.security.hardening == .@"hardened-selinux" and env.arch != .amd64)
+                if (w.cfg.system.binhost and env.arch == .riscv64)
+                    w.cfg.system.binhost = false;
+                if (w.cfg.security.hardening == .@"hardened-selinux" and env.arch != .amd64) {
                     w.cfg.security.hardening = .standard;
+                    w.cfg.security.selinux = false;
+                }
             }
         }
         if (!w.cfg.boot_mode_explicit)
-            w.cfg.boot_mode = env.boot_mode;
+            w.cfg.boot_mode = effectiveBootMode(env.boot_mode, env.arch);
         // an unpinned scheme tracks the EFFECTIVE firmware either way —
         // an explicit boot_mode pick must flip an implicit scheme too,
         // and a bios→uefi re-detect must un-apply the bios scheme.
@@ -863,7 +876,18 @@ pub const Wizard = struct {
         // it itself or the disk page can never validate on BIOS.
         if (w.flow == .express and w.cfg.boot_mode == .bios)
             w.cfg.disk.boot_part = true;
+        w.normalizeHidden();
         w.invalidateSteps();
+    }
+
+    /// Combos that must silently flip hidden fields: `disk.boot_part` is
+    /// an expert-only field (invisible under Express), but grub can't
+    /// read kernels inside a LUKS-encrypted root — force the unencrypted
+    /// /boot on so a fresh Express + LUKS install stays valid.
+    fn normalizeHidden(w: *Wizard) void {
+        if (w.flow == .express and w.cfg.disk.luks and !w.cfg.disk.boot_part and
+            config.resolveBootloader(&w.cfg) == .grub)
+            w.cfg.disk.boot_part = true;
     }
 
     /// Merge the attached preset's `[defaults]` under cfg and pin any
@@ -923,6 +947,7 @@ pub const Wizard = struct {
             w.page_idx = prev_page;
             return e;
         };
+        w.normalizeHidden();
         // Derived changes (libc→init, hardening→selinux, init→netmanager)
         // skip the per-field lock check — verify every locked path on the
         // final cfg and roll the whole set back on violation.
@@ -1048,7 +1073,7 @@ pub const Wizard = struct {
             const s = try strOf(v);
             if (std.mem.eql(u8, s, "auto")) {
                 w.cfg.boot_mode_explicit = false;
-                w.cfg.boot_mode = if (w.env) |env| env.boot_mode else (w.detected_boot orelse .uefi);
+                w.cfg.boot_mode = if (w.env) |env| effectiveBootMode(env.boot_mode, env.arch) else (w.detected_boot orelse .uefi);
             } else {
                 w.cfg.boot_mode = std.meta.stringToEnum(config.BootMode, s) orelse return error.BadValue;
                 w.cfg.boot_mode_explicit = true;
@@ -1062,6 +1087,7 @@ pub const Wizard = struct {
                 };
             if (w.flow == .express and w.cfg.boot_mode == .bios)
                 w.cfg.disk.boot_part = true;
+            w.normalizeHidden();
             return;
         }
         if (std.mem.eql(u8, name, "users")) {
@@ -2650,6 +2676,56 @@ test "applyEnv follows firmware both directions" {
     w.cfg.disk.scheme_explicit = true;
     w.applyEnv(e_bios);
     try testing.expectEqual(config.Scheme.manual, w.cfg.disk.scheme);
+}
+
+test "applyEnv treats no-EFI-runtime as uefi off-amd64, retires express defaults" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var w = testWizard();
+    w.alloc = arena.allocator();
+    w.flow = .express;
+    w.applyExpressDefaults();
+    const e = detect.Env{
+        .arch = .riscv64,
+        .boot_mode = .bios, // OpenSBI direct-kernel live env: no EFI runtime, not a PC BIOS
+        .ram_mib = 8192,
+        .cpu_count = 4,
+        .cpu_vendor = "test",
+        .cpu_flags = &.{},
+        .nics = &.{},
+        .gpus = &.{},
+        .disks = &.{},
+        .net_reachable = false,
+    };
+    w.applyEnv(e);
+    // "bios" only described the live env — the target disk is UEFI.
+    try testing.expectEqual(config.BootMode.uefi, w.cfg.boot_mode);
+    try testing.expectEqual(config.Scheme.@"efi-swap-root", w.cfg.disk.scheme);
+    // express defaults that can't work on riscv64 were retired.
+    try testing.expectEqual(config.Kernel.dist, w.cfg.system.kernel);
+    try testing.expectEqual(false, w.cfg.system.binhost);
+    try testing.expectEqual(config.Hardening.standard, w.cfg.security.hardening);
+    try testing.expectEqual(false, w.cfg.security.selinux);
+    // arm64 keeps dist-bin (keyword exists) but still retires selinux.
+    var w2 = testWizard();
+    w2.alloc = arena.allocator();
+    w2.flow = .express;
+    w2.applyExpressDefaults();
+    var e2 = e;
+    e2.arch = .arm64;
+    w2.applyEnv(e2);
+    try testing.expectEqual(config.Kernel.@"dist-bin", w2.cfg.system.kernel);
+    try testing.expectEqual(false, w2.cfg.security.selinux);
+    // express + luks on a grub-resolving arch gets its hidden /boot part.
+    try w2.setField("disk.luks", .{ .bool = true });
+    try testing.expectEqual(true, w2.cfg.disk.boot_part);
+    // amd64 bios stays a real PC BIOS report.
+    var w3 = testWizard();
+    w3.alloc = arena.allocator();
+    var e3 = e;
+    e3.arch = .amd64;
+    w3.applyEnv(e3);
+    try testing.expectEqual(config.BootMode.bios, w3.cfg.boot_mode);
 }
 
 test "preset defaults apply and locks reject divergence" {
