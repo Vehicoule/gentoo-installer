@@ -2156,7 +2156,10 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env,
                         // --removable overwrites EFI/BOOT/BOOT<arch>.EFI
                         // — on a shared (alongside) ESP preserve whatever
                         // loader already sits there as a .bak sibling.
-                        try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "if [ -d /sys/firmware/efi/efivars ]; then exec grub-install --target={s} --efi-directory={s}; else f={s}/EFI/BOOT/{s}; [ -f $f ] && cp -f $f $f.bak; exec grub-install --target={s} --efi-directory={s} --removable; fi", .{ grubEfiTarget(cfg), espInTarget(cfg), espInTarget(cfg), efiBootFile(cfg), grubEfiTarget(cfg), espInTarget(cfg) }) }),
+                        // Skip the copy when a .bak exists: on a re-run the
+                        // live file is our own GRUB, and overwriting .bak
+                        // would lose the original OS loader it saved.
+                        try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "if [ -d /sys/firmware/efi/efivars ]; then exec grub-install --target={s} --efi-directory={s}; else f={s}/EFI/BOOT/{s}; {{ [ ! -f $f ] || [ -f $f.bak ] || cp -f $f $f.bak; }} && exec grub-install --target={s} --efi-directory={s} --removable; fi", .{ grubEfiTarget(cfg), espInTarget(cfg), espInTarget(cfg), efiBootFile(cfg), grubEfiTarget(cfg), espInTarget(cfg) }) }),
                     .chroot = true,
                     .desc = "grub-install UEFI",
                 } })
