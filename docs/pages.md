@@ -23,8 +23,9 @@ Two flows, picked on `welcome`:
   the wizard only asks for the disk, confirmation, and credentials.
   Defaults: btrfs + zram, systemd, `hardened-selinux-systemd` stage3
   (glibc/gcc — one resolved stem; desktop-profile bits are applied
-  post-stage3), dist-bin kernel, **limine** bootloader (uniform across
-  BIOS/UEFI — one predictable path), NM, doas, minimal package set.
+  post-stage3), dist-bin kernel, `auto` bootloader (**limine** on amd64 —
+  uniform across BIOS/UEFI — **grub** elsewhere; sys-boot/limine carries
+  no non-x86 keyword in ::gentoo), NM, doas, minimal package set.
 - **Advanced** — adds the three Software pages (variant/system/packages)
   between `accounts` and `review`; every field on every page is editable,
   and fields marked `expert` below appear only here.
@@ -172,13 +173,13 @@ they're getting.
 | kernel_config | path | — | `kernel=manual` only: a `.config` on the live env, copied into the target and built via `olddefconfig` |
 | initramfs | enum `dracut\|ugrd\|none` | `dracut` | `none` unsafe with LUKS/LVM/separate-/usr — VALIDATE warns/blocks |
 | uki | bool | false | implies dracut/ugrd + installkernel[uki] |
-| bootloader | enum `auto\|grub\|systemd-boot\|efistub\|limine\|refind` | `auto` (resolves to **limine** on both BIOS and UEFI, both flows) | grub/systemd-boot/efistub/rEFInd are explicit Advanced picks. VALIDATE hard-rejects `systemd-boot`/`efistub`/`uki`/`refind` on BIOS (limine BIOS mode is supported) |
+| bootloader | enum `auto\|grub\|systemd-boot\|efistub\|limine\|refind` | `auto` (**limine** on amd64 — BIOS+UEFI — **grub** on arm64/riscv64) | grub/systemd-boot/efistub/rEFInd are explicit Advanced picks. VALIDATE hard-rejects `systemd-boot`/`efistub`/`uki`/`refind` on BIOS (limine BIOS mode is supported), an explicit `limine` pick off-amd64, and `boot_mode=bios` off-amd64 (no legacy firmware exists there) |
 | secure_boot | enum `off\|sbctl\|shim` | `off` | UEFI-only — hidden and forced `off` on BIOS boots (VALIDATE rejects non-`off` there too); `sbctl` requires uki or signed bootloader; `shim` for grub only — stages MS-signed shim+mmx64 + MOK-signed grubx64.efi/kernels, `efibootmgr` entry → shim; amd64/arm64 only (no upstream riscv64 shim) |
 | — | — | — | shim enrollment uses `mokutil --root-pw`: the **root password** is the one-time MOK password MokManager asks for at first boot — VALIDATE requires root.password when secure_boot=shim |
 | snapshots | enum `auto\|off` | `auto` | system snapshots before world-update/kernel installs; needs btrfs root or `lvm=on`, else kernel rollback only |
 | keep_kernels | int | 3 | kernel boot entries retained; 0 = never prune |
 | net_manager | enum `networkmanager\|dhcpcd\|netifrc\|systemd-networkd` | `networkmanager` | `systemd-networkd` needs init=systemd |
-| wifi_fw | bool | detected | `linux-firmware` + `sof-firmware` |
+| wifi_fw | bool | detected | `linux-firmware` (+ `sof-firmware` on amd64 — the package is x86-only) |
 | gpu_driver | enum `auto\|nouveau\|nvidia-open\|nvidia-drivers` | `auto` | `auto` = in-kernel/mesa; NVIDIA ⇒ generation-aware: **`nvidia-open`** on Turing+ (GTX 16xx/RTX 20xx+ — Express's opinionated pick), `nvidia-drivers` or `nouveau` on older silicon. `nvidia-*` options appear only when `env.gpus[]` reports NVIDIA; VALIDATE rejects `nvidia-open` on pre-Turing. They imply `ACCEPT_LICENSE=+NVIDIA` and kernel-module signing when secure_boot is on |
 | microcode | bool | detected (vendor) | intel-microcode / amd via linux-firmware; loaded early via the initramfs (dracut `early_microcode`) |
 | services.sshd / .logger / .cron | bool | false/true/true | — |

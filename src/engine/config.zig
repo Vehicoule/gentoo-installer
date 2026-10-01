@@ -416,11 +416,12 @@ pub fn shrinkable(fs: RootFs) bool {
     };
 }
 
-/// Resolve `bootloader = "auto"`: limine on every boot mode/flow
-/// (docs/DESIGN.md §Decisions).
+/// Resolve `bootloader = "auto"`: limine on amd64, grub elsewhere —
+/// sys-boot/limine is ~amd64/~x86-only in ::gentoo (the package grows
+/// uefi-aarch64/uefi-riscv64 USE flags but ships no non-x86 keyword).
 pub fn resolveBootloader(cfg: *const Config) Bootloader {
     if (cfg.system.bootloader != .auto) return cfg.system.bootloader;
-    return .limine;
+    return if (cfg.arch == .amd64 or cfg.arch == .detect) .limine else .grub;
 }
 
 /// Resolve the stage3 stem (the pointer-file suffix after the arch
@@ -677,6 +678,14 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier, env: 
     // No official Gentoo binhost exists for riscv64.
     if (cfg.system.binhost and cfg.arch == .riscv64)
         try errs.append(alloc, "system.binhost has no upstream binpackages for riscv64");
+    // An explicit limine pick is amd64-only even though `auto` quietly
+    // degrades to grub off-x86 — make the reason explicit.
+    if (cfg.system.bootloader == .limine and cfg.arch != .amd64 and cfg.arch != .detect)
+        try errs.append(alloc, fmt(alloc, "system.bootloader=limine is amd64-only — sys-boot/limine has no {s} keyword in ::gentoo", .{@tagName(cfg.arch)}));
+    // Gentoo's prebuilt dist kernel is published for amd64/arm64 only;
+    // riscv64 builds gentoo-sources from source.
+    if (cfg.system.kernel == .@"dist-bin" and cfg.arch == .riscv64)
+        try errs.append(alloc, "kernel=dist-bin has no riscv64 prebuilt kernel — use kernel=dist (gentoo-sources)");
     // Network managers must match init capabilities.
     if (cfg.network.manager == .netifrc and cfg.system.init != .openrc)
         try errs.append(alloc, "network.manager=netifrc requires init=openrc");
@@ -1439,6 +1448,46 @@ test "validate stage3 variant matrix" {
             if (!stage3_err) std.debug.print("expected stage3 err for {s}/{s}\n", .{ tc.arch, tc.s3 });
             try std.testing.expect(stage3_err);
         }
+    }
+}
+
+test "validate gates x86-only paths off amd64" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { arch: []const u8, extra: []const u8, ok: bool }{
+        .{ .arch = "arm64", .extra = "kernel = \"dist\"", .ok = true },
+        .{ .arch = "riscv64", .extra = "kernel = \"dist\"", .ok = true },
+        .{ .arch = "amd64", .extra = "bootloader = \"limine\"", .ok = true },
+        .{ .arch = "arm64", .extra = "bootloader = \"limine\"", .ok = false },
+        .{ .arch = "riscv64", .extra = "bootloader = \"limine\"", .ok = false },
+        .{ .arch = "arm64", .extra = "kernel = \"dist-bin\"", .ok = true },
+        .{ .arch = "riscv64", .extra = "kernel = \"dist-bin\"", .ok = false },
+    };
+    for (cases) |tc| {
+        const src = try std.fmt.allocPrint(alloc,
+            \\arch = "{s}"
+            \\[disk]
+            \\device = "/dev/sda"
+            \\[system]
+            \\binhost = false
+            \\{s}
+            \\[security]
+            \\hardening = "standard"
+            \\selinux = false
+            \\[[users]]
+            \\name = "a"
+            \\password_hash = "$6$x$y"
+        , .{ tc.arch, tc.extra });
+        defer alloc.free(src);
+        var r = try validCfg(alloc, src);
+        defer r.doc.deinit();
+        var arch_err = false;
+        for (r.errs) |e| {
+            if (std.mem.indexOf(u8, e, "amd64-only") != null or
+                std.mem.indexOf(u8, e, "riscv64 prebuilt") != null) arch_err = true;
+        }
+        if (arch_err == tc.ok)
+            std.debug.print("arch gate mismatch {s}/{s}: {any}\n", .{ tc.arch, tc.extra, r.errs });
+        try std.testing.expect(arch_err != tc.ok);
     }
 }
 

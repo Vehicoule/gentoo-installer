@@ -259,6 +259,10 @@ fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, 
                 const pp = partPath(alloc, dev, n);
                 const is_root = std.mem.eql(u8, p.mount, "/");
                 var dev_node = pp;
+                // mkfs/luksFormat refuse leftover signatures — a rerun after
+                // a failed install still has them. Wipe before any format.
+                if ((is_root and d.luks) or (p.fs.len > 0 and !std.mem.eql(u8, p.fs, "none")))
+                    try c.append(alloc, argv(alloc, &.{ "wipefs", "-a", pp }, s(alloc, "wipe signatures on {s}", .{pp})));
                 if (is_root and d.luks) {
                     try c.append(alloc, .{ .exec = .{
                         .argv = try alloc.dupe([]const u8, &.{ "cryptsetup", "luksFormat", "--type", "luks2", "--pbkdf", "argon2id", "--batch-mode", "--key-file", "-", pp }),
@@ -415,9 +419,14 @@ fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, 
     try c.append(alloc, argv(alloc, &.{ "sgdisk", s(alloc, "-n{}:0:0", .{n}), s(alloc, "-t{}:8304", .{n}), s(alloc, "-c{}:root", .{n}), s(alloc, "-u{}:{s}", .{ n, partGuid(alloc, seed, n) }), dev }, s(alloc, "root partition {} (rest of disk)", .{n})));
 
     // ESP filesystem (never reformatted in alongside mode — not reached here).
-    if (esp_part) |esp|
+    // wipefs before every format: a rerun after a failed install still
+    // carries signatures mkfs tools refuse to overwrite.
+    if (esp_part) |esp| {
+        try c.append(alloc, argv(alloc, &.{ "wipefs", "-a", esp }, s(alloc, "wipe signatures on {s}", .{esp})));
         try c.append(alloc, argv(alloc, &.{ "mkfs.vfat", "-F32", "-n", "ESP", esp }, "format ESP as FAT32"));
+    }
     if (boot_part) |bp| {
+        try c.append(alloc, argv(alloc, &.{ "wipefs", "-a", bp }, s(alloc, "wipe signatures on {s}", .{bp})));
         // Limine ≥12 reads only FAT/ISO9660 — ext4 /boot is unreadable
         // to its BIOS stage. grub keeps ext4.
         if (std.mem.eql(u8, bootPartFs(cfg), "vfat")) {
@@ -439,8 +448,10 @@ fn appendFsChain(alloc: Allocator, c: *std.ArrayList(Cmd), cfg: *const Config, r
     // standalone partition — validation enforces that pairing.
     _ = d.home_part;
 
-    // LUKS on root (container lives on the raw partition).
+    // LUKS on root (container lives on the raw partition). Wipe stale
+    // signatures first — luksFormat/pvcreate/mkfs all refuse leftovers.
     var root_dev = root_part;
+    try c.append(alloc, argv(alloc, &.{ "wipefs", "-a", root_part }, s(alloc, "wipe signatures on {s}", .{root_part})));
     if (d.luks) {
         try c.append(alloc, .{ .exec = .{
             .argv = try alloc.dupe([]const u8, &.{ "cryptsetup", "luksFormat", "--type", "luks2", "--pbkdf", "argon2id", "--batch-mode", "--key-file", "-", root_part }),
@@ -460,6 +471,7 @@ fn appendFsChain(alloc: Allocator, c: *std.ArrayList(Cmd), cfg: *const Config, r
     // LVM inside the (possibly encrypted) root container.
     var fs_dev = root_dev;
     if (d.lvm) {
+        try c.append(alloc, argv(alloc, &.{ "wipefs", "-a", root_dev }, s(alloc, "wipe signatures on {s}", .{root_dev})));
         try c.append(alloc, argv(alloc, &.{ "pvcreate", "--norestorefile", root_dev }, s(alloc, "PV on {s}", .{root_dev})));
         try c.append(alloc, argv(alloc, &.{ "vgcreate", "vg0", root_dev }, "volume group vg0"));
         if (cfg.system.snapshots == .auto) {
@@ -482,26 +494,31 @@ fn appendFsChain(alloc: Allocator, c: *std.ArrayList(Cmd), cfg: *const Config, r
                     .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "{s}lvcreate -T vg0/tank -n home -V \"${{pm}}M\"", .{measure}) }),
                     .desc = "thin home LV (virtual size = pool, overcommit)",
                 } });
+                try c.append(alloc, argv(alloc, &.{ "wipefs", "-a", "/dev/vg0/home" }, "wipe signatures on home LV"));
                 try c.append(alloc, argv(alloc, &.{ s(alloc, "mkfs.{s}", .{@tagName(d.root_fs)}), "/dev/vg0/home" }, "format home LV"));
             }
         } else {
             try c.append(alloc, argv(alloc, &.{ "lvcreate", "-l", "70%VG", "-n", "root", "vg0" }, "linear root LV (70% VG)"));
             if (d.home_part and d.root_fs != .btrfs) {
                 try c.append(alloc, argv(alloc, &.{ "lvcreate", "-l", "100%FREE", "-n", "home", "vg0" }, "linear home LV (rest of VG)"));
+                try c.append(alloc, argv(alloc, &.{ "wipefs", "-a", "/dev/vg0/home" }, "wipe signatures on home LV"));
                 try c.append(alloc, argv(alloc, &.{ s(alloc, "mkfs.{s}", .{@tagName(d.root_fs)}), "/dev/vg0/home" }, "format home LV"));
             }
         }
         fs_dev = "/dev/vg0/root";
     }
 
+    try c.append(alloc, argv(alloc, &.{ "wipefs", "-a", fs_dev }, s(alloc, "wipe signatures on {s}", .{fs_dev})));
     const mk = mkfsTool(d.root_fs);
     var mkfs_argv: std.ArrayList([]const u8) = .empty;
     try mkfs_argv.append(alloc, mk.mkfs);
     try mkfs_argv.append(alloc, fs_dev);
     try c.append(alloc, fmtArgv(alloc, s(alloc, "format root as {s}", .{@tagName(d.root_fs)}), mkfs_argv.items));
 
-    if (swap_part) |sp|
+    if (swap_part) |sp| {
+        try c.append(alloc, argv(alloc, &.{ "wipefs", "-a", sp }, s(alloc, "wipe signatures on {s}", .{sp})));
         try c.append(alloc, argv(alloc, &.{ "mkswap", "-L", "swap", sp }, "format swap"));
+    }
 
     if (d.root_fs == .btrfs) {
         // Mount then create the subvol layout + @snapshots dir.
@@ -912,7 +929,10 @@ fn makeConf(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) ![]co
 
     const cflags = switch (cfg.makeconf.cflags) {
         .safe => "-O2 -pipe",
-        .native => "-O2 -pipe -march=native",
+        // -march=native is broken on riscv64: gcc's ISA-string detection
+        // frequently produces an arch string it then rejects (even on real
+        // hardware); rv64gc is the lp64d baseline Gentoo recommends.
+        .native => if (cfg.arch == .riscv64) "-O2 -pipe -march=rv64gc" else "-O2 -pipe -march=native",
         .custom => |f| f,
     };
     try w.print("COMMON_FLAGS=\"{s}\"\nCFLAGS=\"${{COMMON_FLAGS}}\"\nCXXFLAGS=\"${{COMMON_FLAGS}}\"\n", .{cflags});
@@ -1070,6 +1090,12 @@ fn planPortage(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, se
         };
         try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/package.accept_keywords/installer", s(alloc, "sys-boot/limine {s}\n", .{kw})));
     }
+    // Packages that are stable on amd64 but ~arch-only elsewhere. Keywords
+    // for other arches are inert on the current one, so emit the union.
+    if (cfg.disk.swap == .zram and cfg.system.init == .systemd)
+        try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/package.accept_keywords/zram", "sys-apps/zram-generator ~arm64 ~riscv\n"));
+    if (cfg.system.privilege == .doas)
+        try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/package.accept_keywords/doas", "app-admin/doas ~riscv\n"));
     try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/portage/repos.conf/gentoo.conf", "[gentoo]\nlocation = /var/db/repos/gentoo\nsync-type = webrsync\n"));
     if (cfg.system.binhost) {
         // Gentoo ships binhosts per arch+ABI dir; riscv64 has none.
@@ -1100,6 +1126,17 @@ fn planChroot(alloc: Allocator) !Step {
     var c: std.ArrayList(Cmd) = .empty;
     for ([_][]const u8{ "/proc", "/sys", "/dev", "/run" }) |p|
         try c.append(alloc, argv(alloc, &.{ "mount", "--rbind", p, s(alloc, "/mnt/gentoo{s}", .{p}) }, s(alloc, "bind {s}", .{p})));
+    // Minimal/hand-rolled live envs can expose /dev/null & friends at 0600/0660
+    // root:root or lack devpts, which breaks portage's userpriv/userfetch
+    // children (they reopen os.devnull and allocate ptys). Normalize; no-op on
+    // regular live media.
+    try c.append(alloc, argv(alloc, &.{
+        "sh", "-c",
+        "chmod a+rw /mnt/gentoo/dev/null /mnt/gentoo/dev/zero /mnt/gentoo/dev/full" ++
+        " /mnt/gentoo/dev/random /mnt/gentoo/dev/urandom /mnt/gentoo/dev/tty 2>/dev/null; " ++
+        "mkdir -p /mnt/gentoo/dev/pts; " ++
+        "mountpoint -q /mnt/gentoo/dev/pts 2>/dev/null || mount -t devpts devpts /mnt/gentoo/dev/pts 2>/dev/null; :",
+    }, "normalize device nodes + devpts inside chroot"));
     try c.append(alloc, argv(alloc, &.{ "cp", "--dereference", "/etc/resolv.conf", "/mnt/gentoo/etc/" }, "dns into target"));
     try c.append(alloc, .{ .note = "subsequent chroot cmds run as: chroot /mnt/gentoo <cmd>" });
     return step(alloc, "enter-chroot", "Enter chroot", c);
@@ -1108,6 +1145,10 @@ fn planChroot(alloc: Allocator) !Step {
 fn planRepoSync(alloc: Allocator, cfg: *const Config) !Step {
     _ = cfg;
     var c: std.ArrayList(Cmd) = .empty;
+    // Portage drops a repo whose `location` isn't a directory (seen on
+    // bare live envs: "Invalid Repository Location" → "Repository
+    // 'gentoo' not found"). Create it rather than relying on webrsync.
+    try c.append(alloc, argv(alloc, &.{ "mkdir", "-p", "/mnt/gentoo/var/db/repos/gentoo" }, "repo location dir"));
     try c.append(alloc, .{ .exec = .{
         .argv = try alloc.dupe([]const u8, &.{"emerge-webrsync"}),
         .chroot = true,
@@ -1179,7 +1220,10 @@ fn planKernel(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !St
     // firmware + microcode
     var fw_atoms: std.ArrayList([]const u8) = .empty;
     try fw_atoms.append(alloc, "sys-kernel/linux-firmware");
-    try fw_atoms.append(alloc, "sys-firmware/sof-firmware");
+    // SOF is Intel audio-DSP firmware — the package is amd64/x86-only in
+    // ::gentoo, so emerging it elsewhere fails dep resolution outright.
+    if (cfg.arch == .amd64)
+        try fw_atoms.append(alloc, "sys-firmware/sof-firmware");
     if (ucodeAtom(cfg, env)) |atom| try fw_atoms.append(alloc, atom);
     try c.append(alloc, .{ .exec = .{
         .argv = try prepend(alloc, "emerge", fw_atoms.items),
@@ -2098,14 +2142,35 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env,
                     .desc = "os-prober (dual-boot detection for grub.cfg)",
                 } });
             const target = if (cfg.boot_mode == .uefi) grubEfiTarget(cfg) else "i386-pc";
+            // grub's ebuild does not RDEPEND on efibootmgr, and without it
+            // grub-install fails outright on an EFI-booted live env —
+            // merge it whenever the NVRAM-registering path can be taken.
+            if (cfg.boot_mode == .uefi)
+                try c.append(alloc, .{ .exec = .{
+                    .argv = try alloc.dupe([]const u8, &.{ "emerge", "sys-boot/efibootmgr" }),
+                    .chroot = true,
+                    .desc = "efibootmgr (grub-install NVRAM registration)",
+                } });
             if (cfg.boot_mode == .uefi)
                 try c.append(alloc, .{ .exec = .{
                     // shim owns the NVRAM entry — under --no-nvram
-                    // grub-install only lays modules + boot files.
+                    // grub-install only lays modules + boot files. When the
+                    // live env wasn't EFI-booted (riscv64 OpenSBI direct-kernel
+                    // bring-up) efibootmgr can't register an entry — install
+                    // --removable instead, which also writes the
+                    // EFI/BOOT/BOOT<arch>.EFI fallback U-Boot/EDK2 scan for.
                     .argv = if (cfg.security.secure_boot == .shim)
                         try alloc.dupe([]const u8, &.{ "grub-install", s(alloc, "--target={s}", .{grubEfiTarget(cfg)}), s(alloc, "--efi-directory={s}", .{espInTarget(cfg)}), "--no-nvram" })
                     else
-                        try alloc.dupe([]const u8, &.{ "grub-install", s(alloc, "--target={s}", .{grubEfiTarget(cfg)}), s(alloc, "--efi-directory={s}", .{espInTarget(cfg)}) }),
+                        // --removable overwrites EFI/BOOT/BOOT<arch>.EFI
+                        // — on a shared (alongside) ESP preserve whatever
+                        // loader sits there. $f.gentoo is a reference copy of
+                        // the fallback WE last wrote (refreshed after each
+                        // successful install): a live fallback matching it is
+                        // ours; anything else (first-run foreign loader, or
+                        // one an OS update swapped in later) goes to the next
+                        // free .bak/.bakN before grub-install writes ours.
+                        try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "if [ -d /sys/firmware/efi/efivars ]; then exec grub-install --target={s} --efi-directory={s}; else f={s}/EFI/BOOT/{s}; r=$f.gentoo; if [ -f $f ] && ! cmp -s $f $r 2>/dev/null; then b=$f.bak; n=1; while [ -f $b ]; do b=$f.bak$n; n=$((n+1)); done; cp -f $f $b || exit 1; fi; grub-install --target={s} --efi-directory={s} --removable && cp -f $f $r; fi", .{ grubEfiTarget(cfg), espInTarget(cfg), espInTarget(cfg), efiBootFile(cfg), grubEfiTarget(cfg), espInTarget(cfg) }) }),
                     .chroot = true,
                     .desc = "grub-install UEFI",
                 } })
@@ -2416,6 +2481,7 @@ fn grubEfiTarget(cfg: *const Config) []const u8 {
         else => "x86_64-efi",
     };
 }
+
 
 fn limineConf(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, seed: u128) []const u8 {
     var aw: std.Io.Writer.Allocating = .init(alloc);

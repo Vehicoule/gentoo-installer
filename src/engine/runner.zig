@@ -272,11 +272,11 @@ fn execCmd(io: std.Io, alloc: Allocator, e: plan.Exec) !void {
     try argv_buf.appendSlice(alloc, e.argv);
     var child = try std.process.spawn(io, .{
         .argv = argv_buf.items,
-        .stdin = if (e.stdin != null) .pipe else .inherit,
-        // The headless wire is stdout-only — child output must never
-        // reach it. Both streams are piped: a secret-bearing stdin
-        // means collect+redact before forwarding, otherwise stream
-        // straight to stderr (bounded memory over a long install).
+        // Only stdin-bearing commands get a pipe — everything else
+        // reads /dev/null. Inheriting the headless stream both lets a
+        // child slurp pending protocol lines and breaks portage fetch
+        // workers (their spawn children crash on the shared fd).
+        .stdin = if (e.stdin != null) .pipe else .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
     });
