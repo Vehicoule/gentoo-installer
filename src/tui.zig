@@ -42,6 +42,22 @@ const PageView = struct {
 
 const Mode = enum { form, editing, confirm_install, progress, plan_preview, done, failed };
 
+/// overlay listing the keys of the active mode — `?` toggles it
+const HELP_TEXT =
+    \\ keys ──────────────────────────────────────────
+    \\  ↑/k ↓/j        move · scroll review/plan
+    \\  ←/h →/l space  cycle option · pick action
+    \\  enter          edit field · activate button
+    \\  PgUp/PgDn      back / next page
+    \\  g then digit   jump to a visited page (rail #)
+    \\  ?              this help
+    \\  q / ctrl+c     quit
+    \\ ───────────────────────────────────────────────
+    \\ editing:  enter commit · esc cancel
+    \\ secrets:  type → enter → retype → enter
+    \\ confirm:  type the disk name, enter, esc cancels
+;
+
 pub const Tui = struct {
     alloc: Allocator,
     io: std.Io,
@@ -58,6 +74,9 @@ pub const Tui = struct {
     confirming: bool = false,
     errors: std.ArrayList(ErrItem) = .empty,
     status: []const u8 = "",
+    /// status renders green for info and red for failures — the flag
+    /// keeps the two apart instead of guessing from the text.
+    status_err: bool = false,
     prog_lines: std.ArrayList([]const u8) = .empty,
     plan_lines: std.ArrayList([]const u8) = .empty,
     /// timeline for the install view — ids/titles live on `alloc`
@@ -67,6 +86,10 @@ pub const Tui = struct {
     scroll: usize = 0,
     /// pending digit for the `g<N>` nav jump — 0 = no jump armed.
     goto_armed: bool = false,
+    /// `?` help overlay
+    show_help: bool = false,
+    /// plan preview scroll offset
+    plan_scroll: usize = 0,
     /// set by the review-page whole-config gate — refreshErrors shows
     /// every error, not just this page's, until the user navigates.
     gate_errors: bool = false,
@@ -315,10 +338,12 @@ pub const Tui = struct {
         }
         t.wiz.setField(f.name, v) catch |e| {
             t.status = std.fmt.allocPrint(t.alloc, "set failed: {s}", .{@errorName(e)}) catch "set failed";
+            t.status_err = true;
             return;
         };
         t.mode = .form;
         t.status = "";
+        t.status_err = false;
         try t.refreshErrors();
         try t.refreshPage();
     }
@@ -383,6 +408,7 @@ pub const Tui = struct {
         } else if (std.mem.eql(u8, act, "quit")) {
             t.mode = .done;
             t.status = "quit";
+            t.status_err = false;
         } else if (std.mem.eql(u8, act, "plan")) {
             try t.showPlanPreview();
         } else if (std.mem.eql(u8, act, "export_answer")) {
@@ -390,6 +416,7 @@ pub const Tui = struct {
             if (!try t.requireValidConfig()) return;
             try t.wiz.exportAnswer("gentoo-installer-answer.toml");
             t.status = "answer file → ./gentoo-installer-answer.toml";
+            t.status_err = false;
         } else if (std.mem.eql(u8, act, "install")) {
             if (!try t.requireValidConfig()) return;
             t.mode = .confirm_install;
@@ -410,6 +437,7 @@ pub const Tui = struct {
         // hidden) and the user couldn't see what blocks the install.
         t.gate_errors = true;
         t.status = "fix the listed problems first";
+        t.status_err = true;
         return false;
     }
 
@@ -417,13 +445,16 @@ pub const Tui = struct {
         const ps = try t.wiz.pkgSets(t.alloc);
         if (ps.errs.len > 0) {
             t.status = std.fmt.allocPrint(t.alloc, "set resolution: {s}", .{ps.errs[0]}) catch "set resolution failed";
+            t.status_err = true;
             return;
         }
         const p = engine.plan.build(t.alloc, &t.wiz.cfg, if (t.wiz.env) |*e| e else null, ps.sets, t.wiz.preset, null) catch |e| {
             t.status = std.fmt.allocPrint(t.alloc, "plan failed: {s}", .{@errorName(e)}) catch "plan failed";
+            t.status_err = true;
             return;
         };
         t.plan_lines.clearRetainingCapacity();
+        t.plan_scroll = 0;
         var aw: std.Io.Writer.Allocating = .init(t.alloc);
         try engine.runner.run(t.io, t.alloc, p, .{ .mode = .dry_run, .out = &aw.writer });
         var it = std.mem.splitScalar(u8, aw.written(), '\n');
@@ -436,16 +467,19 @@ pub const Tui = struct {
         t.prog_lines.clearRetainingCapacity();
         const ps = t.wiz.pkgSets(t.alloc) catch |e| {
             t.status = std.fmt.allocPrint(t.alloc, "set resolution failed: {s}", .{@errorName(e)}) catch "set resolution failed";
+            t.status_err = true;
             t.mode = .failed;
             return;
         };
         if (ps.errs.len > 0) {
             t.status = std.fmt.allocPrint(t.alloc, "set resolution: {s}", .{ps.errs[0]}) catch "set resolution failed";
+            t.status_err = true;
             t.mode = .failed;
             return;
         }
         const p = engine.plan.build(t.alloc, &t.wiz.cfg, if (t.wiz.env) |*e| e else null, ps.sets, t.wiz.preset, null) catch |e| {
             t.status = std.fmt.allocPrint(t.alloc, "plan failed: {s}", .{@errorName(e)}) catch "plan failed";
+            t.status_err = true;
             t.mode = .failed;
             return;
         };
@@ -482,11 +516,13 @@ pub const Tui = struct {
             .ctx = &ctx,
         }) catch |e| {
             t.status = std.fmt.allocPrint(t.alloc, "install failed: {s}", .{@errorName(e)}) catch "install failed";
+            t.status_err = true;
             t.mode = .failed;
             return;
         };
         t.mode = .done;
         t.status = "install preview complete (dry-run)";
+        t.status_err = false;
     }
 
     fn cycle(t: *Tui, dir: i32) !void {
@@ -566,6 +602,9 @@ const fg_dim: vaxis.Color = .{ .index = 8 };
 const fg_cyan: vaxis.Color = .{ .index = 14 };
 const accent: vaxis.Style = .{ .fg = fg_cyan, .bold = true };
 const sel: vaxis.Style = .{ .reverse = true };
+/// editing reads differently from mere focus — underline marks the row
+/// whose keys are currently being captured.
+const editing_style: vaxis.Style = .{ .reverse = true, .ul_style = .single };
 const dim: vaxis.Style = .{ .fg = fg_dim };
 const err_style: vaxis.Style = .{ .fg = fg_red };
 const ok_style: vaxis.Style = .{ .fg = fg_green };
@@ -617,6 +656,24 @@ fn drawModal(t: *Tui, win: vaxis.Window, fa: Allocator, w: u16, h: u16) !void {
     const by = (h -| bh) / 2;
     const dev = t.wiz.cfg.disk.device;
     const base = std.fs.path.basename(dev);
+    // size makes the destructive choice concrete — "vdb" alone is a
+    // name; "vdb · 25 GiB" is the thing being wiped
+    var dev_line: []const u8 = dev;
+    if (t.wiz.env) |env| {
+        for (env.disks) |d| {
+            if (std.mem.eql(u8, d.path, dev)) {
+                // match the disk list's precision — sub-GiB disks read
+                // MiB, not "0 GiB"
+                dev_line = if (d.size_bytes >= (1 << 30))
+                    try std.fmt.allocPrint(fa, "{s} · {} GiB{s}", .{ dev, d.size_bytes / (1 << 30), if (d.removable) " (removable)" else "" })
+                else if (d.size_bytes > 0)
+                    try std.fmt.allocPrint(fa, "{s} · {} MiB{s}", .{ dev, d.size_bytes >> 20, if (d.removable) " (removable)" else "" })
+                else
+                    dev;
+                break;
+            }
+        }
+    }
     const bar = try repStr(fa, "─", bw - 2);
     _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, "╭{s}╮", .{bar}), .style = err_style }}, .{ .row_offset = by, .col_offset = bx });
     _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, "╰{s}╯", .{bar}), .style = err_style }}, .{ .row_offset = by + bh - 1, .col_offset = bx });
@@ -625,18 +682,23 @@ fn drawModal(t: *Tui, win: vaxis.Window, fa: Allocator, w: u16, h: u16) !void {
         _ = win.print(&.{.{ .text = "│", .style = err_style }}, .{ .row_offset = by + @as(u16, @intCast(i)), .col_offset = bx + bw - 1 });
         _ = win.print(&.{.{ .text = try repStr(fa, " ", bw - 2), .style = .{} }}, .{ .row_offset = by + @as(u16, @intCast(i)), .col_offset = bx + 1 });
     }
-    _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " Install onto {s}?", .{dev}), .style = .{ .bold = true, .fg = fg_red } }}, .{ .row_offset = by + 1, .col_offset = bx + 1 });
+    _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " Install onto {s}?", .{dev_line}), .style = .{ .bold = true, .fg = fg_red } }}, .{ .row_offset = by + 1, .col_offset = bx + 1 });
     _ = win.print(&.{.{ .text = " All data on the disk will be erased.", .style = .{} }}, .{ .row_offset = by + 2, .col_offset = bx + 1 });
     _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " type `{s}` to continue — TUI previews only (dry-run)", .{base}), .style = dim }}, .{ .row_offset = by + 4, .col_offset = bx + 1 });
     _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " > {s}▌", .{t.edit_buf.items}), .style = .{} }}, .{ .row_offset = by + 6, .col_offset = bx + 1 });
     _ = win.print(&.{.{ .text = " esc cancel · enter confirm", .style = dim }}, .{ .row_offset = by + 7, .col_offset = bx + 1 });
 }
 
-/// install progress: left = step timeline, right = tail of the run log.
-fn drawProgress(t: *Tui, win: vaxis.Window, fa: Allocator, h: u16) !void {
+/// install progress: left = step timeline, right = tail of the run log;
+/// done/failed add a centered result panel over the timeline.
+fn drawProgress(t: *Tui, win: vaxis.Window, fa: Allocator, w: u16, h: u16) !void {
     var row: u16 = 2;
     if (t.install_steps.items.len > 0) {
-        _ = win.print(&.{.{ .text = " steps", .style = .{ .fg = fg_dim, .bold = true } }}, .{ .row_offset = 1 });
+        var done_n: usize = 0;
+        for (t.install_steps.items) |s| {
+            if (std.mem.eql(u8, s.state, "done") or std.mem.eql(u8, s.state, "skipped")) done_n += 1;
+        }
+        _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " steps  ({d}/{d})", .{ done_n, t.install_steps.items.len }), .style = .{ .fg = fg_dim, .bold = true } }}, .{ .row_offset = 1 });
         for (t.install_steps.items) |s| {
             if (row >= h -| 4) break;
             const done_ = std.mem.eql(u8, s.state, "done");
@@ -661,6 +723,29 @@ fn drawProgress(t: *Tui, win: vaxis.Window, fa: Allocator, h: u16) !void {
     }
     const sty: vaxis.Style = if (t.mode == .failed) err_style else if (t.mode == .done) ok_style else .{};
     _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " {s}", .{t.status}), .style = sty }}, .{ .row_offset = h -| 2 });
+
+    // result panel — a boxed verdict on the finished state. .failed
+    // always deserves it (even a pre-step failure), but .done also
+    // covers quitting the wizard — no steps ran, and "✓ finished"
+    // would falsely report completion.
+    if (t.mode == .failed or (t.mode == .done and t.install_steps.items.len > 0)) {
+        const psty: vaxis.Style = if (t.mode == .done) ok_style else err_style;
+        const title = if (t.mode == .done) " ✓ finished " else " ✗ failed ";
+        const bw: u16 = @min(w -| 4, @max(title.len + 6, t.status.len + 8));
+        const bh: u16 = 5;
+        const bx = (w -| bw) / 2;
+        const by = (h -| bh) / 2;
+        _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, "╭{s}╮", .{try repStr(fa, "─", bw - 2)}), .style = psty }}, .{ .row_offset = by, .col_offset = bx });
+        _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, "╰{s}╯", .{try repStr(fa, "─", bw - 2)}), .style = psty }}, .{ .row_offset = by + bh - 1, .col_offset = bx });
+        for (1..bh - 1) |i| {
+            _ = win.print(&.{.{ .text = "│", .style = psty }}, .{ .row_offset = by + @as(u16, @intCast(i)), .col_offset = bx });
+            _ = win.print(&.{.{ .text = "│", .style = psty }}, .{ .row_offset = by + @as(u16, @intCast(i)), .col_offset = bx + bw - 1 });
+            _ = win.print(&.{.{ .text = try repStr(fa, " ", bw - 2), .style = .{} }}, .{ .row_offset = by + @as(u16, @intCast(i)), .col_offset = bx + 1 });
+        }
+        _ = win.print(&.{.{ .text = title, .style = .{ .bold = true, .fg = if (t.mode == .done) fg_green else fg_red } }}, .{ .row_offset = by + 1, .col_offset = bx + 1 });
+        _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " {s}", .{t.status}), .style = .{} }}, .{ .row_offset = by + 2, .col_offset = bx + 1 });
+        _ = win.print(&.{.{ .text = " q to quit", .style = dim }}, .{ .row_offset = by + 3, .col_offset = bx + 1 });
+    }
 }
 
 fn draw(t: *Tui, win: vaxis.Window) !void {
@@ -675,32 +760,53 @@ fn draw(t: *Tui, win: vaxis.Window) !void {
         return;
     }
 
-    // header — brand + flow badge; page position moved to the rail.
+    // header — brand + flow badge, page position right-aligned.
     const head = try std.fmt.allocPrint(fa, " gentoo-installer  ·  {s} flow", .{@tagName(t.wiz.flow)});
     _ = win.print(&.{.{ .text = head, .style = .{ .reverse = true, .bold = true } }}, .{ .row_offset = 0, .col_offset = 0 });
-    _ = win.print(&.{.{ .text = try repStr(fa, " ", w -| @as(u16, @intCast(head.len))), .style = .{ .reverse = true } }}, .{ .row_offset = 0, .col_offset = @intCast(head.len) });
+    const pos = if (t.mode == .form or t.mode == .editing or t.mode == .confirm_install)
+        try std.fmt.allocPrint(fa, "{d}/{d} ", .{ t.pv.index, t.pv.of })
+    else
+        " ";
+    _ = win.print(&.{.{ .text = pos, .style = .{ .reverse = true, .bold = true } }}, .{ .row_offset = 0, .col_offset = w -| @as(u16, @intCast(pos.len)) });
+    _ = win.print(&.{.{ .text = try repStr(fa, " ", w -| @as(u16, @intCast(head.len)) -| @as(u16, @intCast(pos.len))), .style = .{ .reverse = true } }}, .{ .row_offset = 0, .col_offset = @intCast(head.len) });
     t.last_h = h;
 
     if (t.mode == .plan_preview) {
-        _ = win.print(&.{.{ .text = " plan preview — esc to return", .style = accent }}, .{ .row_offset = 2 });
-        var prow: u16 = 3;
+        const total = t.plan_lines.items.len;
+        // "commands" = `     $` exec lines only — step headings, notes
+        // and write_file lines ride in the same stream
+        var ncmd: usize = 0;
         for (t.plan_lines.items) |ln| {
+            if (std.mem.startsWith(u8, ln, "     $")) ncmd += 1;
+        }
+        const vis = h -| 4;
+        t.plan_scroll = @min(t.plan_scroll, total -| vis);
+        _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " plan preview — {d} commands  ·  ↑↓ scroll · esc return", .{ncmd}), .style = accent }}, .{ .row_offset = 2 });
+        var prow: u16 = 3;
+        for (t.plan_lines.items[@min(t.plan_scroll, total)..]) |ln| {
             if (prow >= h -| 1) break;
             _ = win.print(&.{.{ .text = ln, .style = .{} }}, .{ .row_offset = prow });
             prow += 1;
         }
+        if (t.plan_scroll > 0)
+            _ = win.print(&.{.{ .text = " ↑", .style = dim }}, .{ .row_offset = 2, .col_offset = w -| 3 });
+        if (t.plan_scroll + vis < total)
+            _ = win.print(&.{.{ .text = " ↓", .style = dim }}, .{ .row_offset = h -| 2, .col_offset = w -| 3 });
+        if (t.show_help) try drawHelp(win, fa, w, h);
         return;
     }
 
     if (t.mode == .progress or t.mode == .done or t.mode == .failed) {
-        try drawProgress(t, win, fa, h);
+        try drawProgress(t, win, fa, w, h);
         _ = win.print(&.{.{ .text = " q quit", .style = .{ .reverse = true } }}, .{ .row_offset = h -| 1 });
+        if (t.show_help) try drawHelp(win, fa, w, h);
         return;
     }
 
     if (t.mode == .confirm_install) {
         if (w >= 60) try drawRail(t, win, fa, h);
         try drawModal(t, win, fa, w, h);
+        if (t.show_help) try drawHelp(win, fa, w, h);
         return;
     }
 
@@ -812,7 +918,7 @@ fn draw(t: *Tui, win: vaxis.Window) !void {
         if (row > 2 + max_rows) break;
         vi += 1;
         const is_focus = i == t.focus;
-        const sty: vaxis.Style = if (is_focus) sel else .{};
+        const sty: vaxis.Style = if (t.mode == .editing and i == t.edit_field) editing_style else if (is_focus) sel else .{};
         _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, " {s}", .{f.label}), .style = sty }}, .{ .row_offset = row, .col_offset = cx });
         var vbuf: std.Io.Writer.Allocating = .init(fa);
         try renderValue(&vbuf.writer, f, t, i);
@@ -866,6 +972,15 @@ fn draw(t: *Tui, win: vaxis.Window) !void {
         }
     }
 
+    // clipped-field indicators — a scrolled list reads as complete
+    // otherwise
+    if (t.pv.fields.len > 0) {
+        if (t.scroll > 0)
+            _ = win.print(&.{.{ .text = " ↑", .style = dim }}, .{ .row_offset = @intCast(t.contentStart() -| 1), .col_offset = w -| 4 });
+        if (vi < t.pv.fields.len)
+            _ = win.print(&.{.{ .text = " ↓", .style = dim }}, .{ .row_offset = h -| 8, .col_offset = w -| 4 });
+    }
+
     // actions row — pinned above the footer so a long page can't push
     // buttons offscreen.
     if (t.pv.actions.len > 0) {
@@ -908,10 +1023,38 @@ fn draw(t: *Tui, win: vaxis.Window) !void {
     else if (t.goto_armed)
         " g<N>: pick a page number from the rail"
     else
-        " ↑↓ navigate · enter edit · ←→/space pick · PgUp/Dn page · g<N> jump · q quit";
+        " ↑↓ navigate · enter edit · ←→/space pick · PgUp/Dn page · g<N> jump · ? keys · q quit";
     _ = win.print(&.{.{ .text = foot, .style = .{ .reverse = true } }}, .{ .row_offset = h -| 1 });
     if (t.status.len > 0)
-        _ = win.print(&.{.{ .text = t.status, .style = ok_style }}, .{ .row_offset = h -| 2, .col_offset = cx });
+        _ = win.print(&.{.{ .text = t.status, .style = if (t.status_err) err_style else ok_style }}, .{ .row_offset = h -| 2, .col_offset = cx });
+
+    if (t.show_help) try drawHelp(win, fa, w, h);
+}
+
+/// `?` overlay — a centered box of key help; drawn last so it floats
+/// above whatever mode is underneath.
+fn drawHelp(win: vaxis.Window, fa: Allocator, w: u16, h: u16) !void {
+    var lines: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, HELP_TEXT, '\n');
+    while (it.next()) |l| try lines.append(fa, l);
+    // bound by the terminal — the overlay must stay drawable at the
+    // supported 30-col minimum, so shrink the box and clip lines to
+    // the interior rather than spilling off the right edge
+    const bw: u16 = @min(52, w -| 4);
+    const iw: usize = bw -| 4;
+    const bh: u16 = @intCast(@min(lines.items.len + 2, h -| 4));
+    const bx = (w -| bw) / 2;
+    const by = (h -| bh) / 2;
+    _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, "╭{s}╮", .{try repStr(fa, "─", bw - 2)}), .style = accent }}, .{ .row_offset = by, .col_offset = bx });
+    _ = win.print(&.{.{ .text = try std.fmt.allocPrint(fa, "╰{s}╯", .{try repStr(fa, "─", bw - 2)}), .style = accent }}, .{ .row_offset = by + bh - 1, .col_offset = bx });
+    for (1..bh - 1) |i| {
+        _ = win.print(&.{.{ .text = "│", .style = accent }}, .{ .row_offset = by + @as(u16, @intCast(i)), .col_offset = bx });
+        _ = win.print(&.{.{ .text = "│", .style = accent }}, .{ .row_offset = by + @as(u16, @intCast(i)), .col_offset = bx + bw - 1 });
+        _ = win.print(&.{.{ .text = try repStr(fa, " ", bw - 2), .style = .{} }}, .{ .row_offset = by + @as(u16, @intCast(i)), .col_offset = bx + 1 });
+    }
+    for (lines.items[0..@min(lines.items.len, bh -| 2)], 0..) |l, i| {
+        _ = win.print(&.{.{ .text = l[0..@min(l.len, iw)], .style = .{} }}, .{ .row_offset = by + 1 + @as(u16, @intCast(i)), .col_offset = bx + 1 });
+    }
 }
 
 fn renderValue(w: *std.Io.Writer, f: FieldView, t: *Tui, i: usize) !void {
@@ -919,6 +1062,7 @@ fn renderValue(w: *std.Io.Writer, f: FieldView, t: *Tui, i: usize) !void {
         if (std.mem.eql(u8, f.ftype, "secret")) {
             for (0..t.edit_buf.items.len) |_| try w.writeAll("●");
             if (t.confirming) try w.writeAll("  [confirm]");
+            try w.writeAll("▌");
             return;
         }
         try w.writeAll(t.edit_buf.items);
@@ -934,6 +1078,10 @@ fn renderValue(w: *std.Io.Writer, f: FieldView, t: *Tui, i: usize) !void {
             .string => |s| s,
             else => "",
         };
+        if (cur.len == 0) {
+            try w.writeAll("◀ (not set) ▶");
+            return;
+        }
         for (f.options) |o| {
             if (std.mem.eql(u8, o.v, cur)) {
                 try w.print("◀ {s} ▶", .{o.label});
@@ -949,7 +1097,9 @@ fn renderValue(w: *std.Io.Writer, f: FieldView, t: *Tui, i: usize) !void {
         return;
     }
     switch (f.value) {
-        .string => |s| try w.writeAll(s),
+        .string => |s| {
+            if (s.len == 0) try w.writeAll("(not set)") else try w.writeAll(s);
+        },
         .integer => |n| try w.print("{}", .{n}),
         .bool => |b| try w.writeAll(if (b) "true" else "false"),
         .array => |arr| {
@@ -965,7 +1115,7 @@ fn renderValue(w: *std.Io.Writer, f: FieldView, t: *Tui, i: usize) !void {
             }
         },
         .object => try w.writeAll("{…}"),
-        else => try w.writeAll("(unset)"),
+        else => try w.writeAll("(not set)"),
     }
 }
 
@@ -1002,12 +1152,32 @@ pub fn runTui(init: std.process.Init, alloc: Allocator, io: std.Io, preset: ?*co
         switch (ev) {
             .key_press => |key| {
                 if (key.matches('c', .{ .ctrl = true })) break;
-                if (t.mode == .done or t.mode == .failed) {
+                // help overlay swallows keys until dismissed — no
+                // `continue`: the redraw at loop end must paint the
+                // toggle
+                if (t.show_help) {
+                    if (key.matches('?', .{}) or key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{}))
+                        t.show_help = false;
+                } else if (key.text != null and key.text.?.len == 1 and key.text.?[0] == '?' and
+                    // '?' is literal input in the text-entry modes —
+                    // help can't take it there
+                    (t.mode == .form or t.mode == .plan_preview or t.mode == .done or t.mode == .failed))
+                {
+                    t.show_help = true;
+                } else if (t.mode == .done or t.mode == .failed) {
                     if (key.matches('q', .{})) break;
-                    continue;
-                }
-                if (t.mode == .plan_preview) {
-                    if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) t.mode = .form;
+                } else if (t.mode == .plan_preview) {
+                    if (key.matches(vaxis.Key.escape, .{}) or key.matches('q', .{})) {
+                        t.mode = .form;
+                    } else if (key.matches(vaxis.Key.up, .{}) or key.matches('k', .{})) {
+                        t.plan_scroll = t.plan_scroll -| 1;
+                    } else if (key.matches(vaxis.Key.down, .{}) or key.matches('j', .{})) {
+                        t.plan_scroll +|= 1;
+                    } else if (key.matches(vaxis.Key.page_up, .{})) {
+                        t.plan_scroll = t.plan_scroll -| 10;
+                    } else if (key.matches(vaxis.Key.page_down, .{})) {
+                        t.plan_scroll +|= 10;
+                    }
                 } else if (t.mode == .confirm_install) {
                     if (key.matches(vaxis.Key.enter, .{})) {
                         const base = std.fs.path.basename(t.wiz.cfg.disk.device);
@@ -1016,6 +1186,7 @@ pub fn runTui(init: std.process.Init, alloc: Allocator, io: std.Io, preset: ?*co
                         } else {
                             t.mode = .form;
                             t.status = "confirm mismatch";
+                            t.status_err = true;
                         }
                     } else if (key.matches(vaxis.Key.escape, .{})) {
                         t.mode = .form;
@@ -1041,6 +1212,7 @@ pub fn runTui(init: std.process.Init, alloc: Allocator, io: std.Io, preset: ?*co
                                 try t.commitEdit();
                             } else {
                                 t.status = "entries differ";
+                                t.status_err = true;
                                 t.confirming = false;
                                 t.edit_confirm.clearRetainingCapacity();
                             }
