@@ -1145,9 +1145,10 @@ fn planChroot(alloc: Allocator) !Step {
         "sh", "-c",
         "chmod a+rw /mnt/gentoo/dev/null /mnt/gentoo/dev/zero /mnt/gentoo/dev/full" ++
         " /mnt/gentoo/dev/random /mnt/gentoo/dev/urandom /mnt/gentoo/dev/tty 2>/dev/null; " ++
-        "mkdir -p /mnt/gentoo/dev/pts; " ++
-        "mountpoint -q /mnt/gentoo/dev/pts 2>/dev/null || mount -t devpts devpts /mnt/gentoo/dev/pts 2>/dev/null; :",
-    }, "normalize device nodes + devpts inside chroot"));
+        "mkdir -p /mnt/gentoo/dev/pts /mnt/gentoo/dev/shm; " ++
+        "mountpoint -q /mnt/gentoo/dev/pts 2>/dev/null || mount -t devpts devpts /mnt/gentoo/dev/pts 2>/dev/null; " ++
+        "mountpoint -q /mnt/gentoo/dev/shm 2>/dev/null || mount -t tmpfs shm /mnt/gentoo/dev/shm 2>/dev/null; :",
+    }, "normalize device nodes + devpts/devshm inside chroot"));
     try c.append(alloc, argv(alloc, &.{ "cp", "--dereference", "/etc/resolv.conf", "/mnt/gentoo/etc/" }, "dns into target"));
     try c.append(alloc, .{ .note = "subsequent chroot cmds run as: chroot /mnt/gentoo <cmd>" });
     return step(alloc, "enter-chroot", "Enter chroot", c);
