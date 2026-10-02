@@ -975,6 +975,13 @@ fn makeConf(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) ![]co
     }
     try w.print("ACCEPT_LICENSE=\"{s}\"\n", .{accept});
 
+    // riscv is effectively a ~arch-only arch: nearly all packages past
+    // the stage3 base (service/fs tooling included) carry ~riscv only.
+    // ~${ARCH} is the usable default; amd64/arm64 keep the stage3's
+    // stable ACCEPT_KEYWORDS="${ARCH}".
+    if (cfg.arch == .riscv64)
+        try w.writeAll("ACCEPT_KEYWORDS=\"~${ARCH}\"\n");
+
     if (!std.mem.eql(u8, cfg.makeconf.mirrors, "auto"))
         try w.print("GENTOO_MIRRORS=\"{s}\"\n", .{cfg.makeconf.mirrors})
     else
@@ -2866,6 +2873,31 @@ test "installkernel package.use always carries the initramfs generator" {
         const cfg = try config.decode(alloc, doc);
         const use = try packageUse(alloc, &cfg);
         try std.testing.expect(std.mem.indexOf(u8, use, tc.want) != null);
+    }
+}
+
+test "riscv64 make.conf accepts ~arch keywords" {
+    const toml_mod = @import("toml.zig");
+    // Beyond the stage3 base, most riscv packages (service + fs tooling
+    // included) are ~riscv-only — stable keywords leave the arch nearly
+    // uninstallable.
+    const cases = [_]struct { arch: []const u8, tilde: bool }{
+        .{ .arch = "amd64", .tilde = false },
+        .{ .arch = "arm64", .tilde = false },
+        .{ .arch = "riscv64", .tilde = true },
+    };
+    for (cases) |tc| {
+        const src = try std.fmt.allocPrint(std.testing.allocator, "arch = \"{s}\"\n[disk]\ndevice = \"/dev/vda\"\n", .{tc.arch});
+        defer std.testing.allocator.free(src);
+        var doc = try toml_mod.parse(std.testing.allocator, src, null);
+        defer doc.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const cfg = try config.decode(alloc, doc);
+        const mc = try makeConf(alloc, &cfg, null);
+        const has = std.mem.indexOf(u8, mc, "ACCEPT_KEYWORDS=\"~${ARCH}\"") != null;
+        try std.testing.expectEqual(tc.tilde, has);
     }
 }
 
