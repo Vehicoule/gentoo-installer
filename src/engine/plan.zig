@@ -1137,10 +1137,20 @@ fn planChroot(alloc: Allocator) !Step {
     var c: std.ArrayList(Cmd) = .empty;
     for ([_][]const u8{ "/proc", "/sys", "/dev", "/run" }) |p|
         try c.append(alloc, argv(alloc, &.{ "mount", "--rbind", p, s(alloc, "/mnt/gentoo{s}", .{p}) }, s(alloc, "bind {s}", .{p})));
+    // Keep the bound /dev out of the live env's propagation group: an rbind
+    // stays shared, so a tmpfs we mount at dev/pts or dev/shm would otherwise
+    // propagate back and shadow whatever the live env has there. Slave it
+    // first (--make-rslave on util-linux, -o rslave on busybox).
+    try c.append(alloc, argv(alloc, &.{
+        "sh", "-c",
+        "mount --make-rslave /mnt/gentoo/dev 2>/dev/null || mount -o rslave /mnt/gentoo/dev 2>/dev/null || :",
+    }, "slave the bound /dev before chroot submounts"));
     // Minimal/hand-rolled live envs can expose /dev/null & friends at 0600/0660
     // root:root or lack devpts, which breaks portage's userpriv/userfetch
     // children (they reopen os.devnull and allocate ptys). Normalize; no-op on
-    // regular live media.
+    // regular live media. /dev/shm gets a tmpfs because POSIX sem_open (python
+    // multiprocessing, e.g. pybind11 parallel compiles) resolves under it and
+    // an empty bound dir fails ENOENT.
     try c.append(alloc, argv(alloc, &.{
         "sh", "-c",
         "chmod a+rw /mnt/gentoo/dev/null /mnt/gentoo/dev/zero /mnt/gentoo/dev/full" ++
