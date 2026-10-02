@@ -1070,6 +1070,10 @@ fn packageUse(alloc: Allocator, cfg: *const Config) ![]const u8 {
     // it, so the flag must be set and systemd rebuilt before dracut runs.
     if (cfg.disk.luks and cfg.system.init == .systemd)
         try w.writeAll("sys-apps/systemd cryptsetup\n");
+    // networkmanager[wifi,-iwd] (the ebuild default) links its supplicant
+    // control over D-Bus — without the flag emerge aborts on a USE change.
+    if (cfg.network.manager == .networkmanager)
+        try w.writeAll("net-wireless/wpa_supplicant dbus\n");
     return aw.written();
 }
 
