@@ -1505,9 +1505,21 @@ fn planSystemConfig(alloc: Allocator, cfg: *const Config) !Step {
     for (cfg.users) |u| {
         var args: std.ArrayList([]const u8) = .empty;
         try args.appendSlice(alloc, &.{ "useradd", "-m", "-s", u.shell });
-        if (u.groups.len > 0) {
+        // doas/sudo grant privilege to :wheel and Gentoo's pam_wheel gates
+        // su to the same group — with privilege enabled, a user who is not
+        // in wheel could not elevate at all. Add it implicitly.
+        var groups: std.ArrayList([]const u8) = .empty;
+        try groups.appendSlice(alloc, u.groups);
+        if (cfg.system.privilege != .none) {
+            var has_wheel = false;
+            for (u.groups) |g| {
+                if (std.mem.eql(u8, g, "wheel")) has_wheel = true;
+            }
+            if (!has_wheel) try groups.append(alloc, "wheel");
+        }
+        if (groups.items.len > 0) {
             try args.append(alloc, "-G");
-            try args.append(alloc, try std.mem.join(alloc, ",", u.groups));
+            try args.append(alloc, try std.mem.join(alloc, ",", groups.items));
         }
         try args.append(alloc, u.name);
         try c.append(alloc, .{ .exec = .{ .argv = args.items, .chroot = true, .desc = s(alloc, "create user {s}", .{u.name}) } });
@@ -2913,6 +2925,50 @@ test "riscv64 make.conf accepts ~arch keywords" {
         const mc = try makeConf(alloc, &cfg, null);
         const has = std.mem.indexOf(u8, mc, "ACCEPT_KEYWORDS=\"~${ARCH}\"") != null;
         try std.testing.expectEqual(tc.tilde, has);
+    }
+}
+
+test "privilege escalation adds users to wheel implicitly" {
+    const toml_mod = @import("toml.zig");
+    // doas.conf/sudoers grant :wheel and pam_wheel gates su — with
+    // privilege enabled a group-less user must still be able to elevate.
+    const cases = [_]struct { privilege: []const u8, extra: []const u8, want_g: ?[]const u8 }{
+        .{ .privilege = "doas", .extra = "", .want_g = "wheel" },
+        .{ .privilege = "sudo", .extra = "", .want_g = "wheel" },
+        .{ .privilege = "none", .extra = "", .want_g = null },
+        .{ .privilege = "doas", .extra = "groups = [\"wheel\"]\n", .want_g = "wheel" },
+        .{ .privilege = "doas", .extra = "groups = [\"audio\", \"video\"]\n", .want_g = "audio,video,wheel" },
+    };
+    for (cases) |tc| {
+        const src = try std.fmt.allocPrint(std.testing.allocator, "[disk]\ndevice = \"/dev/vda\"\n[system]\nprivilege = \"{s}\"\n[[users]]\nname = \"larry\"\n{s}", .{ tc.privilege, tc.extra });
+        defer std.testing.allocator.free(src);
+        var doc = try toml_mod.parse(std.testing.allocator, src, null);
+        defer doc.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const cfg = try config.decode(alloc, doc);
+        const plan = try build(alloc, &cfg, null, .{}, null, null);
+        var saw_useradd = false;
+        var got_g: ?[]const u8 = null;
+        for (plan.steps) |st| {
+            if (!std.mem.eql(u8, st.id, "system-config")) continue;
+            for (st.cmds) |cmd| {
+                if (cmd == .exec and std.mem.eql(u8, cmd.exec.argv[0], "useradd")) {
+                    saw_useradd = true;
+                    for (cmd.exec.argv, 0..) |a, i| {
+                        if (std.mem.eql(u8, a, "-G")) got_g = cmd.exec.argv[i + 1];
+                    }
+                }
+            }
+        }
+        try std.testing.expect(saw_useradd);
+        if (tc.want_g) |w| {
+            try std.testing.expect(got_g != null);
+            try std.testing.expectEqualStrings(w, got_g.?);
+        } else {
+            try std.testing.expect(got_g == null);
+        }
     }
 }
 
