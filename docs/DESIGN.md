@@ -298,6 +298,11 @@ shell = "/bin/bash"
 password_hash = "$6$rounds=…"       # crypt() hash, e.g. `openssl passwd -6`
 ssh_authorized_keys = ["ssh-ed25519 AAAA…"]
 # a user with neither is created locked (`useradd` + `passwd -l`)
+# `system.privilege` grants `:wheel` (doas.conf / sudoers.d/wheel) and
+# Gentoo's pam.d/su gates `su` on the same group — give admin users
+# `wheel` here or they cannot elevate. The wizard already defaults
+# users[0].groups to ["wheel"]; non-admin (e.g. service) users stay
+# wheel-less on purpose — the planner never adds it implicitly.
 
 [root]
 password_hash = "$6$…"              # same rule; absent = root stays locked
