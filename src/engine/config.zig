@@ -815,8 +815,7 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier, env: 
                             if (cfg.disk.shrink_mib < 8192 + (if (cfg.disk.swap == .partition) cfg.disk.swap_mib else 0))
                                 try errs.append(alloc, fmt(alloc, "disk.shrink_mib must cover the install (≥8192 MiB{s})", .{if (cfg.disk.swap == .partition) " + swap_mib" else ""}));
                         }
-                    } else
-                        try errs.append(alloc, fmt(alloc, "{s} is '{s}' — only ntfs/ext/btrfs shrink (xfs/f2fs/luks/lvm can't)", .{ p.path, p.fs }));
+                    } else try errs.append(alloc, fmt(alloc, "{s} is '{s}' — only ntfs/ext/btrfs shrink (xfs/f2fs/luks/lvm can't)", .{ p.path, p.fs }));
                 },
                 .@"free-space" => {
                     const need: u64 = (8192 + @as(u64, if (cfg.disk.swap == .partition) cfg.disk.swap_mib else 0)) << 20;
@@ -894,7 +893,6 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier, env: 
 
     if (cfg.system.privilege == .none and cfg.root.lock_root)
         try errs.append(alloc, "privilege=none with lock_root leaves no admin path");
-
 
     // Login-path proof: some credential must survive to the finished
     // system, or sshd must be reachable with keys.
@@ -1307,73 +1305,82 @@ test "stage3 stem resolution" {
 test "stage3 stem matrix matches autobuilds" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { src: []const u8, stem: []const u8 }{
-        .{ .src = \\arch = "amd64"
-                 \\[security]
-                 \\hardening = "standard"
-                 \\selinux = false
-                 , .stem = "systemd" },
-        .{ .src = \\arch = "amd64"
-                 \\[system]
-                 \\init = "openrc"
-                 , .stem = "hardened-selinux-openrc" },
-        .{ .src = \\arch = "amd64"
-                 \\[system]
-                 \\init = "openrc"
-                 \\[security]
-                 \\hardening = "hardened"
-                 \\selinux = false
-                 , .stem = "hardened-openrc" },
-        .{ .src = \\arch = "amd64"
-                 \\[stage3]
-                 \\toolchain = "llvm"
-                 \\[security]
-                 \\hardening = "standard"
-                 \\selinux = false
-                 , .stem = "llvm-systemd" },
-        .{ .src = \\arch = "amd64"
-                 \\[stage3]
-                 \\nomultilib = true
-                 \\[system]
-                 \\init = "openrc"
-                 \\[security]
-                 \\hardening = "standard"
-                 \\selinux = false
-                 , .stem = "nomultilib-openrc" },
-        .{ .src = \\arch = "amd64"
-                 \\[stage3]
-                 \\libc = "musl"
-                 \\[security]
-                 \\hardening = "hardened"
-                 \\selinux = false
-                 , .stem = "musl-hardened-systemd" },
-        .{ .src = \\arch = "arm64"
-                 \\[stage3]
-                 \\libc = "musl"
-                 \\toolchain = "llvm"
-                 \\[security]
-                 \\hardening = "standard"
-                 \\selinux = false
-                 \\[system]
-                 \\init = "openrc"
-                 , .stem = "musl-llvm-openrc" },
+        .{ .src =
+        \\arch = "amd64"
+        \\[security]
+        \\hardening = "standard"
+        \\selinux = false
+        , .stem = "systemd" },
+        .{ .src =
+        \\arch = "amd64"
+        \\[system]
+        \\init = "openrc"
+        , .stem = "hardened-selinux-openrc" },
+        .{ .src =
+        \\arch = "amd64"
+        \\[system]
+        \\init = "openrc"
+        \\[security]
+        \\hardening = "hardened"
+        \\selinux = false
+        , .stem = "hardened-openrc" },
+        .{ .src =
+        \\arch = "amd64"
+        \\[stage3]
+        \\toolchain = "llvm"
+        \\[security]
+        \\hardening = "standard"
+        \\selinux = false
+        , .stem = "llvm-systemd" },
+        .{ .src =
+        \\arch = "amd64"
+        \\[stage3]
+        \\nomultilib = true
+        \\[system]
+        \\init = "openrc"
+        \\[security]
+        \\hardening = "standard"
+        \\selinux = false
+        , .stem = "nomultilib-openrc" },
+        .{ .src =
+        \\arch = "amd64"
+        \\[stage3]
+        \\libc = "musl"
+        \\[security]
+        \\hardening = "hardened"
+        \\selinux = false
+        , .stem = "musl-hardened-systemd" },
+        .{ .src =
+        \\arch = "arm64"
+        \\[stage3]
+        \\libc = "musl"
+        \\toolchain = "llvm"
+        \\[security]
+        \\hardening = "standard"
+        \\selinux = false
+        \\[system]
+        \\init = "openrc"
+        , .stem = "musl-llvm-openrc" },
         // riscv carries musl in the ABI token — stem is init only
-        .{ .src = \\arch = "riscv64"
-                 \\[stage3]
-                 \\libc = "musl"
-                 \\[security]
-                 \\hardening = "standard"
-                 \\selinux = false
-                 , .stem = "systemd" },
+        .{ .src =
+        \\arch = "riscv64"
+        \\[stage3]
+        \\libc = "musl"
+        \\[security]
+        \\hardening = "standard"
+        \\selinux = false
+        , .stem = "systemd" },
         // nomultilib is a no-op where the ABI is already single
-        .{ .src = \\arch = "arm64"
-                 \\[stage3]
-                 \\nomultilib = true
-                 \\[security]
-                 \\hardening = "standard"
-                 \\selinux = false
-                 \\[system]
-                 \\init = "openrc"
-                 , .stem = "openrc" },
+        .{ .src =
+        \\arch = "arm64"
+        \\[stage3]
+        \\nomultilib = true
+        \\[security]
+        \\hardening = "standard"
+        \\selinux = false
+        \\[system]
+        \\init = "openrc"
+        , .stem = "openrc" },
     };
     for (cases) |tc| {
         var doc = try toml.parse(alloc, tc.src, null);

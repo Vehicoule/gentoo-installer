@@ -472,7 +472,7 @@ converted to `password_hash` at export (no plaintext, file mode 0600).
 ## Repo layout
 
 ```
-build.zig, build.zig.zon        # zig 0.16.x pinned
+build.zig, build.zig.zon        # zig 0.17.x pinned
 src/engine/                     # zig library: steps, runner, wizard, model
 src/tui/                        # zig, libvaxis/vxfw
 src/main.zig                    # cli: tui|headless|--config|--dry-run
@@ -482,7 +482,7 @@ scripts/qemu-test.sh
 docs/                           # DESIGN.md, protocol.md, presets.md
 ```
 
-Toolchain: zig 0.16.x (libvaxis baseline), rust stable (iced/libcosmic).
+Toolchain: zig 0.17.x (vendored libvaxis port in third_party/), rust stable (iced/libcosmic).
 GUI is a separate build artifact; the TUI/engine binary stays dependency-free.
 
 ## Milestones

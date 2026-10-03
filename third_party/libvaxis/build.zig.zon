@@ -1,0 +1,24 @@
+.{
+    .name = .vaxis,
+    .fingerprint = 0x14fbbb94fc556305,
+    .version = "0.6.0",
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .zigimg = .{
+            .url = "git+https://github.com/zigimg/zigimg#11c3b9b56b452c86dc2dc06f48cfc18c8869804d",
+            .hash = "zigimg-0.1.0-8_eo2p5FGAA_mWUaP7Sqj4XVLJf5HK39GotTK9-VP35a",
+                    },
+        .uucode = .{
+            .url = "git+https://github.com/jacobsandlund/uucode#ea62149739404a73c202b48a33bf6dd2af4bd9b0",
+            .hash = "uucode-0.2.0-ZZjBPoGFVgCiflJNFc6Io8xzC67B6PA5bUkk4LT0kCxg",
+            .lazy = true,
+        },
+    },
+    .paths = .{
+        "LICENSE",
+        "build.zig",
+        "build.zig.zon",
+        "include",
+        "src",
+    },
+}

@@ -158,7 +158,8 @@ pub fn main(init: std.process.Init) !void {
             if (!cfg.boot_mode_explicit) {
                 cfg.boot_mode = if (e.boot_mode == .bios and cfg.arch != .amd64) .uefi else e.boot_mode;
             } else if (cfg.boot_mode != e.boot_mode and
-                !(cfg.boot_mode == .uefi and e.boot_mode == .bios and cfg.arch != .amd64)) {
+                !(cfg.boot_mode == .uefi and e.boot_mode == .bios and cfg.arch != .amd64))
+            {
                 try errw.print("config requests {s} but the live env booted {s} — refusing (fix the config or boot firmware settings)\n", .{ @tagName(cfg.boot_mode), @tagName(e.boot_mode) });
                 try errw.flush();
                 std.process.exit(2);
