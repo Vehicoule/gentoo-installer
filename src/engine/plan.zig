@@ -975,6 +975,13 @@ fn makeConf(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) ![]co
     }
     try w.print("ACCEPT_LICENSE=\"{s}\"\n", .{accept});
 
+    // riscv is effectively a ~arch-only arch: nearly all packages past
+    // the stage3 base (service/fs tooling included) carry ~riscv only.
+    // ~${ARCH} is the usable default; amd64/arm64 keep the stage3's
+    // stable ACCEPT_KEYWORDS="${ARCH}".
+    if (cfg.arch == .riscv64)
+        try w.writeAll("ACCEPT_KEYWORDS=\"~${ARCH}\"\n");
+
     if (!std.mem.eql(u8, cfg.makeconf.mirrors, "auto"))
         try w.print("GENTOO_MIRRORS=\"{s}\"\n", .{cfg.makeconf.mirrors})
     else
@@ -1063,6 +1070,10 @@ fn packageUse(alloc: Allocator, cfg: *const Config) ![]const u8 {
     // it, so the flag must be set and systemd rebuilt before dracut runs.
     if (cfg.disk.luks and cfg.system.init == .systemd)
         try w.writeAll("sys-apps/systemd cryptsetup\n");
+    // networkmanager[wifi,-iwd] (the ebuild default) links its supplicant
+    // control over D-Bus — without the flag emerge aborts on a USE change.
+    if (cfg.network.manager == .networkmanager)
+        try w.writeAll("net-wireless/wpa_supplicant dbus\n");
     return aw.written();
 }
 
@@ -1126,17 +1137,28 @@ fn planChroot(alloc: Allocator) !Step {
     var c: std.ArrayList(Cmd) = .empty;
     for ([_][]const u8{ "/proc", "/sys", "/dev", "/run" }) |p|
         try c.append(alloc, argv(alloc, &.{ "mount", "--rbind", p, s(alloc, "/mnt/gentoo{s}", .{p}) }, s(alloc, "bind {s}", .{p})));
+    // Keep the bound /dev out of the live env's propagation group: an rbind
+    // stays shared, so a tmpfs we mount at dev/pts or dev/shm would otherwise
+    // propagate back and shadow whatever the live env has there. Slave it
+    // first (--make-rslave on util-linux, -o rslave on busybox).
+    try c.append(alloc, argv(alloc, &.{
+        "sh", "-c",
+        "mount --make-rslave /mnt/gentoo/dev 2>/dev/null || mount -o rslave /mnt/gentoo/dev 2>/dev/null || :",
+    }, "slave the bound /dev before chroot submounts"));
     // Minimal/hand-rolled live envs can expose /dev/null & friends at 0600/0660
     // root:root or lack devpts, which breaks portage's userpriv/userfetch
     // children (they reopen os.devnull and allocate ptys). Normalize; no-op on
-    // regular live media.
+    // regular live media. /dev/shm gets a tmpfs because POSIX sem_open (python
+    // multiprocessing, e.g. pybind11 parallel compiles) resolves under it and
+    // an empty bound dir fails ENOENT.
     try c.append(alloc, argv(alloc, &.{
         "sh", "-c",
         "chmod a+rw /mnt/gentoo/dev/null /mnt/gentoo/dev/zero /mnt/gentoo/dev/full" ++
         " /mnt/gentoo/dev/random /mnt/gentoo/dev/urandom /mnt/gentoo/dev/tty 2>/dev/null; " ++
-        "mkdir -p /mnt/gentoo/dev/pts; " ++
-        "mountpoint -q /mnt/gentoo/dev/pts 2>/dev/null || mount -t devpts devpts /mnt/gentoo/dev/pts 2>/dev/null; :",
-    }, "normalize device nodes + devpts inside chroot"));
+        "mkdir -p /mnt/gentoo/dev/pts /mnt/gentoo/dev/shm; " ++
+        "mountpoint -q /mnt/gentoo/dev/pts 2>/dev/null || mount -t devpts devpts /mnt/gentoo/dev/pts 2>/dev/null; " ++
+        "mountpoint -q /mnt/gentoo/dev/shm 2>/dev/null || mount -t tmpfs shm /mnt/gentoo/dev/shm 2>/dev/null; :",
+    }, "normalize device nodes + devpts/devshm inside chroot"));
     try c.append(alloc, argv(alloc, &.{ "cp", "--dereference", "/etc/resolv.conf", "/mnt/gentoo/etc/" }, "dns into target"));
     try c.append(alloc, .{ .note = "subsequent chroot cmds run as: chroot /mnt/gentoo <cmd>" });
     return step(alloc, "enter-chroot", "Enter chroot", c);
@@ -2866,6 +2888,31 @@ test "installkernel package.use always carries the initramfs generator" {
         const cfg = try config.decode(alloc, doc);
         const use = try packageUse(alloc, &cfg);
         try std.testing.expect(std.mem.indexOf(u8, use, tc.want) != null);
+    }
+}
+
+test "riscv64 make.conf accepts ~arch keywords" {
+    const toml_mod = @import("toml.zig");
+    // Beyond the stage3 base, most riscv packages (service + fs tooling
+    // included) are ~riscv-only — stable keywords leave the arch nearly
+    // uninstallable.
+    const cases = [_]struct { arch: []const u8, tilde: bool }{
+        .{ .arch = "amd64", .tilde = false },
+        .{ .arch = "arm64", .tilde = false },
+        .{ .arch = "riscv64", .tilde = true },
+    };
+    for (cases) |tc| {
+        const src = try std.fmt.allocPrint(std.testing.allocator, "arch = \"{s}\"\n[disk]\ndevice = \"/dev/vda\"\n", .{tc.arch});
+        defer std.testing.allocator.free(src);
+        var doc = try toml_mod.parse(std.testing.allocator, src, null);
+        defer doc.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        const cfg = try config.decode(alloc, doc);
+        const mc = try makeConf(alloc, &cfg, null);
+        const has = std.mem.indexOf(u8, mc, "ACCEPT_KEYWORDS=\"~${ARCH}\"") != null;
+        try std.testing.expectEqual(tc.tilde, has);
     }
 }
 
