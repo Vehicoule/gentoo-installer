@@ -339,15 +339,12 @@ fn planPartition(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, 
                     // GUID, name, attribute bits) first and re-apply it,
                     // or the foreign OS's boot/mount references keyed to
                     // PARTUUID or type silently break.
-                    try c.append(alloc, argv(alloc, &.{ "sh", "-c", s(alloc,
-                        "i=$(sgdisk -i{} {s}) && " ++
+                    try c.append(alloc, argv(alloc, &.{ "sh", "-c", s(alloc, "i=$(sgdisk -i{} {s}) && " ++
                         "t=$(echo \"$i\" | sed -n 's|Partition GUID code: *\\([^ ]*\\).*|\\1|p') && " ++
                         "u=$(echo \"$i\" | sed -n 's|Partition unique GUID: *||p') && " ++
                         "m=$(echo \"$i\" | sed -n \"s|Partition name: *'\\(.*\\)'|\\1|p\") && " ++
                         "a=$(echo \"$i\" | sed -n 's|Attribute flags: *||p') && " ++
-                        "sgdisk -d{} -n{}:{}:{} -t{}:$t -u{}:$u -c{}:\"$m\" -A{}:=:$a {s}",
-                        .{ pp.num, dev, pp.num, pp.num, pp.start_sector, new_end, pp.num, pp.num, pp.num, pp.num, dev }) },
-                        s(alloc, "shrink partition {} to end at sector {} (type/GUID/name/attrs preserved)", .{ pp.num, new_end })));
+                        "sgdisk -d{} -n{}:{}:{} -t{}:$t -u{}:$u -c{}:\"$m\" -A{}:=:$a {s}", .{ pp.num, dev, pp.num, pp.num, pp.start_sector, new_end, pp.num, pp.num, pp.num, pp.num, dev }) }, s(alloc, "shrink partition {} to end at sector {} (type/GUID/name/attrs preserved)", .{ pp.num, new_end })));
                     rs = new_end + 1;
                     // The freed gap ends where the partition used to.
                     re = old_end;
@@ -731,8 +728,7 @@ fn kernelArgs(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, see
     // Proprietary NVIDIA: kernel modesetting is required for Wayland
     // compositors and gives a working fb console before X starts.
     switch (resolveGpuDriver(cfg, env)) {
-        .@"nvidia-open", .@"nvidia-drivers" =>
-            r = s(alloc, "{s} nvidia-drm.modeset=1", .{r}),
+        .@"nvidia-open", .@"nvidia-drivers" => r = s(alloc, "{s} nvidia-drm.modeset=1", .{r}),
         else => {},
     }
     // Alt inits need their supervisor binary as PID1 — the stage3 ships
@@ -1142,7 +1138,7 @@ fn planChroot(alloc: Allocator) !Step {
     // propagate back and shadow whatever the live env has there. Slave it
     // first (--make-rslave on util-linux, -o rslave on busybox).
     try c.append(alloc, argv(alloc, &.{
-        "sh", "-c",
+        "sh",                                                                                                  "-c",
         "mount --make-rslave /mnt/gentoo/dev 2>/dev/null || mount -o rslave /mnt/gentoo/dev 2>/dev/null || :",
     }, "slave the bound /dev before chroot submounts"));
     // Minimal/hand-rolled live envs can expose /dev/null & friends at 0600/0660
@@ -1154,10 +1150,10 @@ fn planChroot(alloc: Allocator) !Step {
     try c.append(alloc, argv(alloc, &.{
         "sh", "-c",
         "chmod a+rw /mnt/gentoo/dev/null /mnt/gentoo/dev/zero /mnt/gentoo/dev/full" ++
-        " /mnt/gentoo/dev/random /mnt/gentoo/dev/urandom /mnt/gentoo/dev/tty 2>/dev/null; " ++
-        "mkdir -p /mnt/gentoo/dev/pts /mnt/gentoo/dev/shm; " ++
-        "mountpoint -q /mnt/gentoo/dev/pts 2>/dev/null || mount -t devpts devpts /mnt/gentoo/dev/pts 2>/dev/null; " ++
-        "mountpoint -q /mnt/gentoo/dev/shm 2>/dev/null || mount -t tmpfs shm /mnt/gentoo/dev/shm 2>/dev/null; :",
+            " /mnt/gentoo/dev/random /mnt/gentoo/dev/urandom /mnt/gentoo/dev/tty 2>/dev/null; " ++
+            "mkdir -p /mnt/gentoo/dev/pts /mnt/gentoo/dev/shm; " ++
+            "mountpoint -q /mnt/gentoo/dev/pts 2>/dev/null || mount -t devpts devpts /mnt/gentoo/dev/pts 2>/dev/null; " ++
+            "mountpoint -q /mnt/gentoo/dev/shm 2>/dev/null || mount -t tmpfs shm /mnt/gentoo/dev/shm 2>/dev/null; :",
     }, "normalize device nodes + devpts/devshm inside chroot"));
     try c.append(alloc, argv(alloc, &.{ "cp", "--dereference", "/etc/resolv.conf", "/mnt/gentoo/etc/" }, "dns into target"));
     try c.append(alloc, .{ .note = "subsequent chroot cmds run as: chroot /mnt/gentoo <cmd>" });
@@ -1217,8 +1213,7 @@ fn planBaseConfig(alloc: Allocator, cfg: *const Config) !Step {
         // musl has no locale-gen/SUPPORTED database — C.UTF-8 is builtin
         // and extra locales come from musl-locales via MUSL_LOCPATH. Set
         // the default through env.d directly (what eselect would write).
-        try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/env.d/02locale",
-            s(alloc, "LANG=\"{s}\"\nMUSL_LOCPATH=\"/usr/share/i18n/locales\"\n", .{cfg.system.locale})));
+        try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/env.d/02locale", s(alloc, "LANG=\"{s}\"\nMUSL_LOCPATH=\"/usr/share/i18n/locales\"\n", .{cfg.system.locale})));
         try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "emerge", "--oneshot", "sys-apps/musl-locales" }), .chroot = true, .desc = "musl locale data" } });
     } else {
         var gen: std.Io.Writer.Allocating = .init(alloc);
@@ -1363,8 +1358,7 @@ fn planKernel(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !St
         // pair must exist before any module build (nvidia emerge below)
         // or linux-mod-r1 signs with a nonexistent key.
         try c.append(alloc, .{ .exec = .{
-            .argv = try alloc.dupe([]const u8, &.{ "sh", "-c",
-                "umask 077 && mkdir -p /etc/shim && " ++
+            .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", "umask 077 && mkdir -p /etc/shim && " ++
                 "openssl req -new -x509 -newkey rsa:2048 -keyout /etc/shim/mok.key " ++
                 "-out /etc/shim/mok.pem -days 3650 -nodes -subj '/CN=gentoo-installer-mok/' && " ++
                 "openssl x509 -in /etc/shim/mok.pem -outform der -out /etc/shim/mok.der" }),
@@ -1566,10 +1560,7 @@ fn planSystemConfig(alloc: Allocator, cfg: *const Config) !Step {
                 // installs a small runscript driving util-linux zramctl.
                 // Alt inits all run `openrc sysinit`+`openrc boot` in their
                 // stage-1, which is what executes this boot-runlevel unit.
-                try c.append(alloc, .{ .write_file = .{
-                    .path = "/mnt/gentoo/etc/init.d/zram",
-                    .mode = 0o755,
-                    .content =
+                try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/etc/init.d/zram", .mode = 0o755, .content =
                     \\#!/sbin/openrc-run
                     \\description="zram compressed swap device"
                     \\
@@ -1752,16 +1743,13 @@ fn planServices(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !
             // The boot target is a real service: `waits-for.d` makes every
             // link in boot.d/ a unit dinit starts before `boot` completes.
             try c.append(alloc, argv(alloc, &.{ "mkdir", "-p", "/mnt/gentoo/etc/dinit.d/boot.d" }, "dinit.d dirs"));
-            try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/dinit.d/boot",
-                "type = internal\nwaits-for.d: boot.d\n"));
-            try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/dinit.d/sysinit",
-                "type = scripted\ncommand = /usr/libexec/gi-sysinit\n"));
+            try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/dinit.d/boot", "type = internal\nwaits-for.d: boot.d\n"));
+            try c.append(alloc, wf(alloc, "/mnt/gentoo/etc/dinit.d/sysinit", "type = scripted\ncommand = /usr/libexec/gi-sysinit\n"));
             // gettys on the vt consoles (serial getty is added by tests/
             // installs that need it — console= decides what's live).
             for ([_]u8{ '1', '2', '3', '4' }) |n| {
                 const name = s(alloc, "tty{c}", .{n});
-                try c.append(alloc, wf(alloc, s(alloc, "/mnt/gentoo/etc/dinit.d/{s}", .{name}),
-                    s(alloc, "type = process\ncommand = /sbin/agetty {s} 38400 linux\nrestart = true\ndepends-on = sysinit\n", .{name})));
+                try c.append(alloc, wf(alloc, s(alloc, "/mnt/gentoo/etc/dinit.d/{s}", .{name}), s(alloc, "type = process\ncommand = /sbin/agetty {s} 38400 linux\nrestart = true\ndepends-on = sysinit\n", .{name})));
                 try c.append(alloc, argv(alloc, &.{ "ln", "-sf", s(alloc, "../{s}", .{name}), s(alloc, "/mnt/gentoo/etc/dinit.d/boot.d/{s}", .{name}) }, s(alloc, "boot.d {s}", .{name})));
             }
             try c.append(alloc, argv(alloc, &.{ "ln", "-sf", "../sysinit", "/mnt/gentoo/etc/dinit.d/boot.d/sysinit" }, "boot.d sysinit"));
@@ -1772,7 +1760,9 @@ fn planServices(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !
             // binary is required (a shell script's exit panics the
             // kernel, and sysrq 'o' needs a live usermode-helper).
             // dinitctl can only request HALT, so -h maps to power off.
-            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/usr/src/gi-shutdown.c", .mode = 0o644,
+            try c.append(alloc, .{ .write_file = .{
+                .path = "/mnt/gentoo/usr/src/gi-shutdown.c",
+                .mode = 0o644,
                 .content =
                 \\/* gentoo-installer dinit shutdown — dual role:
                 \\ * `shutdown --system -X` (exec'd by dinit PID1 after
@@ -1809,39 +1799,30 @@ fn planServices(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !
                 ,
             } });
             try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c",
-                    "cc -O2 -o /usr/sbin/shutdown /usr/src/gi-shutdown.c || " ++
+                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", "cc -O2 -o /usr/sbin/shutdown /usr/src/gi-shutdown.c || " ++
                     "gcc -O2 -o /usr/sbin/shutdown /usr/src/gi-shutdown.c || " ++
                     "clang -O2 -o /usr/sbin/shutdown /usr/src/gi-shutdown.c" }),
                 .chroot = true,
                 .desc = "build the dinit shutdown binary",
             } });
             for ([_][]const u8{ "poweroff", "halt" }) |name|
-                try c.append(alloc, .{ .write_file = .{ .path = s(alloc, "/mnt/gentoo/sbin/{s}", .{name}), .mode = 0o755,
-                    .content = "#!/bin/sh\nexec /usr/sbin/shutdown\n" } });
-            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/sbin/reboot", .mode = 0o755,
-                .content = "#!/bin/sh\nkill -INT 1\n" } });
+                try c.append(alloc, .{ .write_file = .{ .path = s(alloc, "/mnt/gentoo/sbin/{s}", .{name}), .mode = 0o755, .content = "#!/bin/sh\nexec /usr/sbin/shutdown\n" } });
+            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/sbin/reboot", .mode = 0o755, .content = "#!/bin/sh\nkill -INT 1\n" } });
         },
         .runit => {
             // runit-init runs /etc/runit/{1,2,3}: sysinit via openrc,
             // then runsvdir on the default sv dir, openrc shutdown last.
             try c.append(alloc, argv(alloc, &.{ "mkdir", "-p", "/mnt/gentoo/etc/runit/runsvdir/default", "/mnt/gentoo/etc/sv" }, "runit dirs"));
-            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/etc/runit/1", .mode = 0o755,
-                .content = "#!/bin/sh\nexec /usr/libexec/gi-sysinit\n" } });
-            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/etc/runit/2", .mode = 0o755,
-                .content = "#!/bin/sh\nexec /usr/bin/runsvdir -P /etc/runit/runsvdir/default\n" } });
-            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/etc/runit/3", .mode = 0o755,
-                .content = "#!/bin/sh\nexec /sbin/openrc shutdown\n" } });
+            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/etc/runit/1", .mode = 0o755, .content = "#!/bin/sh\nexec /usr/libexec/gi-sysinit\n" } });
+            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/etc/runit/2", .mode = 0o755, .content = "#!/bin/sh\nexec /usr/bin/runsvdir -P /etc/runit/runsvdir/default\n" } });
+            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/etc/runit/3", .mode = 0o755, .content = "#!/bin/sh\nexec /sbin/openrc shutdown\n" } });
             // Shutdown commands: `runit-init 0` signals PID1 to end
             // stage2, run stage3, then power off; `6` reboots.
             // `shutdown -r` must reboot, so shutdown parses its args.
             for ([_][]const u8{ "poweroff", "halt" }) |name|
-                try c.append(alloc, .{ .write_file = .{ .path = s(alloc, "/mnt/gentoo/sbin/{s}", .{name}), .mode = 0o755,
-                    .content = "#!/bin/sh\nexec /sbin/runit-init 0\n" } });
-            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/sbin/shutdown", .mode = 0o755,
-                .content = "#!/bin/sh\ncase \" $*\" in\n  *\" -r\"*) exec /sbin/runit-init 6 ;;\n  *) exec /sbin/runit-init 0 ;;\nesac\n" } });
-            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/sbin/reboot", .mode = 0o755,
-                .content = "#!/bin/sh\nexec /sbin/runit-init 6\n" } });
+                try c.append(alloc, .{ .write_file = .{ .path = s(alloc, "/mnt/gentoo/sbin/{s}", .{name}), .mode = 0o755, .content = "#!/bin/sh\nexec /sbin/runit-init 0\n" } });
+            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/sbin/shutdown", .mode = 0o755, .content = "#!/bin/sh\ncase \" $*\" in\n  *\" -r\"*) exec /sbin/runit-init 6 ;;\n  *) exec /sbin/runit-init 0 ;;\nesac\n" } });
+            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/sbin/reboot", .mode = 0o755, .content = "#!/bin/sh\nexec /sbin/runit-init 6\n" } });
         },
         .s6 => {
             // s6-linux-init-maker emits a staging dir: bin/ holds init +
@@ -1859,19 +1840,15 @@ fn planServices(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !
             // s6 PID1, openrc's shutdown runlevel must not run killprocs
             // or mount-ro — they kill the s6 supervision tree mid-teardown
             // and stage 3 never finishes.
-            try c.append(alloc, argv(alloc, &.{ "rm", "-f",
-                "/mnt/gentoo/etc/runlevels/shutdown/killprocs",
-                "/mnt/gentoo/etc/runlevels/shutdown/mount-ro" }, "strip killprocs/mount-ro from shutdown runlevel"));
+            try c.append(alloc, argv(alloc, &.{ "rm", "-f", "/mnt/gentoo/etc/runlevels/shutdown/killprocs", "/mnt/gentoo/etc/runlevels/shutdown/mount-ro" }, "strip killprocs/mount-ro from shutdown runlevel"));
             // rc.init is stage 2: openrc owns sysinit/boot (gi-sysinit),
             // then s6-rc-init opens the compiled db on the live scandir
             // and brings up the default bundle ($1 is the boot runlevel).
-            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/etc/s6-linux-init/current/scripts/rc.init", .mode = 0o755,
-                .content = "#!/bin/sh\n/usr/libexec/gi-sysinit\ns6-rc-init -c /etc/s6-rc/compiled /run/service || exit 1\nexec s6-rc -u change \"${1:-default}\"\n" } });
+            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/etc/s6-linux-init/current/scripts/rc.init", .mode = 0o755, .content = "#!/bin/sh\n/usr/libexec/gi-sysinit\ns6-rc-init -c /etc/s6-rc/compiled /run/service || exit 1\nexec s6-rc -u change \"${1:-default}\"\n" } });
             // Bundle down first, then openrc's shutdown runlevel — the
             // sysinit oneshot has no down action, so zram/mounts/sysctl
             // state needs openrc's own teardown (same as runit's /3).
-            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/etc/s6-linux-init/current/scripts/rc.shutdown", .mode = 0o755,
-                .content = "#!/bin/sh\ns6-rc -da change default || true\nopenrc shutdown || true\nexit 0\n" } });
+            try c.append(alloc, .{ .write_file = .{ .path = "/mnt/gentoo/etc/s6-linux-init/current/scripts/rc.shutdown", .mode = 0o755, .content = "#!/bin/sh\ns6-rc -da change default || true\nopenrc shutdown || true\nexit 0\n" } });
             // s6-rc source db: sysinit is a oneshot every unit depends on,
             // tty1-4 are supervised agettys, `default` bundles them all.
             // The bundle's contents file is appended per enabled unit in
@@ -1883,8 +1860,7 @@ fn planServices(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !
             for ([_]u8{ '1', '2', '3', '4' }) |n| {
                 const name = s(alloc, "tty{c}", .{n});
                 try c.append(alloc, .{ .write_file = .{ .path = s(alloc, "/mnt/gentoo/etc/s6-rc/source/{s}/type", .{name}), .mode = 0o644, .content = "longrun\n" } });
-                try c.append(alloc, .{ .write_file = .{ .path = s(alloc, "/mnt/gentoo/etc/s6-rc/source/{s}/run", .{name}), .mode = 0o755,
-                    .content = s(alloc, "#!/bin/sh\nexec /sbin/agetty {s} 38400 linux\n", .{name}) } });
+                try c.append(alloc, .{ .write_file = .{ .path = s(alloc, "/mnt/gentoo/etc/s6-rc/source/{s}/run", .{name}), .mode = 0o755, .content = s(alloc, "#!/bin/sh\nexec /sbin/agetty {s} 38400 linux\n", .{name}) } });
                 try c.append(alloc, .{ .write_file = .{ .path = s(alloc, "/mnt/gentoo/etc/s6-rc/source/{s}/dependencies", .{name}), .mode = 0o644, .content = "sysinit\n" } });
             }
         },
@@ -1916,14 +1892,12 @@ fn planServices(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env) !
                             try c.append(alloc, argv(alloc, &.{ "ln", "-sf", s(alloc, "/etc/sv/{s}", .{u}), s(alloc, "/mnt/gentoo/etc/runit/runsvdir/default/{s}", .{u}) }, s(alloc, "runit enable {s}", .{u})));
                         },
                         .dinit => {
-                            try c.append(alloc, wf(alloc, s(alloc, "/mnt/gentoo/etc/dinit.d/{s}", .{u}),
-                                s(alloc, "type = process\ncommand = {s}\nrestart = true\ndepends-on = sysinit\n", .{cmd})));
+                            try c.append(alloc, wf(alloc, s(alloc, "/mnt/gentoo/etc/dinit.d/{s}", .{u}), s(alloc, "type = process\ncommand = {s}\nrestart = true\ndepends-on = sysinit\n", .{cmd})));
                             try c.append(alloc, argv(alloc, &.{ "ln", "-sf", s(alloc, "../{s}", .{u}), s(alloc, "/mnt/gentoo/etc/dinit.d/boot.d/{s}", .{u}) }, s(alloc, "dinit enable {s}", .{u})));
                         },
                         .s6 => {
                             try c.append(alloc, .{ .write_file = .{ .path = s(alloc, "/mnt/gentoo/etc/s6-rc/source/{s}/type", .{u}), .mode = 0o644, .content = "longrun\n" } });
-                            try c.append(alloc, .{ .write_file = .{ .path = s(alloc, "/mnt/gentoo/etc/s6-rc/source/{s}/run", .{u}), .mode = 0o755,
-                                .content = s(alloc, "#!/bin/sh\nexec {s}\n", .{cmd}) } });
+                            try c.append(alloc, .{ .write_file = .{ .path = s(alloc, "/mnt/gentoo/etc/s6-rc/source/{s}/run", .{u}), .mode = 0o755, .content = s(alloc, "#!/bin/sh\nexec {s}\n", .{cmd}) } });
                             try c.append(alloc, .{ .write_file = .{ .path = s(alloc, "/mnt/gentoo/etc/s6-rc/source/{s}/dependencies", .{u}), .mode = 0o644, .content = "sysinit\n" } });
                             try c.append(alloc, .{ .exec = .{ .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "echo {s} >> /etc/s6-rc/source/default/contents", .{u}) }), .chroot = true, .desc = s(alloc, "s6-rc bundle {s}", .{u}) } });
                         },
@@ -1980,8 +1954,7 @@ fn planPackages(alloc: Allocator, cfg: *const Config, sets: Sets) !Step {
         // repo names land in a repos.conf path + [section] — no traversal.
         if (!stepNameOk(repo.name)) return error.BadRepo;
         if (repo.sync_uri) |uri| {
-            try c.append(alloc, wf(alloc, s(alloc, "/mnt/gentoo/etc/portage/repos.conf/{s}.conf", .{repo.name}),
-                s(alloc, "[{s}]\nlocation = /var/db/repos/{s}\nsync-type = git\nsync-uri = {s}\nauto-sync = yes\n", .{ repo.name, repo.name, uri })));
+            try c.append(alloc, wf(alloc, s(alloc, "/mnt/gentoo/etc/portage/repos.conf/{s}.conf", .{repo.name}), s(alloc, "[{s}]\nlocation = /var/db/repos/{s}\nsync-type = git\nsync-uri = {s}\nauto-sync = yes\n", .{ repo.name, repo.name, uri })));
             try c.append(alloc, .{ .exec = .{
                 .argv = try alloc.dupe([]const u8, &.{ "emaint", "sync", "-r", repo.name }),
                 .chroot = true,
@@ -2174,28 +2147,30 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env,
                     .desc = "efibootmgr (grub-install NVRAM registration)",
                 } });
             if (cfg.boot_mode == .uefi)
-                try c.append(alloc, .{ .exec = .{
-                    // shim owns the NVRAM entry — under --no-nvram
-                    // grub-install only lays modules + boot files. When the
-                    // live env wasn't EFI-booted (riscv64 OpenSBI direct-kernel
-                    // bring-up) efibootmgr can't register an entry — install
-                    // --removable instead, which also writes the
-                    // EFI/BOOT/BOOT<arch>.EFI fallback U-Boot/EDK2 scan for.
-                    .argv = if (cfg.security.secure_boot == .shim)
-                        try alloc.dupe([]const u8, &.{ "grub-install", s(alloc, "--target={s}", .{grubEfiTarget(cfg)}), s(alloc, "--efi-directory={s}", .{espInTarget(cfg)}), "--no-nvram" })
-                    else
-                        // --removable overwrites EFI/BOOT/BOOT<arch>.EFI
-                        // — on a shared (alongside) ESP preserve whatever
-                        // loader sits there. $f.gentoo is a reference copy of
-                        // the fallback WE last wrote (refreshed after each
-                        // successful install): a live fallback matching it is
-                        // ours; anything else (first-run foreign loader, or
-                        // one an OS update swapped in later) goes to the next
-                        // free .bak/.bakN before grub-install writes ours.
-                        try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "if [ -d /sys/firmware/efi/efivars ]; then exec grub-install --target={s} --efi-directory={s}; else f={s}/EFI/BOOT/{s}; r=$f.gentoo; if [ -f $f ] && ! cmp -s $f $r 2>/dev/null; then b=$f.bak; n=1; while [ -f $b ]; do b=$f.bak$n; n=$((n+1)); done; cp -f $f $b || exit 1; fi; grub-install --target={s} --efi-directory={s} --removable && cp -f $f $r; fi", .{ grubEfiTarget(cfg), espInTarget(cfg), espInTarget(cfg), efiBootFile(cfg), grubEfiTarget(cfg), espInTarget(cfg) }) }),
-                    .chroot = true,
-                    .desc = "grub-install UEFI",
-                } })
+                try c.append(alloc, .{
+                    .exec = .{
+                        // shim owns the NVRAM entry — under --no-nvram
+                        // grub-install only lays modules + boot files. When the
+                        // live env wasn't EFI-booted (riscv64 OpenSBI direct-kernel
+                        // bring-up) efibootmgr can't register an entry — install
+                        // --removable instead, which also writes the
+                        // EFI/BOOT/BOOT<arch>.EFI fallback U-Boot/EDK2 scan for.
+                        .argv = if (cfg.security.secure_boot == .shim)
+                            try alloc.dupe([]const u8, &.{ "grub-install", s(alloc, "--target={s}", .{grubEfiTarget(cfg)}), s(alloc, "--efi-directory={s}", .{espInTarget(cfg)}), "--no-nvram" })
+                        else
+                            // --removable overwrites EFI/BOOT/BOOT<arch>.EFI
+                            // — on a shared (alongside) ESP preserve whatever
+                            // loader sits there. $f.gentoo is a reference copy of
+                            // the fallback WE last wrote (refreshed after each
+                            // successful install): a live fallback matching it is
+                            // ours; anything else (first-run foreign loader, or
+                            // one an OS update swapped in later) goes to the next
+                            // free .bak/.bakN before grub-install writes ours.
+                            try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "if [ -d /sys/firmware/efi/efivars ]; then exec grub-install --target={s} --efi-directory={s}; else f={s}/EFI/BOOT/{s}; r=$f.gentoo; if [ -f $f ] && ! cmp -s $f $r 2>/dev/null; then b=$f.bak; n=1; while [ -f $b ]; do b=$f.bak$n; n=$((n+1)); done; cp -f $f $b || exit 1; fi; grub-install --target={s} --efi-directory={s} --removable && cp -f $f $r; fi", .{ grubEfiTarget(cfg), espInTarget(cfg), espInTarget(cfg), efiBootFile(cfg), grubEfiTarget(cfg), espInTarget(cfg) }) }),
+                        .chroot = true,
+                        .desc = "grub-install UEFI",
+                    },
+                })
             else
                 try c.append(alloc, .{ .exec = .{
                     .argv = try alloc.dupe([]const u8, &.{ "grub-install", s(alloc, "--target={s}", .{target}), cfg.disk.device }),
@@ -2283,17 +2258,19 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env,
             // (alongside) ESP we must NOT pass --usedefault — that would
             // install rEFInd as EFI/BOOT/BOOTX64.EFI, hijacking whatever
             // fallback loader already lives there.
-            try c.append(alloc, .{ .exec = .{
-                .argv = if (cfg.disk.scheme == .alongside)
-                    // no positional device — that operand only pairs with
-                    // --usedefault; without it refind-install discovers
-                    // the already-mounted ESP itself.
-                    try alloc.dupe([]const u8, &.{ "refind-install", "--alldrivers" })
-                else
-                    try alloc.dupe([]const u8, &.{ "refind-install", "--alldrivers", "--usedefault", espPath(alloc, cfg, env) orelse partPath(alloc, cfg.disk.device, 1) }),
-                .chroot = true,
-                .desc = "install rEFInd to ESP + NVRAM entry",
-            } });
+            try c.append(alloc, .{
+                .exec = .{
+                    .argv = if (cfg.disk.scheme == .alongside)
+                        // no positional device — that operand only pairs with
+                        // --usedefault; without it refind-install discovers
+                        // the already-mounted ESP itself.
+                        try alloc.dupe([]const u8, &.{ "refind-install", "--alldrivers" })
+                    else
+                        try alloc.dupe([]const u8, &.{ "refind-install", "--alldrivers", "--usedefault", espPath(alloc, cfg, env) orelse partPath(alloc, cfg.disk.device, 1) }),
+                    .chroot = true,
+                    .desc = "install rEFInd to ESP + NVRAM entry",
+                },
+            });
             try c.append(alloc, .{ .note = "rEFInd auto-discovers kernels+initramfs on /boot via its fs drivers — no staging needed" });
         },
         .auto => unreachable,
@@ -2348,28 +2325,36 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env,
                 .chroot = true,
                 .desc = "shim + mokutil + sbsigntools",
             } });
-            try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc,
-                    // Gentoo's prebuilt grub carries its own signature
-                    // that nothing trusts yet — sbsign adds ours (MOK)
-                    // on top; shim accepts any verifiable signature.
-                    "mkdir -p {s} && cp /usr/share/shim/{s} {s}/{s} && cp /usr/share/shim/{s} {s}/{s} && " ++
-                    "sbsign --key /etc/shim/mok.key --cert /etc/shim/mok.pem --output {s}/{s} /usr/lib/grub/{s}",
-                    .{ dir, shim_src, dir, shim_dst, mm_src, dir, mm_src, dir, grub_dst, grub_src }) }),
-                .chroot = true,
-                .desc = "stage shim + MokManager + signed grub on the ESP",
-            } });
-            try c.append(alloc, .{ .exec = .{
-                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc,
-                    // grub's linux loader verifies the PE signature via
-                    // shim — sign every staged kernel copy in place.
-                    "rc=0; for f in {s}/vmlinuz /boot/vmlinuz-* /boot/kernel-* /boot/*/*/vmlinuz /boot/*/*/linux; do " ++
-                    "[ -f \"$f\" ] || continue; sbsign --key /etc/shim/mok.key --cert /etc/shim/mok.pem " ++
-                    "--output \"$f.signed\" \"$f\" && mv -f \"$f.signed\" \"$f\" || rc=1; done; exit $rc",
-                    .{ espInTarget(cfg) }) }),
-                .chroot = true,
-                .desc = "sign kernels with the MOK key",
-            } });
+            try c.append(alloc, .{
+                .exec = .{
+                    .argv = try alloc.dupe([]const u8, &.{
+                        "sh", "-c",
+                        s(alloc,
+                            // Gentoo's prebuilt grub carries its own signature
+                            // that nothing trusts yet — sbsign adds ours (MOK)
+                            // on top; shim accepts any verifiable signature.
+                            "mkdir -p {s} && cp /usr/share/shim/{s} {s}/{s} && cp /usr/share/shim/{s} {s}/{s} && " ++
+                                "sbsign --key /etc/shim/mok.key --cert /etc/shim/mok.pem --output {s}/{s} /usr/lib/grub/{s}", .{ dir, shim_src, dir, shim_dst, mm_src, dir, mm_src, dir, grub_dst, grub_src }),
+                    }),
+                    .chroot = true,
+                    .desc = "stage shim + MokManager + signed grub on the ESP",
+                },
+            });
+            try c.append(alloc, .{
+                .exec = .{
+                    .argv = try alloc.dupe([]const u8, &.{
+                        "sh", "-c",
+                        s(alloc,
+                            // grub's linux loader verifies the PE signature via
+                            // shim — sign every staged kernel copy in place.
+                            "rc=0; for f in {s}/vmlinuz /boot/vmlinuz-* /boot/kernel-* /boot/*/*/vmlinuz /boot/*/*/linux; do " ++
+                                "[ -f \"$f\" ] || continue; sbsign --key /etc/shim/mok.key --cert /etc/shim/mok.pem " ++
+                                "--output \"$f.signed\" \"$f\" && mv -f \"$f.signed\" \"$f\" || rc=1; done; exit $rc", .{espInTarget(cfg)}),
+                    }),
+                    .chroot = true,
+                    .desc = "sign kernels with the MOK key",
+                },
+            });
             try c.append(alloc, .{ .exec = .{
                 .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", s(alloc, "esp=$(findmnt -no SOURCE {s}) || exit 1; " ++
                     "d=$(lsblk -no PKNAME \"$esp\"); p=$(lsblk -no PARTN \"$esp\"); " ++
@@ -2378,19 +2363,20 @@ fn planBootloader(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env,
                 .chroot = true,
                 .desc = "efibootmgr: shim NVRAM entry",
             } });
-            try c.append(alloc, .{ .exec = .{
-                // --root-pw uses the root password as the one-time
-                // enrollment credential — headless-safe (mokutil has no
-                // --password-file) and the user already knows it.
-                // The queued request MUST be visible afterwards —
-                // without it MokManager never enrolls the cert and the
-                // signed grub is refused under real secure boot.
-                .argv = try alloc.dupe([]const u8, &.{ "sh", "-c",
-                    "mokutil --import /etc/shim/mok.der --root-pw && " ++
-                    "mokutil --list-new 2>/dev/null | grep -q ." }),
-                .chroot = true,
-                .desc = "mokutil: queue MOK enrollment for first boot",
-            } });
+            try c.append(alloc, .{
+                .exec = .{
+                    // --root-pw uses the root password as the one-time
+                    // enrollment credential — headless-safe (mokutil has no
+                    // --password-file) and the user already knows it.
+                    // The queued request MUST be visible afterwards —
+                    // without it MokManager never enrolls the cert and the
+                    // signed grub is refused under real secure boot.
+                    .argv = try alloc.dupe([]const u8, &.{ "sh", "-c", "mokutil --import /etc/shim/mok.der --root-pw && " ++
+                        "mokutil --list-new 2>/dev/null | grep -q ." }),
+                    .chroot = true,
+                    .desc = "mokutil: queue MOK enrollment for first boot",
+                },
+            });
             // The prebuilt standalone grub resolves $prefix to the dir
             // it loaded from — it needs grub.cfg next to grubx64.efi.
             try c.append(alloc, .{ .exec = .{
@@ -2503,7 +2489,6 @@ fn grubEfiTarget(cfg: *const Config) []const u8 {
         else => "x86_64-efi",
     };
 }
-
 
 fn limineConf(alloc: Allocator, cfg: *const Config, env: ?*const detect.Env, seed: u128) []const u8 {
     var aw: std.Io.Writer.Allocating = .init(alloc);
@@ -2706,69 +2691,78 @@ fn profileFor(alloc: std.mem.Allocator, src: []const u8) !?[]const u8 {
 test "profilePath matrix matches profiles.desc" {
     const alloc = std.testing.allocator;
     const cases = [_]struct { src: []const u8, want: []const u8 }{
-        .{ .src = \\arch = "amd64"
-                 \\[security]
-                 \\hardening = "standard"
-                 \\selinux = false
-                 , .want = "default/linux/amd64/23.0/systemd" },
-        .{ .src = \\arch = "amd64"
-                 \\[system]
-                 \\init = "openrc"
-                 , .want = "default/linux/amd64/23.0/hardened/selinux" },
-        .{ .src = \\arch = "amd64"
-                 \\[system]
-                 \\init = "openrc"
-                 \\[security]
-                 \\hardening = "standard"
-                 \\selinux = false
-                 , .want = "default/linux/amd64/23.0" },
-        .{ .src = \\arch = "amd64"
-                 \\[stage3]
-                 \\nomultilib = true
-                 \\[security]
-                 \\hardening = "standard"
-                 \\selinux = false
-                 , .want = "default/linux/amd64/23.0/no-multilib/systemd" },
-        .{ .src = \\arch = "amd64"
-                 \\[stage3]
-                 \\libc = "musl"
-                 \\toolchain = "llvm"
-                 \\[system]
-                 \\init = "openrc"
-                 \\[security]
-                 \\hardening = "standard"
-                 \\selinux = false
-                 , .want = "default/linux/amd64/23.0/musl/llvm" },
-        .{ .src = \\arch = "amd64"
-                 \\[stage3]
-                 \\libc = "musl"
-                 \\[security]
-                 \\hardening = "hardened"
-                 \\selinux = false
-                 , .want = "default/linux/amd64/23.0/musl/hardened/systemd" },
-        .{ .src = \\arch = "arm64"
-                 \\[stage3]
-                 \\libc = "musl"
-                 \\[system]
-                 \\init = "openrc"
-                 \\[security]
-                 \\hardening = "standard"
-                 \\selinux = false
-                 , .want = "default/linux/arm64/23.0/musl" },
-        .{ .src = \\arch = "riscv64"
-                 \\[security]
-                 \\hardening = "standard"
-                 \\selinux = false
-                 , .want = "default/linux/riscv/23.0/rv64/lp64d/systemd" },
-        .{ .src = \\arch = "riscv64"
-                 \\[stage3]
-                 \\libc = "musl"
-                 \\[system]
-                 \\init = "openrc"
-                 \\[security]
-                 \\hardening = "standard"
-                 \\selinux = false
-                 , .want = "default/linux/riscv/23.0/rv64/lp64d/musl" },
+        .{ .src =
+        \\arch = "amd64"
+        \\[security]
+        \\hardening = "standard"
+        \\selinux = false
+        , .want = "default/linux/amd64/23.0/systemd" },
+        .{ .src =
+        \\arch = "amd64"
+        \\[system]
+        \\init = "openrc"
+        , .want = "default/linux/amd64/23.0/hardened/selinux" },
+        .{ .src =
+        \\arch = "amd64"
+        \\[system]
+        \\init = "openrc"
+        \\[security]
+        \\hardening = "standard"
+        \\selinux = false
+        , .want = "default/linux/amd64/23.0" },
+        .{ .src =
+        \\arch = "amd64"
+        \\[stage3]
+        \\nomultilib = true
+        \\[security]
+        \\hardening = "standard"
+        \\selinux = false
+        , .want = "default/linux/amd64/23.0/no-multilib/systemd" },
+        .{ .src =
+        \\arch = "amd64"
+        \\[stage3]
+        \\libc = "musl"
+        \\toolchain = "llvm"
+        \\[system]
+        \\init = "openrc"
+        \\[security]
+        \\hardening = "standard"
+        \\selinux = false
+        , .want = "default/linux/amd64/23.0/musl/llvm" },
+        .{ .src =
+        \\arch = "amd64"
+        \\[stage3]
+        \\libc = "musl"
+        \\[security]
+        \\hardening = "hardened"
+        \\selinux = false
+        , .want = "default/linux/amd64/23.0/musl/hardened/systemd" },
+        .{ .src =
+        \\arch = "arm64"
+        \\[stage3]
+        \\libc = "musl"
+        \\[system]
+        \\init = "openrc"
+        \\[security]
+        \\hardening = "standard"
+        \\selinux = false
+        , .want = "default/linux/arm64/23.0/musl" },
+        .{ .src =
+        \\arch = "riscv64"
+        \\[security]
+        \\hardening = "standard"
+        \\selinux = false
+        , .want = "default/linux/riscv/23.0/rv64/lp64d/systemd" },
+        .{ .src =
+        \\arch = "riscv64"
+        \\[stage3]
+        \\libc = "musl"
+        \\[system]
+        \\init = "openrc"
+        \\[security]
+        \\hardening = "standard"
+        \\selinux = false
+        , .want = "default/linux/riscv/23.0/rv64/lp64d/musl" },
     };
     for (cases) |tc| {
         var arena = std.heap.ArenaAllocator.init(alloc);
@@ -2845,39 +2839,42 @@ test "installkernel package.use always carries the initramfs generator" {
     // USE=initramfs then fail dep resolution. Every bootloader pick must
     // emit the generator flag (dracut for the default initramfs).
     const cases = [_]struct { src: []const u8, want: []const u8 }{
-        .{ .src = \\arch = "amd64"
-                 \\[disk]
-                 \\device = "/dev/vda"
-                 \\[stage3]
-                 \\libc = "musl"
-                 \\[system]
-                 \\init = "openrc"
-                 \\bootloader = "efistub"
-                 \\[security]
-                 \\hardening = "standard"
-                 \\selinux = false
-                 , .want = "sys-kernel/installkernel -systemd-boot dracut -ugrd\n" },
-        .{ .src = \\arch = "amd64"
-                 \\[disk]
-                 \\device = "/dev/vda"
-                 \\[system]
-                 \\init = "openrc"
-                 \\bootloader = "grub"
-                 \\initramfs = "ugrd"
-                 \\[security]
-                 \\hardening = "standard"
-                 \\selinux = false
-                 , .want = "sys-kernel/installkernel grub ugrd -dracut\n" },
-        .{ .src = \\arch = "amd64"
-                 \\[disk]
-                 \\device = "/dev/vda"
-                 \\[system]
-                 \\bootloader = "limine"
-                 \\initramfs = "none"
-                 \\[security]
-                 \\hardening = "standard"
-                 \\selinux = false
-                 , .want = "sys-kernel/installkernel -systemd-boot -refind -dracut -ugrd\n" },
+        .{ .src =
+        \\arch = "amd64"
+        \\[disk]
+        \\device = "/dev/vda"
+        \\[stage3]
+        \\libc = "musl"
+        \\[system]
+        \\init = "openrc"
+        \\bootloader = "efistub"
+        \\[security]
+        \\hardening = "standard"
+        \\selinux = false
+        , .want = "sys-kernel/installkernel -systemd-boot dracut -ugrd\n" },
+        .{ .src =
+        \\arch = "amd64"
+        \\[disk]
+        \\device = "/dev/vda"
+        \\[system]
+        \\init = "openrc"
+        \\bootloader = "grub"
+        \\initramfs = "ugrd"
+        \\[security]
+        \\hardening = "standard"
+        \\selinux = false
+        , .want = "sys-kernel/installkernel grub ugrd -dracut\n" },
+        .{ .src =
+        \\arch = "amd64"
+        \\[disk]
+        \\device = "/dev/vda"
+        \\[system]
+        \\bootloader = "limine"
+        \\initramfs = "none"
+        \\[security]
+        \\hardening = "standard"
+        \\selinux = false
+        , .want = "sys-kernel/installkernel -systemd-boot -refind -dracut -ugrd\n" },
     };
     for (cases) |tc| {
         var doc = try toml_mod.parse(std.testing.allocator, tc.src, null);

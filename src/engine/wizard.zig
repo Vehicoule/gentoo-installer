@@ -617,7 +617,7 @@ pub const Wizard = struct {
     fn emitSummary(w: *Wizard, out: *std.Io.Writer) !void {
         var buf: [pages.len]usize = undefined;
         const order = w.flowOrder(&buf);
-        var seen: [pages.len]bool = .{false} ** pages.len;
+        var seen: [pages.len]bool = @splat(false);
         var first_g = true;
         for (order) |pi| {
             const pg = pages[pi];

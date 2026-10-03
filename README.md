@@ -18,7 +18,7 @@ headless protocol, and roadmap.
 
 ## Building
 
-Engine + TUI (Zig 0.16.x):
+Engine + TUI (Zig 0.17.x):
 
 ```sh
 zig build            # zig-out/bin/gentoo-installer  (tui | headless | run | plan | validate | detect)
