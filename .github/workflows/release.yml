@@ -119,7 +119,7 @@ jobs:
           cat > "dist/$pkg/run-gui.sh" <<'EOF'
           #!/bin/sh
           here="$(cd "$(dirname "$0")" && pwd)"
-          exec env GI_BIN="$here/gentoo-installer" "$here/gentoo-installer-gui" "$@"
+          exec env GI_BIN="$here/gentoo-installer" GI_PRESET="$here/presets/gentoo" "$here/gentoo-installer-gui" "$@"
           EOF
           chmod +x "dist/$pkg/run-gui.sh"
           tar -C dist -czf "dist/$pkg.tar.gz" "$pkg"

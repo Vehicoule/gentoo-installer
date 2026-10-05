@@ -34,7 +34,15 @@ fn engine_stream() -> impl cosmic::iced::futures::Stream<Item = Message> {
     stream::channel(64, |tx: mpsc::Sender<Message>| async move {
         std::thread::spawn(move || {
             let mut tx = tx;
-            let spawn = Command::new(engine_binary())
+            let mut engine_cmd = Command::new(engine_binary());
+            // Named package sets (e.g. packages.sets=["cosmic"]) need a
+            // preset; the tarball wrapper points GI_PRESET at the bundled
+            // presets/gentoo dir. Unset keeps the no-preset behavior for
+            // other callers.
+            if let Ok(preset) = std::env::var("GI_PRESET") {
+                engine_cmd.arg("--preset").arg(preset);
+            }
+            let spawn = engine_cmd
                 .arg("headless")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
