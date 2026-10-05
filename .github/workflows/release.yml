@@ -1,0 +1,90 @@
+name: release
+
+# Tag a commit as v<zon version> (e.g. v1.0.0) to cut a release.
+# Static musl builds are produced for every install target the engine
+# supports; suffixed tags (v1.0.0-rc1) publish as prereleases.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: # builds artifacts only, no release published
+
+permissions:
+  contents: write
+
+env:
+  ZIG_VERSION: "0.17.0"
+  ZIG_SHA256: "1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dist_arch: amd64
+            zig_target: x86_64-linux-musl
+          - dist_arch: arm64
+            zig_target: aarch64-linux-musl
+          - dist_arch: riscv64
+            zig_target: riscv64-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        run: |
+          curl -fsSL -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          echo "${ZIG_SHA256}  zig.tar.xz" | sha256sum -c -
+          tar -xf zig.tar.xz
+          echo "$PWD/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: Tag must match package/engine version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          zon_ver=$(grep -oP '\.version = "\K[^"]+' build.zig.zon)
+          eng_ver=$(grep -oP 'pub const version = "\K[^"]+' src/engine/engine.zig)
+          echo "tag=$tag build.zig.zon=$zon_ver engine=$eng_ver"
+          [ "$tag" = "$zon_ver" ] && [ "$zon_ver" = "$eng_ver" ]
+
+      - name: Build gentoo-installer (${{ matrix.zig_target }})
+        run: zig build -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSmall
+
+      - name: Package tarball
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then ver="${GITHUB_REF_NAME#v}"; else ver="0.0.0-${GITHUB_SHA::7}"; fi
+          pkg="gentoo-installer-${ver}-linux-${{ matrix.dist_arch }}"
+          mkdir -p "dist/$pkg"
+          cp zig-out/bin/gentoo-installer "dist/$pkg/"
+          cp -r presets "dist/$pkg/"
+          cp LICENSE README.md "dist/$pkg/"
+          tar -C dist -czf "dist/$pkg.tar.gz" "$pkg"
+          rm -rf "dist/$pkg"
+          (cd dist && sha256sum "$pkg.tar.gz" > "$pkg.tar.gz.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.dist_arch }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          flags=(--generate-notes)
+          case "$GITHUB_REF_NAME" in *-*) flags+=(--prerelease);; esac
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "gentoo-installer $GITHUB_REF_NAME" "${flags[@]}"
