@@ -1215,6 +1215,10 @@ pub fn runTui(init: std.process.Init, alloc: Allocator, io: std.Io, preset: ?*co
                                 t.status_err = true;
                                 t.confirming = false;
                                 t.edit_confirm.clearRetainingCapacity();
+                                // Restart the pair: keeping the rejected
+                                // entry would make every retry append to
+                                // it and mismatch again.
+                                t.edit_buf.clearRetainingCapacity();
                             }
                         } else try t.commitEdit();
                     } else if (key.matches(vaxis.Key.escape, .{})) {
