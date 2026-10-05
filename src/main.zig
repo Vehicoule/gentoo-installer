@@ -506,7 +506,7 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
             } else {
                 try out.writeAll("{\"ev\":\"hello\",");
                 try writeReq(out, req);
-                try out.writeAll("\"engine\":\"0.1.0\",\"version\":1,\"caps\":[\"hello\",\"detect\",\"wizard\",\"install\",\"quit\"]}\n");
+                try out.print("\"engine\":\"{s}\",\"version\":1,\"caps\":[\"hello\",\"detect\",\"wizard\",\"install\",\"quit\"]}}\n", .{engine.version});
             }
         } else if (std.mem.eql(u8, op, "detect")) {
             // env must outlive the request — disks/gpus populate
