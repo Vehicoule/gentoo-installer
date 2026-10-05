@@ -37,9 +37,10 @@ fn engine_stream() -> impl cosmic::iced::futures::Stream<Item = Message> {
             let mut engine_cmd = Command::new(engine_binary());
             // Named package sets (e.g. packages.sets=["cosmic"]) need a
             // preset; the tarball wrapper points GI_PRESET at the bundled
-            // presets/gentoo dir. Unset keeps the no-preset behavior for
-            // other callers.
-            if let Ok(preset) = std::env::var("GI_PRESET") {
+            // presets/gentoo dir. Direct launches resolve the same dir
+            // next to the binary. Unset + no bundled dir keeps the
+            // no-preset behavior for other callers.
+            if let Some(preset) = engine_preset() {
                 engine_cmd.arg("--preset").arg(preset);
             }
             let spawn = engine_cmd
@@ -88,10 +89,39 @@ fn engine_stream() -> impl cosmic::iced::futures::Stream<Item = Message> {
     })
 }
 
+fn engine_preset() -> Option<String> {
+    if let Ok(p) = std::env::var("GI_PRESET") {
+        return Some(p);
+    }
+    let exe = std::env::current_exe().unwrap_or_default();
+    // release tarball: presets/gentoo next to gentoo-installer-gui
+    if let Some(dir) = exe.parent() {
+        let cand = dir.join("presets/gentoo");
+        if cand.is_dir() {
+            return Some(cand.display().to_string());
+        }
+    }
+    // repo checkout: presets/gentoo at the workspace root
+    for p in exe.ancestors().skip(1) {
+        let cand = p.join("presets/gentoo");
+        if cand.is_dir() {
+            return Some(cand.display().to_string());
+        }
+    }
+    None
+}
+
 fn engine_binary() -> String {
     std::env::var("GI_BIN").unwrap_or_else(|_| {
-        // repo checkout: zig-out/bin/gentoo-installer next to the workspace root
         let exe = std::env::current_exe().unwrap_or_default();
+        // release tarball: the engine sits next to gentoo-installer-gui
+        if let Some(dir) = exe.parent() {
+            let cand = dir.join("gentoo-installer");
+            if cand.exists() {
+                return cand.display().to_string();
+            }
+        }
+        // repo checkout: zig-out/bin/gentoo-installer next to the workspace root
         for p in exe.ancestors().skip(1) {
             let cand = p.join("zig-out/bin/gentoo-installer");
             if cand.exists() {
