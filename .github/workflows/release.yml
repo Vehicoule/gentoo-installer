@@ -70,8 +70,70 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  gui:
+    # libcosmic GUI — amd64 only: Gentoo LiveGUI ships no other arch, and
+    # wayland/x11/dbus are dlopen'd at runtime so only libxkbcommon is a
+    # hard link dep. Bundles the static engine (GUI spawns `headless`).
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        run: |
+          curl -fsSL -o zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          echo "${ZIG_SHA256}  zig.tar.xz" | sha256sum -c -
+          tar -xf zig.tar.xz
+          echo "$PWD/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: Tag must match package/engine version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          base="${tag%%-*}"
+          zon_ver=$(grep -oP '\.version = "\K[^"]+' build.zig.zon)
+          eng_ver=$(grep -oP 'pub const version = "\K[^"]+' src/engine/engine.zig)
+          echo "tag=$tag base=$base build.zig.zon=$zon_ver engine=$eng_ver"
+          [ "$base" = "$zon_ver" ] && [ "$zon_ver" = "$eng_ver" ]
+
+      - name: System deps for libcosmic
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev \
+            libdbus-1-dev libudev-dev libinput-dev libegl1-mesa-dev libgbm-dev \
+            libseat-dev libxcb1-dev libfontconfig-dev
+
+      - name: Build engine + GUI
+        run: |
+          zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSmall
+          cargo build --release --locked -p gentoo-installer-gui
+
+      - name: Package tarball
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then ver="${GITHUB_REF_NAME#v}"; else ver="0.0.0-${GITHUB_SHA::7}"; fi
+          pkg="gentoo-installer-gui-${ver}-linux-amd64"
+          mkdir -p "dist/$pkg"
+          cp target/release/gentoo-installer-gui "dist/$pkg/"
+          cp zig-out/bin/gentoo-installer "dist/$pkg/"
+          cp -r presets "dist/$pkg/"
+          cp LICENSE README.md "dist/$pkg/"
+          cat > "dist/$pkg/run-gui.sh" <<'EOF'
+          #!/bin/sh
+          here="$(cd "$(dirname "$0")" && pwd)"
+          exec env GI_BIN="$here/gentoo-installer" "$here/gentoo-installer-gui" "$@"
+          EOF
+          chmod +x "dist/$pkg/run-gui.sh"
+          tar -C dist -czf "dist/$pkg.tar.gz" "$pkg"
+          rm -rf "dist/$pkg"
+          (cd dist && sha256sum "$pkg.tar.gz" > "$pkg.tar.gz.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-gui-amd64
+          path: dist/
+          if-no-files-found: error
+
   release:
-    needs: build
+    needs: [build, gui]
     # push only — workflow_dispatch on a tag ref must not publish
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
@@ -89,7 +151,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          flags=(--generate-notes)
-          case "$GITHUB_REF_NAME" in *-*) flags+=(--prerelease);; esac
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "gentoo-installer $GITHUB_REF_NAME" "${flags[@]}"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            # retag/re-run on an existing release: refresh assets instead
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            flags=(--generate-notes)
+            case "$GITHUB_REF_NAME" in *-*) flags+=(--prerelease);; esac
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --title "gentoo-installer $GITHUB_REF_NAME" "${flags[@]}"
+          fi
