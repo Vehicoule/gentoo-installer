@@ -43,10 +43,11 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           tag="${GITHUB_REF_NAME#v}"
+          base="${tag%%-*}" # v1.0.0-rc1 gates against checked-in 1.0.0
           zon_ver=$(grep -oP '\.version = "\K[^"]+' build.zig.zon)
           eng_ver=$(grep -oP 'pub const version = "\K[^"]+' src/engine/engine.zig)
-          echo "tag=$tag build.zig.zon=$zon_ver engine=$eng_ver"
-          [ "$tag" = "$zon_ver" ] && [ "$zon_ver" = "$eng_ver" ]
+          echo "tag=$tag base=$base build.zig.zon=$zon_ver engine=$eng_ver"
+          [ "$base" = "$zon_ver" ] && [ "$zon_ver" = "$eng_ver" ]
 
       - name: Build gentoo-installer (${{ matrix.zig_target }})
         run: zig build -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSmall
@@ -71,7 +72,8 @@ jobs:
 
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    # push only — workflow_dispatch on a tag ref must not publish
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
