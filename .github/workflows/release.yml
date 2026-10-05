@@ -74,7 +74,7 @@ jobs:
     # libcosmic GUI — amd64 only: Gentoo LiveGUI ships no other arch, and
     # wayland/x11/dbus are dlopen'd at runtime so only libxkbcommon is a
     # hard link dep. Bundles the static engine (GUI spawns `headless`).
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04  # oldest runner image → glibc 2.35 floor; the shipped GUI launched nowhere on <2.39 when built on 24.04
     steps:
       - uses: actions/checkout@v4
 
