@@ -220,6 +220,8 @@ struct Installer {
     log: Vec<String>,
     req_seq: u64,                       // monotonic request ids for set correlation
     pending_sets: HashMap<u64, String>, // req -> field; rejected sets restore engine truth
+    pending_op: Option<Value>, // nav/gate op held until every in-flight set resolves —
+    // a refused edit must stay on its page, not ride the action forward
     pending_gates: HashSet<u64>, // req -> whole-config gate op (plan); a validate carrying one unscopes its errors
     last_answer_req: Option<u64>, // newest outstanding answer_file set
     /// detected disks from the `env` event — path → MiB size, so the
@@ -346,8 +348,9 @@ impl Installer {
             if let Some(val) = self.inputs.remove(&name) {
                 self.confirm_inputs.remove(&name);
                 // a cleared field isn't a credential — sending "" would
-                // only come back as a rejected BadValue
-                if !val.is_empty() {
+                // only come back as a rejected BadValue. luks_passphrase
+                // is the one secret where "" is a real clear
+                if !val.is_empty() || name == "disk.luks_passphrase" {
                     self.send_set(&name, Value::String(val));
                 }
             }
@@ -381,13 +384,51 @@ impl Installer {
             let Some(val) = self.inputs.get(&name).cloned() else {
                 continue;
             };
-            if val.is_empty() {
-                continue;
-            }
-            let tv = self.typed_value(&name, &val);
+            let tv = if val.is_empty() {
+                // clearing the text means clearing the value — send the
+                // empty container, not nothing: an unsent edit would keep
+                // the old engine value silently (int has no empty form —
+                // leaving it unsent is the least-wrong option)
+                match self.field_meta(&name).0.as_str() {
+                    "list" | "table" => json!([]),
+                    "record" => json!({}),
+                    "path" => Value::String(String::new()),
+                    _ => continue,
+                }
+            } else {
+                self.typed_value(&name, &val)
+            };
             self.send_set(&name, tv);
         }
         true
+    }
+
+    /// Emit `op` now, or hold it until every in-flight `set` resolves.
+    /// A refused buffered edit would otherwise keep the old engine
+    /// value while the action rides forward — e.g. garbage JSON left
+    /// in `packages.sets` sailing through `next` on the preset's value.
+    /// Returns false when the op was queued, not sent.
+    fn send_op_when_ready(&mut self, op: Value) -> bool {
+        if self.pending_sets.is_empty() {
+            send_op(op);
+            true
+        } else {
+            self.pending_op = Some(op);
+            false
+        }
+    }
+
+    /// Fire a held action once the last correlated set resolved.
+    fn release_pending_op(&mut self) {
+        if self.pending_sets.is_empty()
+            && let Some(op) = self.pending_op.take()
+        {
+            // install ops flip to the run phase only once they're real
+            if op.get("op").and_then(Value::as_str) == Some("install") {
+                self.phase = Phase::Pending;
+            }
+            send_op(op);
+        }
     }
 
     /// Serialize a text-field edit to the JSON shape the engine expects:
@@ -435,6 +476,7 @@ impl cosmic::app::Application for Installer {
             steps: Vec::new(),
             nav: Vec::new(),
             plan: None,
+            pending_op: None,
             errors: Vec::new(),
             errors_unscoped: false,
             log: vec![format!("spawn {}", engine_binary())],
@@ -753,6 +795,9 @@ impl cosmic::app::Application for Installer {
                             self.confirm_inputs.remove(&field);
                             send_op(json!({"op": "page"}));
                         }
+                        // a refused set drops the held action — the user
+                        // stays on the page to fix the rejected edit
+                        self.pending_op = None;
                     }
                     self.errors.push(VErr {
                         message: v
@@ -790,6 +835,7 @@ impl cosmic::app::Application for Installer {
                             // gate checks the imported target
                             send_op(json!({"op": "get_config"}));
                         }
+                        self.release_pending_op();
                     }
                 }
                 Some("config") => {
@@ -828,6 +874,9 @@ impl cosmic::app::Application for Installer {
                     // buffered — secrets/structured values flush once on
                     // the next action; per-keystroke `set` would refuse
                     // mid-edit JSON or numbers and revert the input
+                    // a fresh buffered edit cancels the held action — the
+                    // click captured the intent *before* this edit existed
+                    self.pending_op = None;
                 } else {
                     let tv = self.typed_value(&name, &val);
                     self.send_set(&name, tv);
@@ -844,6 +893,8 @@ impl cosmic::app::Application for Installer {
                 send_op(json!({"op": "page"}));
             }
             Message::Goto(page) => {
+                // an explicit rail hop wins over a held nav action
+                self.pending_op = None;
                 send_op(json!({"op": "goto", "page": page}));
             }
             Message::Select(name, val) => {
@@ -862,7 +913,7 @@ impl cosmic::app::Application for Installer {
                 if !self.flush_pending() {
                     return Task::none();
                 }
-                send_op(json!({"op": op}));
+                self.send_op_when_ready(json!({"op": op}));
             }
             Message::Plan => {
                 if self.flush_pending() {
@@ -871,7 +922,8 @@ impl cosmic::app::Application for Installer {
                     // whole-config gate so its errors surface unscoped
                     self.req_seq += 1;
                     self.pending_gates.insert(self.req_seq);
-                    send_op(json!({"op": "plan", "req": self.req_seq}));
+                    let req = self.req_seq;
+                    self.send_op_when_ready(json!({"op": "plan", "req": req}));
                 }
             }
             Message::Install => {
@@ -900,9 +952,11 @@ impl cosmic::app::Application for Installer {
                 }
                 // leave the wizard synchronously — the engine queues ops, so
                 // a second click before the first `step` would run the whole
-                // wipe again
-                self.phase = Phase::Pending;
-                send_op(json!({"op": "install", "dry_run": false, "confirm": confirm}));
+                // wipe again. While sets are in-flight the op holds instead
+                // — release_pending_op flips the phase when it fires.
+                if self.send_op_when_ready(json!({"op": "install", "dry_run": false, "confirm": confirm})) {
+                    self.phase = Phase::Pending;
+                }
             }
             Message::DryRun => {
                 if self.last_answer_req.is_some() {
@@ -919,8 +973,9 @@ impl cosmic::app::Application for Installer {
                 for s in &mut self.steps {
                     s.state = "todo".into();
                 }
-                self.phase = Phase::Pending;
-                send_op(json!({"op": "install", "dry_run": true}));
+                if self.send_op_when_ready(json!({"op": "install", "dry_run": true})) {
+                    self.phase = Phase::Pending;
+                }
             }
         }
         Task::none()
