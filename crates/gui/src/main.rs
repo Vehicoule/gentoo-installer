@@ -302,6 +302,7 @@ impl Installer {
                     .to_string()
             })
             .collect();
+        let mut rejected: Vec<String> = Vec::new();
         for name in &fields {
             let Some(val) = self.inputs.get(name.as_str()) else {
                 continue;
@@ -314,10 +315,7 @@ impl Installer {
                     .map(String::as_str)
                     .unwrap_or("");
                 if c != val.as_str() {
-                    self.errors.push(VErr::local(format!(
-                        "confirmation does not match for {name}"
-                    )));
-                    ok = false;
+                    rejected.push(format!("confirmation does not match for {name}"));
                 }
             }
             // checked locally so a short password shows a reason instead
@@ -326,11 +324,16 @@ impl Installer {
                 && !val.is_empty()
                 && val.len() < m as usize
             {
-                self.errors.push(VErr::local(format!(
-                    "{name} must be at least {m} characters"
-                )));
-                ok = false;
+                rejected.push(format!("{name} must be at least {m} characters"));
             }
+        }
+        for msg in rejected {
+            // the panel already lists this refusal — repeating it per
+            // blocked Next just stacks identical lines
+            if !self.errors.iter().any(|e| e.message == msg) {
+                self.errors.push(VErr::local(msg));
+            }
+            ok = false;
         }
         if !ok {
             return false;
@@ -342,7 +345,11 @@ impl Installer {
         for name in fields {
             if let Some(val) = self.inputs.remove(&name) {
                 self.confirm_inputs.remove(&name);
-                self.send_set(&name, Value::String(val));
+                // a cleared field isn't a credential — sending "" would
+                // only come back as a rejected BadValue
+                if !val.is_empty() {
+                    self.send_set(&name, Value::String(val));
+                }
             }
         }
         true
