@@ -231,8 +231,8 @@ struct Installer {
 }
 
 impl Installer {
-    /// `(type, confirm)` for a field on the current page.
-    fn field_meta(&self, name: &str) -> (String, bool) {
+    /// `(type, confirm, min_len)` for a field on the current page.
+    fn field_meta(&self, name: &str) -> (String, bool, Option<u64>) {
         self.page
             .as_ref()
             .and_then(|p| p.get("fields"))
@@ -247,9 +247,17 @@ impl Installer {
                         .unwrap_or("string")
                         .to_string(),
                     f.get("confirm").and_then(Value::as_bool).unwrap_or(false),
+                    f.get("min").and_then(Value::as_u64),
                 )
             })
-            .unwrap_or_else(|| ("string".into(), false))
+            .unwrap_or_else(|| ("string".into(), false, None))
+    }
+
+    /// Buffered types send nothing per keystroke — a half-typed JSON
+    /// row/number would only fail to parse mid-edit, get refused, and
+    /// revert the whole input. They go out once on the next action.
+    fn buffered_ftype(ftype: &str) -> bool {
+        matches!(ftype, "secret" | "list" | "record" | "table" | "int" | "path")
     }
 
     /// Send a `set` op with a correlation `req`, remembering which field
@@ -298,7 +306,7 @@ impl Installer {
             let Some(val) = self.inputs.get(name.as_str()) else {
                 continue;
             };
-            let (_, needs_confirm) = self.field_meta(name);
+            let (_, needs_confirm, min_len) = self.field_meta(name);
             if needs_confirm {
                 let c = self
                     .confirm_inputs
@@ -311,6 +319,17 @@ impl Installer {
                     )));
                     ok = false;
                 }
+            }
+            // checked locally so a short password shows a reason instead
+            // of a round-tripped BadValue — and keeps both fields filled
+            if let Some(m) = min_len
+                && !val.is_empty()
+                && val.len() < m as usize
+            {
+                self.errors.push(VErr::local(format!(
+                    "{name} must be at least {m} characters"
+                )));
+                ok = false;
             }
         }
         if !ok {
@@ -329,12 +348,47 @@ impl Installer {
         true
     }
 
+    /// flush_secrets + send every other buffered field on the page once.
+    /// answer_file stays Enter-only — a half-loaded path must never
+    /// replace the config under an unrelated action.
+    fn flush_pending(&mut self) -> bool {
+        if !self.flush_secrets() {
+            return false;
+        }
+        let names: Vec<String> = self
+            .page
+            .as_ref()
+            .and_then(|p| p.get("fields"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|f| {
+                Self::buffered_ftype(
+                    f.get("type").and_then(Value::as_str).unwrap_or("string"),
+                ) && f.get("type").and_then(Value::as_str) != Some("secret")
+                    && f.get("name").and_then(Value::as_str) != Some("answer_file")
+            })
+            .filter_map(|f| f.get("name").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        for name in names {
+            let Some(val) = self.inputs.get(&name).cloned() else {
+                continue;
+            };
+            if val.is_empty() {
+                continue;
+            }
+            let tv = self.typed_value(&name, &val);
+            self.send_set(&name, tv);
+        }
+        true
+    }
+
     /// Serialize a text-field edit to the JSON shape the engine expects:
     /// int → number, list/record/table → parsed JSON, otherwise a string.
     /// Unparseable values go out as strings so the engine's own error
     /// (shown in the error list) explains the rejection.
     fn typed_value(&self, name: &str, text: &str) -> Value {
-        let (ftype, _) = self.field_meta(name);
+        let (ftype, _, _) = self.field_meta(name);
         match ftype.as_str() {
             "int" => text
                 .parse::<i64>()
@@ -682,6 +736,11 @@ impl cosmic::app::Application for Installer {
                                 self.last_answer_req = None;
                                 send_op(json!({"op": "page"}));
                             }
+                        } else if Self::buffered_ftype(&self.field_meta(&field).0) {
+                            // buffered edits keep their text on refusal —
+                            // the error names the fix; dropping the buffer
+                            // would force a full retype (and secrets can't
+                            // be re-echoed from the engine anyway)
                         } else {
                             self.inputs.remove(&field);
                             self.confirm_inputs.remove(&field);
@@ -752,16 +811,16 @@ impl cosmic::app::Application for Installer {
                 self.install_confirm = val;
             }
             Message::Input(name, val) => {
-                let (ftype, _) = self.field_meta(&name);
+                let (ftype, _, _) = self.field_meta(&name);
                 self.inputs.insert(name.clone(), val.clone());
                 if name == "disk.device" {
                     self.disk_device = val.clone();
                     self.install_confirm.clear();
                 }
-                if ftype == "secret" || name == "answer_file" {
-                    // buffered — secrets flush on the next action; the
-                    // answer-file path flushes on Enter (Submit) so a
-                    // half-typed path never loads an unintended file
+                if Self::buffered_ftype(&ftype) || name == "answer_file" {
+                    // buffered — secrets/structured values flush once on
+                    // the next action; per-keystroke `set` would refuse
+                    // mid-edit JSON or numbers and revert the input
                 } else {
                     let tv = self.typed_value(&name, &val);
                     self.send_set(&name, tv);
@@ -793,13 +852,13 @@ impl cosmic::app::Application for Installer {
                 send_op(json!({"op": "export_answer", "path": "gentoo-installer-answers.toml"}))
             }
             Message::Op(op) => {
-                if !self.flush_secrets() {
+                if !self.flush_pending() {
                     return Task::none();
                 }
                 send_op(json!({"op": op}));
             }
             Message::Plan => {
-                if self.flush_secrets() {
+                if self.flush_pending() {
                     // req-tagged: a refused plan comes back as
                     // `validate`+errors — the tag marks it a
                     // whole-config gate so its errors surface unscoped
@@ -815,7 +874,7 @@ impl cosmic::app::Application for Installer {
                     ));
                     return Task::none();
                 }
-                if !self.flush_secrets() {
+                if !self.flush_pending() {
                     return Task::none();
                 }
                 // the engine's confirm gate expects the user to have typed
@@ -847,7 +906,7 @@ impl cosmic::app::Application for Installer {
                 }
                 // dry-run needs no confirm token — the engine skips
                 // destructive gates entirely and only exercises the plan
-                if !self.flush_secrets() {
+                if !self.flush_pending() {
                     return Task::none();
                 }
                 for s in &mut self.steps {

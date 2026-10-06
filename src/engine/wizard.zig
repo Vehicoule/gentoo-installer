@@ -358,20 +358,22 @@ pub fn errorField(err: []const u8) ?[]const u8 {
 /// Owning page id for a whole-config validate error — the same
 /// attribution pageErrors applies in-process, exposed on the wire so
 /// headless frontends can scope errors to the page that can fix them.
-/// Prefix match mirrors pageErrors; a schema-field token falls back
-/// to the field's owning page. null = unscoped (frontends surface it
+/// A leading schema-field token wins — it is more precise than a bare
+/// prefix ("system.initramfs" is a system field, not variant's
+/// "system.init"); the prefix scan mirrors pageErrors for messages
+/// that lead with prose instead. null = unscoped (frontends surface it
 /// only at the whole-config gate).
 pub fn errorPage(err: []const u8) ?[]const u8 {
-    for (pages) |pg| {
-        for (pg.prefixes) |p| {
-            if (std.mem.indexOf(u8, err, p) != null) return pg.id;
-        }
-    }
     if (errorField(err)) |f| {
         for (pages) |pg| {
             for (pg.fields) |fld| {
                 if (std.mem.eql(u8, fld.name, f)) return pg.id;
             }
+        }
+    }
+    for (pages) |pg| {
+        for (pg.prefixes) |p| {
+            if (std.mem.indexOf(u8, err, p) != null) return pg.id;
         }
     }
     return null;
@@ -409,6 +411,10 @@ pub const Wizard = struct {
     /// cheap enough to run per emitPage (the TUI re-emits per keypress).
     /// Invalidated on every config/env/preset mutation.
     steps_json: ?[]u8 = null,
+    /// Why the last `set` was refused — frontends print this instead of
+    /// the bare error name so a rejected password reads as a reason
+    /// ("must be at least 8 characters"), not "BadValue".
+    set_error_detail: ?[]const u8 = null,
 
     fn invalidateSteps(w: *Wizard) void {
         if (w.steps_json) |s| w.alloc.free(s);
@@ -941,10 +947,21 @@ pub const Wizard = struct {
         const prev = w.cfg;
         const prev_flow = w.flow;
         const prev_page = w.page_idx;
+        w.set_error_detail = null;
         w.setFieldInner(name, v) catch |e| {
             w.cfg = prev;
             w.flow = prev_flow;
             w.page_idx = prev_page;
+            // generic fallback for sites that don't set their own reason —
+            // "BadType" alone reads as gibberish in a GUI error panel
+            if (w.set_error_detail == null) {
+                w.set_error_detail = switch (e) {
+                    error.BadType => "expected a different value type for this field",
+                    error.BadValue => "value was rejected",
+                    error.HashFailed => "password hashing failed",
+                    else => null,
+                };
+            }
             return e;
         };
         w.normalizeHidden();
@@ -1015,20 +1032,32 @@ pub const Wizard = struct {
         }
         if (std.mem.eql(u8, name, "disk.luks_passphrase")) {
             const s = try dstr(w, v);
-            if (s.len > 0 and s.len < 8) return error.BadValue;
+            if (s.len > 0 and s.len < 8) {
+                w.set_error_detail = "passphrase must be at least 8 characters";
+                return error.BadValue;
+            }
             w.cfg.disk.luks_passphrase = if (s.len == 0) null else s;
             return;
         }
         if (std.mem.eql(u8, name, "root.password")) {
             const s = try strOf(v);
-            if (s.len < 8) return error.BadValue;
-            w.cfg.root.password_hash = try w.hashPassword(s);
+            if (s.len < 8) {
+                w.set_error_detail = "password must be at least 8 characters";
+                return error.BadValue;
+            }
+            w.cfg.root.password_hash = w.hashPassword(s) catch |e| {
+                w.set_error_detail = "password hashing failed — openssl passwd -6 unavailable?";
+                return e;
+            };
             w.cfg.root.lock_root = false;
             return;
         }
         if (std.mem.eql(u8, name, "user.name")) {
             const s = try dstr(w, v);
-            if (s.len == 0) return error.BadValue;
+            if (s.len == 0) {
+                w.set_error_detail = "account name can't be empty";
+                return error.BadValue;
+            }
             // Rename users[0] in place — a fresh 1-element slice would
             // drop extra users and the first user's keys/shell/groups.
             if (w.cfg.users.len == 0) {
@@ -1045,8 +1074,14 @@ pub const Wizard = struct {
         }
         if (std.mem.eql(u8, name, "user.password")) {
             const s = try strOf(v);
-            if (s.len < 8) return error.BadValue;
-            const h = try w.hashPassword(s);
+            if (s.len < 8) {
+                w.set_error_detail = "password must be at least 8 characters";
+                return error.BadValue;
+            }
+            const h = w.hashPassword(s) catch |e| {
+                w.set_error_detail = "password hashing failed — openssl passwd -6 unavailable?";
+                return e;
+            };
             if (w.cfg.users.len == 0) {
                 const items = try w.alloc.alloc(config.User, 1);
                 items[0] = .{ .name = "user", .groups = @constCast(&.{"wheel"}), .shell = "/bin/bash", .password_hash = h };
@@ -1145,7 +1180,10 @@ pub const Wizard = struct {
     fn hashPassword(w: *Wizard, pw: []const u8) WizardError![]const u8 {
         // Bound the payload: stdin is written before stdout drains, so an
         // unbounded password could stall the session on pipe backpressure.
-        if (pw.len > 1024) return error.BadValue;
+        if (pw.len > 1024) {
+            w.set_error_detail = "password too long (max 1024 characters)";
+            return error.BadValue;
+        }
         var child = std.process.spawn(w.io, .{
             .argv = &.{ "openssl", "passwd", "-6", "-stdin" },
             .stdin = .pipe,
