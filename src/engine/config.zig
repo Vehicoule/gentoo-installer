@@ -513,8 +513,12 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier, env: 
     }
     // make.conf is SOURCED by portage — every interpolated string needs a
     // shell-metacharacter deny-set, not just control chars.
-    for ([_][]const u8{ cfg.makeconf.video_cards, cfg.makeconf.accept_license }) |v| {
-        if (hasShellMeta(v)) try errs.append(alloc, fmt(alloc, "'{s}' contains shell metacharacters — portage sources make.conf", .{v}));
+    const makeconf_vals = [_]struct { name: []const u8, v: []const u8 }{
+        .{ .name = "makeconf.video_cards", .v = cfg.makeconf.video_cards },
+        .{ .name = "makeconf.accept_license", .v = cfg.makeconf.accept_license },
+    };
+    for (makeconf_vals) |e| {
+        if (hasShellMeta(e.v)) try errs.append(alloc, fmt(alloc, "{s} '{s}' contains shell metacharacters — portage sources make.conf", .{ e.name, e.v }));
     }
     // URLs interpolated into sh -c strings must be plain URL charset.
     if (!urlSafe(cfg.stage3.mirror))
@@ -525,7 +529,7 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier, env: 
         try errs.append(alloc, "stage3.variant is not a stage3 stem (lowercase [a-z0-9-] segments, e.g. hardened-selinux-systemd)");
     // Erase-disk schemes always format — wipe=false preserves nothing.
     if (!cfg.disk.wipe and cfg.disk.scheme != .alongside and cfg.disk.scheme != .manual)
-        try errs.append(alloc, "disk.wipe=false has no effect on erase schemes — use alongside to preserve data");
+        try errs.append(alloc, "disk.wipe=false has no effect on erase schemes — use disk.scheme=alongside to preserve data");
     // Erase scheme must match the firmware boot mode (partition layout
     // and bootloader paths are mode-specific).
     if (cfg.disk.scheme == .@"efi-swap-root" and cfg.boot_mode == .bios)
@@ -569,7 +573,7 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier, env: 
         if (cfg.disk.lvm)
             try errs.append(alloc, "disk.lvm is a guided-layout feature — express volumes as partitions under scheme=manual");
         if (!cfg.disk.wipe)
-            try errs.append(alloc, "disk.wipe=false is unsupported under scheme=manual — rows are always created at fixed indices and formatted; use scheme=alongside to preserve an existing install");
+            try errs.append(alloc, "disk.scheme=manual + wipe=false is unsupported — rows are always created at fixed indices and formatted; use alongside to preserve an existing install");
         if (cfg.disk.swap == .partition)
             try errs.append(alloc, "disk.swap=partition is guided-only — under manual, list a fs=\"swap\" partition");
         var root_count: u32 = 0;
@@ -671,7 +675,7 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier, env: 
     // Keymaps land in shell-sourced conf.d files under OpenRC — pin to
     // the keymap-name charset.
     if (!keymapOk(cfg.system.keymap))
-        try errs.append(alloc, fmt(alloc, "keymap '{s}' has characters outside the keymap charset", .{cfg.system.keymap}));
+        try errs.append(alloc, fmt(alloc, "system.keymap '{s}' has characters outside the keymap charset", .{cfg.system.keymap}));
     // zram works on every init — systemd via zram-generator; all others
     // run `openrc boot` in stage-1 which executes the generated
     // init.d/zram runscript.
@@ -685,7 +689,7 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier, env: 
     // Gentoo's prebuilt dist kernel is published for amd64/arm64 only;
     // riscv64 builds gentoo-sources from source.
     if (cfg.system.kernel == .@"dist-bin" and cfg.arch == .riscv64)
-        try errs.append(alloc, "kernel=dist-bin has no riscv64 prebuilt kernel — use kernel=dist (gentoo-sources)");
+        try errs.append(alloc, "system.kernel=dist-bin has no riscv64 prebuilt kernel — use kernel=dist (gentoo-sources)");
     // Network managers must match init capabilities.
     if (cfg.network.manager == .netifrc and cfg.system.init != .openrc)
         try errs.append(alloc, "network.manager=netifrc requires init=openrc");
@@ -701,33 +705,33 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier, env: 
             try errs.append(alloc, fmt(alloc, "users[].name '{s}' is not a POSIX account name", .{u.name}));
         for (u.groups) |g|
             if (!posixName(g))
-                try errs.append(alloc, fmt(alloc, "group '{s}' is not a POSIX group name", .{g}));
+                try errs.append(alloc, fmt(alloc, "users[].groups '{s}' is not a POSIX group name", .{g}));
     }
     if (!hostnameOk(cfg.system.hostname))
-        try errs.append(alloc, fmt(alloc, "hostname '{s}' is not a valid hostname", .{cfg.system.hostname}));
+        try errs.append(alloc, fmt(alloc, "system.hostname '{s}' is not a valid hostname", .{cfg.system.hostname}));
     for (cfg.system.locales) |l|
-        if (hasCtl(l)) try errs.append(alloc, fmt(alloc, "locale contains control characters: '{s}'", .{l}));
+        if (hasCtl(l)) try errs.append(alloc, fmt(alloc, "system.locale contains control characters: '{s}'", .{l}));
     for (cfg.users) |u| {
         if (hasCtl(u.name) or hasCtl(u.shell))
             try errs.append(alloc, fmt(alloc, "user '{s}' has control chars in name/shell", .{u.name}));
         // The shell is argv to useradd -s and lands in /etc/passwd —
         // restrict to an absolute-path charset (no spaces/metachars).
         if (u.shell.len > 0 and !shellOk(u.shell))
-            try errs.append(alloc, fmt(alloc, "shell '{s}' is not a valid absolute shell path", .{u.shell}));
+            try errs.append(alloc, fmt(alloc, "users[].shell '{s}' is not a valid absolute shell path", .{u.shell}));
         // chpasswd -e lines are `name:hash` — a ':' or newline in the
         // hash would forge extra account lines.
         if (u.password_hash) |h|
-            if (!pwHashOk(h)) try errs.append(alloc, fmt(alloc, "password_hash for '{s}' must be a $id$ crypt hash (sha512/yescrypt/...)", .{u.name}));
+            if (!pwHashOk(h)) try errs.append(alloc, fmt(alloc, "users[].password_hash for '{s}' must be a $id$ crypt hash (sha512/yescrypt/...)", .{u.name}));
         for (u.groups) |g|
-            if (hasCtl(g)) try errs.append(alloc, fmt(alloc, "group '{s}' has control characters", .{g}));
+            if (hasCtl(g)) try errs.append(alloc, fmt(alloc, "users[].groups '{s}' has control characters", .{g}));
         for (u.ssh_authorized_keys) |k|
-            if (hasCtl(k)) try errs.append(alloc, fmt(alloc, "ssh key for '{s}' has control characters", .{u.name}));
+            if (hasCtl(k)) try errs.append(alloc, fmt(alloc, "users[].ssh_key for '{s}' has control characters", .{u.name}));
     }
     if (cfg.root.password_hash) |h|
         if (!pwHashOk(h)) try errs.append(alloc, "root.password_hash must be a $id$ crypt hash (sha512/yescrypt/...)");
     // Timezone lands verbatim in /etc/timezone — zone names only.
     if (!tzOk(cfg.system.timezone))
-        try errs.append(alloc, fmt(alloc, "timezone '{s}' is not a valid zone name", .{cfg.system.timezone}));
+        try errs.append(alloc, fmt(alloc, "system.timezone '{s}' is not a valid zone name", .{cfg.system.timezone}));
     // Package atoms become emerge argv — a leading '-' would be a
     // portage flag, whitespace splits into extra args.
     for (cfg.packages.atoms) |a|
@@ -754,7 +758,7 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier, env: 
     }
     var uit = cfg.use.global.iterator();
     while (uit.next()) |kv| {
-        if (!useFlagOk(kv.key_ptr.*)) try errs.append(alloc, fmt(alloc, "USE flag '{s}' has characters outside the USE charset", .{kv.key_ptr.*}));
+        if (!useFlagOk(kv.key_ptr.*)) try errs.append(alloc, fmt(alloc, "use.global['{s}'] has characters outside the USE charset", .{kv.key_ptr.*}));
         // use.global values must be booleans — other types are silently
         // dropped by makeConf(), so reject them here.
         switch (kv.value_ptr.*) {
@@ -776,7 +780,7 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier, env: 
         // bootctl unconditionally writes EFI/BOOT/BOOTX64.EFI — on a
         // shared ESP that hijacks the firmware's fallback loader.
         if (cfg.system.bootloader == .@"systemd-boot")
-            try errs.append(alloc, "scheme=alongside + systemd-boot is refused: bootctl always claims EFI/BOOT/BOOTX64.EFI on the shared ESP — pick limine/grub/efistub/rEFInd");
+            try errs.append(alloc, "system.bootloader=systemd-boot is refused under scheme=alongside — bootctl always claims EFI/BOOT/BOOTX64.EFI on the shared ESP; pick limine/grub/efistub/rEFInd");
         if (env) |e| blk: {
             const disk = for (e.disks) |*di| {
                 if (std.mem.eql(u8, di.path, cfg.disk.device)) break di;
@@ -803,19 +807,19 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier, env: 
                         break :blk;
                     };
                     if (std.mem.eql(u8, p.fs, "BitLocker"))
-                        try errs.append(alloc, fmt(alloc, "{s} is BitLocker — decrypt it in Windows first", .{p.path}))
+                        try errs.append(alloc, fmt(alloc, "disk.shrink_part {s} is BitLocker — decrypt it in Windows first", .{p.path}))
                     else if (std.mem.eql(u8, p.fs, "ntfs") or std.mem.startsWith(u8, p.fs, "ext") or std.mem.eql(u8, p.fs, "btrfs")) {
                         if (p.fs_size_bytes == 0) {
-                            try errs.append(alloc, fmt(alloc, "couldn't probe free space on {s} ({s}) — the fs may be dirty; fsck/chkdsk it first", .{ p.path, p.fs }));
+                            try errs.append(alloc, fmt(alloc, "disk.shrink_part: couldn't probe free space on {s} ({s}) — the fs may be dirty; fsck/chkdsk it first", .{ p.path, p.fs }));
                         } else {
                             // fs must keep 512 MiB reserve past the shrink.
                             const need = (@as(u64, cfg.disk.shrink_mib) + 512) << 20;
                             if (p.fs_free_bytes < need)
-                                try errs.append(alloc, fmt(alloc, "{s} has only {} MiB free — shrink_mib {} + reserve won't fit", .{ p.path, p.fs_free_bytes >> 20, cfg.disk.shrink_mib }));
+                                try errs.append(alloc, fmt(alloc, "disk.shrink_part {s} has only {} MiB free — shrink_mib {} + reserve won't fit", .{ p.path, p.fs_free_bytes >> 20, cfg.disk.shrink_mib }));
                             if (cfg.disk.shrink_mib < 8192 + (if (cfg.disk.swap == .partition) cfg.disk.swap_mib else 0))
                                 try errs.append(alloc, fmt(alloc, "disk.shrink_mib must cover the install (≥8192 MiB{s})", .{if (cfg.disk.swap == .partition) " + swap_mib" else ""}));
                         }
-                    } else try errs.append(alloc, fmt(alloc, "{s} is '{s}' — only ntfs/ext/btrfs shrink (xfs/f2fs/luks/lvm can't)", .{ p.path, p.fs }));
+                    } else try errs.append(alloc, fmt(alloc, "disk.shrink_part {s} is '{s}' — only ntfs/ext/btrfs shrink (xfs/f2fs/luks/lvm can't)", .{ p.path, p.fs }));
                 },
                 .@"free-space" => {
                     const need: u64 = (8192 + @as(u64, if (cfg.disk.swap == .partition) cfg.disk.swap_mib else 0)) << 20;
@@ -823,7 +827,7 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier, env: 
                     for (d.free_regions) |g| {
                         if ((g.end_sector - g.start_sector + 1) * 512 >= need) ok = true;
                     }
-                    if (!ok) try errs.append(alloc, fmt(alloc, "no contiguous free region ≥{} MiB on {s} — shrink a partition or pick another disk", .{ need >> 20, cfg.disk.device }));
+                    if (!ok) try errs.append(alloc, fmt(alloc, "disk.device {s}: no contiguous free region ≥{} MiB — shrink a partition or pick another disk", .{ cfg.disk.device, need >> 20 }));
                 },
             }
         }
@@ -836,11 +840,11 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier, env: 
         }
         if (cfg.system.uki) try errs.append(alloc, "uki requires UEFI");
         if (cfg.security.secure_boot != .off)
-            try errs.append(alloc, "secure_boot requires UEFI; forced off on BIOS");
+            try errs.append(alloc, "security.secure_boot requires UEFI; forced off on BIOS");
     }
 
     if ((cfg.disk.luks or cfg.disk.lvm) and cfg.system.initramfs == .none)
-        try errs.append(alloc, "luks/lvm root requires an initramfs (dracut|ugrd)");
+        try errs.append(alloc, "system.initramfs: luks/lvm root requires an initramfs (dracut|ugrd)");
 
     // Stage3 availability matrix — every axes combination must name a
     // tarball Gentoo actually autobuilds (releases/<arch>/autobuilds).
@@ -883,16 +887,16 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier, env: 
     }
 
     if (cfg.security.secure_boot == .shim and resolveBootloader(cfg) != .grub)
-        try errs.append(alloc, "secure_boot=shim is only supported with grub");
+        try errs.append(alloc, "security.secure_boot=shim is only supported with grub");
     if (cfg.security.secure_boot == .shim and cfg.arch == .riscv64)
-        try errs.append(alloc, "secure_boot=shim needs a shim-signed arch — riscv64 has none; use secure_boot=sbctl");
+        try errs.append(alloc, "security.secure_boot=shim needs a shim-signed arch — riscv64 has none; use secure_boot=sbctl");
     // mokutil --root-pw enrolls with the root password — shim needs
     // root to have one (a locked/hashless root has no enrollment cred).
     if (cfg.security.secure_boot == .shim and (cfg.root.password_hash == null or cfg.root.lock_root))
-        try errs.append(alloc, "secure_boot=shim requires root.password — mokutil --root-pw uses it as the MOK enrollment password");
+        try errs.append(alloc, "security.secure_boot=shim requires root.password — mokutil --root-pw uses it as the MOK enrollment password");
 
     if (cfg.system.privilege == .none and cfg.root.lock_root)
-        try errs.append(alloc, "privilege=none with lock_root leaves no admin path");
+        try errs.append(alloc, "system.privilege=none with lock_root leaves no admin path");
 
     // Login-path proof: some credential must survive to the finished
     // system, or sshd must be reachable with keys.
@@ -922,9 +926,9 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier, env: 
     const nvidia_prop = cfg.gpu.driver == .@"nvidia-open" or cfg.gpu.driver == .@"nvidia-drivers";
     if (nvidia_prop) {
         if (cfg.stage3.libc == .musl)
-            try errs.append(alloc, "proprietary NVIDIA drivers are glibc-only — musl gets nouveau");
+            try errs.append(alloc, "gpu.driver: proprietary NVIDIA drivers are glibc-only — musl gets nouveau");
         if (cfg.arch == .riscv64)
-            try errs.append(alloc, "proprietary NVIDIA drivers are keyworded amd64/arm64 only");
+            try errs.append(alloc, "gpu.driver: proprietary NVIDIA drivers are keyworded amd64/arm64 only");
     }
     if (cfg.gpu.driver == .@"nvidia-open") {
         if (nvidia) |t| switch (t) {
@@ -944,7 +948,7 @@ pub fn validate(alloc: Allocator, cfg: *const Config, nvidia: ?NvidiaTier, env: 
     // dinit comes from the GURU overlay, keyworded ~amd64 only — nothing
     // to emerge on other arches until a keyworded ebuild/overlay exists.
     if (cfg.system.init == .dinit and cfg.arch != .amd64)
-        try errs.append(alloc, "init=dinit is amd64-only for now (GURU sys-apps/dinit is ~amd64)");
+        try errs.append(alloc, "system.init=dinit is amd64-only for now (GURU sys-apps/dinit is ~amd64)");
 
     // locale must be a member of locales
     var found = false;

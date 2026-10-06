@@ -220,6 +220,8 @@ struct Installer {
     log: Vec<String>,
     req_seq: u64,                       // monotonic request ids for set correlation
     pending_sets: HashMap<u64, String>, // req -> field; rejected sets restore engine truth
+    pending_op: Option<Value>, // nav/gate op held until every in-flight set resolves —
+    // a refused edit must stay on its page, not ride the action forward
     pending_gates: HashSet<u64>, // req -> whole-config gate op (plan); a validate carrying one unscopes its errors
     last_answer_req: Option<u64>, // newest outstanding answer_file set
     /// detected disks from the `env` event — path → MiB size, so the
@@ -231,8 +233,8 @@ struct Installer {
 }
 
 impl Installer {
-    /// `(type, confirm)` for a field on the current page.
-    fn field_meta(&self, name: &str) -> (String, bool) {
+    /// `(type, confirm, min_len)` for a field on the current page.
+    fn field_meta(&self, name: &str) -> (String, bool, Option<u64>) {
         self.page
             .as_ref()
             .and_then(|p| p.get("fields"))
@@ -247,9 +249,17 @@ impl Installer {
                         .unwrap_or("string")
                         .to_string(),
                     f.get("confirm").and_then(Value::as_bool).unwrap_or(false),
+                    f.get("min").and_then(Value::as_u64),
                 )
             })
-            .unwrap_or_else(|| ("string".into(), false))
+            .unwrap_or_else(|| ("string".into(), false, None))
+    }
+
+    /// Buffered types send nothing per keystroke — a half-typed JSON
+    /// row/number would only fail to parse mid-edit, get refused, and
+    /// revert the whole input. They go out once on the next action.
+    fn buffered_ftype(ftype: &str) -> bool {
+        matches!(ftype, "secret" | "list" | "record" | "table" | "int" | "path")
     }
 
     /// Send a `set` op with a correlation `req`, remembering which field
@@ -294,11 +304,12 @@ impl Installer {
                     .to_string()
             })
             .collect();
+        let mut rejected: Vec<String> = Vec::new();
         for name in &fields {
             let Some(val) = self.inputs.get(name.as_str()) else {
                 continue;
             };
-            let (_, needs_confirm) = self.field_meta(name);
+            let (_, needs_confirm, min_len) = self.field_meta(name);
             if needs_confirm {
                 let c = self
                     .confirm_inputs
@@ -306,12 +317,25 @@ impl Installer {
                     .map(String::as_str)
                     .unwrap_or("");
                 if c != val.as_str() {
-                    self.errors.push(VErr::local(format!(
-                        "confirmation does not match for {name}"
-                    )));
-                    ok = false;
+                    rejected.push(format!("confirmation does not match for {name}"));
                 }
             }
+            // checked locally so a short password shows a reason instead
+            // of a round-tripped BadValue — and keeps both fields filled
+            if let Some(m) = min_len
+                && !val.is_empty()
+                && val.len() < m as usize
+            {
+                rejected.push(format!("{name} must be at least {m} characters"));
+            }
+        }
+        for msg in rejected {
+            // the panel already lists this refusal — repeating it per
+            // blocked Next just stacks identical lines
+            if !self.errors.iter().any(|e| e.message == msg) {
+                self.errors.push(VErr::local(msg));
+            }
+            ok = false;
         }
         if !ok {
             return false;
@@ -323,10 +347,88 @@ impl Installer {
         for name in fields {
             if let Some(val) = self.inputs.remove(&name) {
                 self.confirm_inputs.remove(&name);
-                self.send_set(&name, Value::String(val));
+                // a cleared field isn't a credential — sending "" would
+                // only come back as a rejected BadValue. luks_passphrase
+                // is the one secret where "" is a real clear
+                if !val.is_empty() || name == "disk.luks_passphrase" {
+                    self.send_set(&name, Value::String(val));
+                }
             }
         }
         true
+    }
+
+    /// flush_secrets + send every other buffered field on the page once.
+    /// answer_file stays Enter-only — a half-loaded path must never
+    /// replace the config under an unrelated action.
+    fn flush_pending(&mut self) -> bool {
+        if !self.flush_secrets() {
+            return false;
+        }
+        let names: Vec<String> = self
+            .page
+            .as_ref()
+            .and_then(|p| p.get("fields"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|f| {
+                Self::buffered_ftype(
+                    f.get("type").and_then(Value::as_str).unwrap_or("string"),
+                ) && f.get("type").and_then(Value::as_str) != Some("secret")
+                    && f.get("name").and_then(Value::as_str) != Some("answer_file")
+            })
+            .filter_map(|f| f.get("name").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        for name in names {
+            let Some(val) = self.inputs.get(&name).cloned() else {
+                continue;
+            };
+            let tv = if val.is_empty() {
+                // clearing the text means clearing the value — send the
+                // empty container, not nothing: an unsent edit would keep
+                // the old engine value silently (int has no empty form —
+                // leaving it unsent is the least-wrong option)
+                match self.field_meta(&name).0.as_str() {
+                    "list" | "table" => json!([]),
+                    "record" => json!({}),
+                    "path" => Value::String(String::new()),
+                    _ => continue,
+                }
+            } else {
+                self.typed_value(&name, &val)
+            };
+            self.send_set(&name, tv);
+        }
+        true
+    }
+
+    /// Emit `op` now, or hold it until every in-flight `set` resolves.
+    /// A refused buffered edit would otherwise keep the old engine
+    /// value while the action rides forward — e.g. garbage JSON left
+    /// in `packages.sets` sailing through `next` on the preset's value.
+    /// Returns false when the op was queued, not sent.
+    fn send_op_when_ready(&mut self, op: Value) -> bool {
+        if self.pending_sets.is_empty() {
+            send_op(op);
+            true
+        } else {
+            self.pending_op = Some(op);
+            false
+        }
+    }
+
+    /// Fire a held action once the last correlated set resolved.
+    fn release_pending_op(&mut self) {
+        if self.pending_sets.is_empty()
+            && let Some(op) = self.pending_op.take()
+        {
+            // install ops flip to the run phase only once they're real
+            if op.get("op").and_then(Value::as_str) == Some("install") {
+                self.phase = Phase::Pending;
+            }
+            send_op(op);
+        }
     }
 
     /// Serialize a text-field edit to the JSON shape the engine expects:
@@ -334,7 +436,7 @@ impl Installer {
     /// Unparseable values go out as strings so the engine's own error
     /// (shown in the error list) explains the rejection.
     fn typed_value(&self, name: &str, text: &str) -> Value {
-        let (ftype, _) = self.field_meta(name);
+        let (ftype, _, _) = self.field_meta(name);
         match ftype.as_str() {
             "int" => text
                 .parse::<i64>()
@@ -374,6 +476,7 @@ impl cosmic::app::Application for Installer {
             steps: Vec::new(),
             nav: Vec::new(),
             plan: None,
+            pending_op: None,
             errors: Vec::new(),
             errors_unscoped: false,
             log: vec![format!("spawn {}", engine_binary())],
@@ -682,11 +785,19 @@ impl cosmic::app::Application for Installer {
                                 self.last_answer_req = None;
                                 send_op(json!({"op": "page"}));
                             }
+                        } else if Self::buffered_ftype(&self.field_meta(&field).0) {
+                            // buffered edits keep their text on refusal —
+                            // the error names the fix; dropping the buffer
+                            // would force a full retype (and secrets can't
+                            // be re-echoed from the engine anyway)
                         } else {
                             self.inputs.remove(&field);
                             self.confirm_inputs.remove(&field);
                             send_op(json!({"op": "page"}));
                         }
+                        // a refused set drops the held action — the user
+                        // stays on the page to fix the rejected edit
+                        self.pending_op = None;
                     }
                     self.errors.push(VErr {
                         message: v
@@ -724,6 +835,7 @@ impl cosmic::app::Application for Installer {
                             // gate checks the imported target
                             send_op(json!({"op": "get_config"}));
                         }
+                        self.release_pending_op();
                     }
                 }
                 Some("config") => {
@@ -752,16 +864,19 @@ impl cosmic::app::Application for Installer {
                 self.install_confirm = val;
             }
             Message::Input(name, val) => {
-                let (ftype, _) = self.field_meta(&name);
+                let (ftype, _, _) = self.field_meta(&name);
                 self.inputs.insert(name.clone(), val.clone());
                 if name == "disk.device" {
                     self.disk_device = val.clone();
                     self.install_confirm.clear();
                 }
-                if ftype == "secret" || name == "answer_file" {
-                    // buffered — secrets flush on the next action; the
-                    // answer-file path flushes on Enter (Submit) so a
-                    // half-typed path never loads an unintended file
+                if Self::buffered_ftype(&ftype) || name == "answer_file" {
+                    // buffered — secrets/structured values flush once on
+                    // the next action; per-keystroke `set` would refuse
+                    // mid-edit JSON or numbers and revert the input
+                    // a fresh buffered edit cancels the held action — the
+                    // click captured the intent *before* this edit existed
+                    self.pending_op = None;
                 } else {
                     let tv = self.typed_value(&name, &val);
                     self.send_set(&name, tv);
@@ -778,6 +893,8 @@ impl cosmic::app::Application for Installer {
                 send_op(json!({"op": "page"}));
             }
             Message::Goto(page) => {
+                // an explicit rail hop wins over a held nav action
+                self.pending_op = None;
                 send_op(json!({"op": "goto", "page": page}));
             }
             Message::Select(name, val) => {
@@ -793,19 +910,20 @@ impl cosmic::app::Application for Installer {
                 send_op(json!({"op": "export_answer", "path": "gentoo-installer-answers.toml"}))
             }
             Message::Op(op) => {
-                if !self.flush_secrets() {
+                if !self.flush_pending() {
                     return Task::none();
                 }
-                send_op(json!({"op": op}));
+                self.send_op_when_ready(json!({"op": op}));
             }
             Message::Plan => {
-                if self.flush_secrets() {
+                if self.flush_pending() {
                     // req-tagged: a refused plan comes back as
                     // `validate`+errors — the tag marks it a
                     // whole-config gate so its errors surface unscoped
                     self.req_seq += 1;
                     self.pending_gates.insert(self.req_seq);
-                    send_op(json!({"op": "plan", "req": self.req_seq}));
+                    let req = self.req_seq;
+                    self.send_op_when_ready(json!({"op": "plan", "req": req}));
                 }
             }
             Message::Install => {
@@ -815,7 +933,7 @@ impl cosmic::app::Application for Installer {
                     ));
                     return Task::none();
                 }
-                if !self.flush_secrets() {
+                if !self.flush_pending() {
                     return Task::none();
                 }
                 // the engine's confirm gate expects the user to have typed
@@ -834,9 +952,11 @@ impl cosmic::app::Application for Installer {
                 }
                 // leave the wizard synchronously — the engine queues ops, so
                 // a second click before the first `step` would run the whole
-                // wipe again
-                self.phase = Phase::Pending;
-                send_op(json!({"op": "install", "dry_run": false, "confirm": confirm}));
+                // wipe again. While sets are in-flight the op holds instead
+                // — release_pending_op flips the phase when it fires.
+                if self.send_op_when_ready(json!({"op": "install", "dry_run": false, "confirm": confirm})) {
+                    self.phase = Phase::Pending;
+                }
             }
             Message::DryRun => {
                 if self.last_answer_req.is_some() {
@@ -847,14 +967,15 @@ impl cosmic::app::Application for Installer {
                 }
                 // dry-run needs no confirm token — the engine skips
                 // destructive gates entirely and only exercises the plan
-                if !self.flush_secrets() {
+                if !self.flush_pending() {
                     return Task::none();
                 }
                 for s in &mut self.steps {
                     s.state = "todo".into();
                 }
-                self.phase = Phase::Pending;
-                send_op(json!({"op": "install", "dry_run": true}));
+                if self.send_op_when_ready(json!({"op": "install", "dry_run": true})) {
+                    self.phase = Phase::Pending;
+                }
             }
         }
         Task::none()

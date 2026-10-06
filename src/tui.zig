@@ -337,7 +337,8 @@ pub const Tui = struct {
             v = .{ .string = try t.alloc.dupe(u8, text) };
         }
         t.wiz.setField(f.name, v) catch |e| {
-            t.status = std.fmt.allocPrint(t.alloc, "set failed: {s}", .{@errorName(e)}) catch "set failed";
+            const why = t.wiz.set_error_detail orelse @errorName(e);
+            t.status = std.fmt.allocPrint(t.alloc, "set failed: {s}", .{why}) catch "set failed";
             t.status_err = true;
             return;
         };

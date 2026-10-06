@@ -579,7 +579,7 @@ fn headless(init: std.process.Init, alloc: std.mem.Allocator, io: std.Io, out: *
             };
             wiz.setField(field, value) catch |e| {
                 var aw: std.Io.Writer.Allocating = .init(req_alloc);
-                aw.writer.print("set {s}: {s}", .{ field, @errorName(e) }) catch {};
+                aw.writer.print("set {s}: {s}", .{ field, wiz.set_error_detail orelse @errorName(e) }) catch {};
                 try writeErr(out, req, aw.written());
                 try out.flush();
                 req_arena.deinit();
